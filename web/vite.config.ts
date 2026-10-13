@@ -11,8 +11,30 @@ const buildTime = process.env.CANVAS_BUILD_TIME?.trim() || process.env.VITE_BUIL
 const appChangelog = readFileSync(resolve(webDir, "../CHANGELOG.md"), "utf8");
 const apiProxyTarget = process.env.VITE_API_PROXY_TARGET?.trim() || "http://127.0.0.1:8080";
 
+// Vite 8 的 oxc 在 serve 模式下会向 .tsx 注入 Fast Refresh 钩子（$RefreshReg$ / $RefreshSig$）。
+// @vitejs/plugin-react 6 在本项目配置（optimizeDeps + 非 bundledDev）下没有把对应的
+// React Refresh 运行时前置脚本注入 index.html，导致首个 .tsx 模块抛
+// "ReferenceError: $RefreshReg$ is not defined"，React 无法挂载，页面空白。
+// 这里显式补上官方前置脚本；生产构建（command === "build"）不注入，行为不变。
+const reactRefreshPreamble = () => ({
+    name: "canvas:react-refresh-preamble",
+    apply: "serve" as const,
+    transformIndexHtml(html: string) {
+        if (html.includes("vite_plugin_react_preamble_installed__")) return html;
+        const preamble = `    <script type="module">
+import RefreshRuntime from "/@react-refresh";
+RefreshRuntime.injectIntoGlobalHook(window);
+window.$RefreshReg$ = () => {};
+window.$RefreshSig$ = () => (type) => type;
+window.__vite_plugin_react_preamble_installed__ = true;
+</script>
+`;
+        return html.replace("</head>", `${preamble}  </head>`);
+    },
+});
+
 export default defineConfig({
-    plugins: [react()],
+    plugins: [react(), reactRefreshPreamble()],
     define: {
         __APP_VERSION__: JSON.stringify(appVersion),
         __APP_CHANGELOG__: JSON.stringify(appChangelog),
