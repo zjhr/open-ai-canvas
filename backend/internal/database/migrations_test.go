@@ -39,6 +39,15 @@ func TestMigrateSchemaRecordsAndValidatesVersion(t *testing.T) {
 	if !db.Migrator().HasTable(&model.UploadReservation{}) {
 		t.Fatal("upload reservation migration missing")
 	}
+	if !db.Migrator().HasTable(&model.WorkbenchTool{}) || !db.Migrator().HasTable(&model.WorkbenchPreset{}) {
+		t.Fatal("schema migration v54 did not create workbench tool and preset tables")
+	}
+	if !db.Migrator().HasIndex(&model.WorkbenchTool{}, "idx_workbench_tools_kind_enabled_sort") {
+		t.Fatal("schema migration v54 did not create the workbench catalog index")
+	}
+	if !db.Migrator().HasIndex(&model.WorkbenchPreset{}, "idx_workbench_presets_tool_enabled_sort") {
+		t.Fatal("schema migration v54 did not create the workbench preset index")
+	}
 	if !db.Migrator().HasIndex(&schemaMigration{}, "idx_schema_migrations_applied_at") {
 		t.Fatal("schema migration v2 did not create the applied_at index")
 	}
@@ -86,6 +95,59 @@ func TestMigrateSchemaRecordsAndValidatesVersion(t *testing.T) {
 	}
 	if err := MigrateSchema(db); err != nil {
 		t.Fatalf("migration should be idempotent: %v", err)
+	}
+}
+
+func TestMigrateSchemaNormalizesLegacyWorkbenchMigrationV51(t *testing.T) {
+	db, err := Open(Config{Driver: "sqlite", DSN: "file:migration-legacy-workbench-v51?mode=memory&cache=shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	// 构造「旧版本只迁移到 v51 工作台身份」的库：删掉 v51 及之后的账本记录，
+	// 只写回一条旧工作台身份的 v51（建表语句已由上面的完整迁移完成，只改账本）。
+	// 必须把 v51 之后的记录也删干净：否则新增迁移（如 v55）会被归一化逻辑视为
+	// 「旧记录之后还有后续迁移」，从而按设计拒绝改写账本。
+	const legacyWorkbenchToolsVersion int64 = 51
+	if err := db.Where("version >= ?", legacyWorkbenchToolsVersion).Delete(&schemaMigration{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&schemaMigration{
+		Version:   legacyWorkbenchToolsVersion,
+		Name:      workbenchToolsMigrationName,
+		Checksum:  legacyWorkbenchToolsMigrationChecksum,
+		AppliedAt: time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateSchema(db); err != nil {
+		t.Fatalf("legacy workbench migration should be normalized: %v", err)
+	}
+	status, err := ReadSchemaStatus(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Ready || status.Current != CurrentSchemaVersion {
+		t.Fatalf("unexpected normalized schema status: %#v", status)
+	}
+	var normalized schemaMigration
+	if err := db.First(&normalized, "version = ?", workbenchToolsMigrationVersion).Error; err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Name != workbenchToolsMigrationName || normalized.Checksum != workbenchToolsMigrationChecksum {
+		t.Fatalf("normalized workbench migration = %#v", normalized)
+	}
+	for _, item := range schemaMigrations {
+		var count int64
+		if err := db.Model(&schemaMigration{}).Where("version = ? AND name = ? AND checksum = ?", item.version, item.name, item.checksum).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if item.version != workbenchToolsMigrationVersion && count != 1 {
+			t.Fatalf("migration %d was not restored: %#v", item.version, item)
+		}
 	}
 }
 
