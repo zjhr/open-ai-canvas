@@ -55,11 +55,25 @@ func runProtocolAdapterTaskWithPolicy(ctx context.Context, input canvasGeneratio
 			key = uuid.NewString()
 		}
 		request.Extra["idempotencyKey"] = key
-		spec, err := adapter.BuildCreate(ctx, protocol.RequestContext{BaseURL: input.Config.BaseURL, Request: request})
-		if err != nil {
-			return nil, err
+		// Agnes 视频创建接口在高峰期会集中返回 503（视频队列已满）与 429（限速）。
+		// 轮询阶段对这两类瞬时错误已有重试，创建阶段此前没有，导致本可自愈的抖动
+		// 直接变成用户可见的失败。这里只对 Agnes 视频补上创建重试；其他适配器与
+		// 其他模态（文本/图像/音频）的调用路径行为完全不变。
+		buildCreate := func(attemptCtx context.Context) ([]byte, *protocol.Result, error) {
+			spec, buildErr := adapter.BuildCreate(attemptCtx, protocol.RequestContext{BaseURL: input.Config.BaseURL, Request: request})
+			if buildErr != nil {
+				return nil, nil, buildErr
+			}
+			return executeProtocolCreateRequest(withProviderRequestKind(attemptCtx, "create"), input, spec)
 		}
-		body, streamedResult, err := executeProtocolCreateRequest(withProviderRequestKind(ctx, "create"), input, spec)
+		var body []byte
+		var streamedResult *protocol.Result
+		var err error
+		if videoCreateRetryApplies(adapter, input) {
+			body, streamedResult, err = runProtocolAdapterCreateWithRetry(ctx, buildCreate, policy)
+		} else {
+			body, streamedResult, err = buildCreate(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
