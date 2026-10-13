@@ -25,7 +25,7 @@ type SortKey = "default" | "title";
 type CategoryChoice = InspirationCategoryChoice & { count: number };
 
 /** 来源筛选的顺序。必须覆盖 inspirationSources 里全部有内容的来源，漏掉就会有条目筛不到。 */
-const SOURCE_ORDER: InspirationSourceId[] = ["original", "chatgpt-prompts", "seedance", "haohaoxue", "youmind"];
+const SOURCE_ORDER: InspirationSourceId[] = ["original", "chatgpt-prompts", "seedance", "haohaoxue", "youmind", "lanshu"];
 const VIEW_OPTIONS: { label: string; value: ViewFilter }[] = [
     { label: "全部", value: "all" },
     { label: "收藏", value: "favorites" },
@@ -384,7 +384,16 @@ export default function InspirationsPage() {
                                         }}
                                     >
                                         <div className="inspiration-card-cover">
-                                            <img src={item.image} alt="" loading="lazy" decoding="async" referrerPolicy="no-referrer" />
+                                            {item.image ? (
+                                                <img src={item.image} alt="" loading="lazy" decoding="async" referrerPolicy="no-referrer" />
+                                            ) : (
+                                                // 纯提示词清单没有配图：用文字版式交代"哪一类、什么规格"，不放无关示意图。
+                                                <div className="flex size-full flex-col items-center justify-center gap-1 px-4 text-center">
+                                                    <span className="text-xs font-medium text-foreground/70">{categoryLabel(item)}</span>
+                                                    {item.ratio ? <span className="text-[11px] text-foreground/50">{item.ratio}</span> : null}
+                                                    <span className="line-clamp-2 text-[10px] text-foreground/38">{inspirationSourceOf(item).name ?? "提示词配方"}</span>
+                                                </div>
+                                            )}
                                             <span className="inspiration-card-source">{inspirationSourceOf(item).label}</span>
                                             <div className="inspiration-card-actions">
                                                 <Tooltip title={favorite ? "取消收藏" : "收藏"}>

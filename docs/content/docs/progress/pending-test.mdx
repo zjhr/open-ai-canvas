@@ -5,6 +5,54 @@ description: 当前项目已实现功能的手工验证清单与未确认边界
 
 # 待测试
 
+## 提示词画廊插件（prompt-gallery）
+
+- 已实现：内置应用插件 `prompt-gallery`（`yingce.plugin/v1`，权限 `ai.text`，声明 `contributes.promptSources: ["inspiration-catalog"]` 与 `surfaces: ["prompt-gallery", "settings"]`）。图片、视频的提示词输入框旁新增「画廊」按钮：画布节点提示词面板、生成配置节点的「组装提示词」框、创作页输入框共三处，点击打开右侧抽屉。
+- 已实现：抽屉复用站内灵感目录（`web/public/inspirations` 导入产物 + 用户自定义/覆盖/隐藏/收藏叠加层），支持关键词全文检索（含提示词正文）、按创作类型/来源/分类/仅收藏筛选、分页与封面懒加载；卡片展示来源、作者与许可，并保留“原文”跳转。
+- 已实现：回填不覆盖草稿——画布节点面板与创作页输入框为空时直接填入、已有内容按新行追加；生成配置组装框按光标位置插入，保留已引用的 `@` 素材。三处共用 `usePromptGalleryProvider` 做启用判断与 provider 构造。
+- 已实现：AI 搜索把一句话需求交给宿主 `ai.text` 服务解析成关键词/类型/来源/分类/仅收藏条件，解析结果显示为可清除的条件标签；未知来源或分类被丢弃并回落到当前筛选，解析失败时提示改用关键词搜索。目录只读本地导入产物，插件不新增远端请求。
+- 已实现：按官方应用插件登记（前端 `official-applications.ts`、后端 `officialApplicationPolicies`），用户可在插件中心自行停用；未配置过的用户默认开启（与 `media-conversion` 同一机制），管理员停用平台可用性后入口消失。
+- [x] 前端专项：`bun test test/prompt-gallery.test.ts` 14 项通过，其中 4 项用真实目录 JSON（stub fetch 读 `web/public/inspirations`）跑通 provider 的检索、来源过滤、facet 计数与“无文本模型服务时报可读错误”；含官方插件清单/权限/状态/分区在内的 31 项相关测试通过；`bun run typecheck`、`bun run lint`、`bun run build` 通过。
+- [x] 后端专项：`go test ./internal/app/ -run 'Plugin|PromptGallery'` 通过，覆盖应用插件策略登记、新用户默认开启与用户停用回落。
+- 已修复（浏览器验收发现）：`usePromptGalleryProvider` 原先要求本地安装记录存在，而该记录只在用户打开过插件中心后才写入，导致没进过插件中心的用户看不到入口。现在只以服务端 `effectiveEnabled` 为准，缺记录时补一份等价插件上下文（该插件没有配置字段、也不写插件存储）。
+- [x] 浏览器验收（ego-browser，v1.6.4 + 重启后的后端）：创作页与画布图片节点提示词面板均出现「画廊」按钮，抽屉标题随输入框类型变化（`当前输入：视频` / `当前输入：图片`）；图片模式 558 条、视频模式 774 条，24 条/页分页正常；关键词搜“咖啡”命中 21 条且能匹配提示词正文；AI 搜索真实调用 `glm-5.3-flash` 后显示「AI 理解 用户想找与咖啡相关的视频类提示词…」条件标签并正确筛出视频结果；卡片回填验证“空则填入、非空按新行追加”（2234 → 4700 字符，原草稿保留）、插入后抽屉自动关闭；通过 `PUT /api/plugins/prompt-gallery/activation` 停用后入口消失、重新启用后恢复。
+- [ ] 未验收：生成配置节点「组装提示词」框的入口只在代码与类型检查层面确认，本机画布没有配置节点、画布节点面板浮层挡住添加节点菜单，没有实际点开。
+- [ ] 目录里有部分未镜像到本地缩略图的封面（远程热链）显示为空图，与灵感页同一现象，未在本次处理。
+
+## 灵感目录新增蓝书视频库（无配图来源）
+
+- 已实现：`web/scripts/import-inspirations.mjs` 新增 `lanshu` 来源（`cclank/lanshu-awesome-ai-video-kit`，MIT），共导入 604 条视频配方：494 条单模型（`prompts/data/all-prompts.json`）+ 110 条跨模型对照（`prompts/data/cross-model-matrix.json`，10 场景 × 11 模型）。中文标题、正文保留上游原文、29 个中文分类译名、模型 id 进 `tags`（搜模型名可命中）、原帖链接与署名。上游没有配图，所以该来源不生成缩略图、也不进首页画廊池。
+- 已实现：卡片支持无封面文字版式（分类 + 规格 + 来源名）。灵感页卡片、详情弹窗与提示词画廊抽屉三处都按 `image` 缺省分支渲染；画廊条目新增 `ratio`（如 `16:9 · 10s`）随卡片展示。
+- 已修复：`--only <source>` 局部同步会按来源重建首页画廊池，把未同步来源的 329 条清空。现在未同步来源的池子条目从上次产物带过来；已核对 `gallery-pool.json` 的 entries 逐条不变（仅 `revisions` 多一项）。
+- 已修复：GitHub 未认证 API 限流（403）会让 `resolveRepoRevision` 直接失败。现在退回 `commits/main.atom` 取提交号（不占配额），seedance / youmind / lanshu 三个来源共用。
+- [x] 前端专项：`bun test test/inspirations-lanshu.test.ts`（7 项，含 604 条逐条字段校验与 494/110 构成）、`test/prompt-gallery.test.ts`（15 项，含真实目录 JSON 的 provider 检索与无封面来源）通过；`bun run typecheck`、`bun run lint`、`bun run build` 通过。
+- [x] 浏览器验收：灵感页来源筛选出现「蓝书视频库 (494)」（验证时目录为 494 条，随后补齐跨模型对照到 604 条，未再跑一遍浏览器）、目录总数 1835 条；画廊抽屉搜 `CogVideoX` 命中 8 条，卡片全部为文字版式（0 张 `img`、0 破图），显示分类 + 规格 +「蓝书视频库 · MIT」+ 厂商署名 + 原文链接；点卡片回填创作输入框 386 字符成功。
+- [ ] 未验收：灵感页切到「蓝书视频库」后的分页与详情弹窗（页面筛选器点选时浮层拦截指针，本次用搜索框路径验收）；窄屏下文字版式的高度观感。
+
+## 提示词输入框插槽（插件化改造）
+
+- 已实现：新增 `contributes.promptEditorSlots`（v2）与宿主插槽注册表 `prompt-editor-slot-registry`、渲染组件 `PromptEditorActions`。宿主在三个输入框各渲染一处，插件用 `registerPromptEditorSlot` 提供按钮；插槽上下文给出 `surface`/`mode`/`prompt`/`readPrompt()`/`applyPrompt()`，回填语义仍由宿主决定（画布节点与创作页空则填入、非空追加；组装框按光标插入并保留 `@` 引用）。
+- 已实现：`prompt-gallery` 从"宿主内联按钮 + 抽屉"改为插件自己注册动作（`builtin/prompt-gallery-action.tsx` + 插件内 `usePromptGalleryProvider`），插件清单升到 `yingce.plugin/v2`。宿主三个输入框文件里不再有画廊代码。
+- 收益：输入框文件的改动量从 36/33/40 行降到 13/18/9 行，`pages/create/index.tsx` 降为 0 改动；以后再加输入框按钮只改插件。
+- [x] `bun test test/prompt-editor-slots.test.ts`（4 项：排序、HMR 幂等替换、停用清理、宿主无内联画廊 UI）与相关 47 项测试通过；`bun run typecheck`、`bun run lint`、`bun run build` 通过。
+- [x] 浏览器验收：创作页「画廊」按钮经插槽渲染出现，打开抽屉、点卡片回填创作输入框 2,465 字符成功。
+- [ ] 未验收：画布节点面板与生成配置组装框在插槽路径下的回填（组装框的光标插入语义）；事件顺序与 `applyPrompt` 是否在插件停用后立即失效。
+
+## 提示词画廊服务端索引（HuggingFace 两个大库）
+
+- 已实现：结构版本 50 `prompt_gallery_index` 新增 `prompt_gallery_sources` 与 `prompt_gallery_prompts`；正文与元数据入库，封面只在浏览时按需代理并缓存到数据目录（不把 3 万张封面写进仓库）。
+- 已实现：`POST /api/admin/prompt-gallery/sources/:id/sync` 由管理员触发后台同步，流式解析 HF `metadata.jsonl`；`GET /api/prompt-gallery/sources` 看状态，`POST /api/prompt-gallery/search` 检索（含来源/分类 facet），`GET /api/prompt-gallery/cover` 走白名单前缀 + 磁盘缓存。
+- 已实现：后台新增「提示词画廊索引」页（模型与资源分组）显示已索引条数、上次同步时间与错误，并支持触发/重新同步；同步中按 running 轮询。
+- 已实现：前端 `PromptGalleryProvider` 合并「站内静态目录 + 远端索引」：站内条目在前、远端接续，分页跨越交界处由 `planMergedPage` 计算；来源筛选里同时出现站内来源与 `hf-*` 来源。任一端失败都会带 `warnings` 返回并在抽屉里以「部分结果不可用」提示，不静默少给结果。
+- 已修复：批量 upsert 一次性写 8 千行会触发 SQLite "too many SQL variables"，改为每 200 行一批（补充 500 行回归用例）。
+- 已修复（关键）：清理过期行原本用写入之后重新取的 `now`，导致刚写入的行也满足 `synced_at < now` 被整轮删空——同步报成功但库里 0 行。现在解析与清理共用同一个时间戳，并补回归用例覆盖两轮连续同步。
+- 已修复：来源筛选下拉默认高度会折叠后面的来源（8 个来源只显示 6 个），改为放开列表高度并允许搜索。
+- [x] 后端专项：`go test ./internal/app/ ./internal/database/ ./internal/repository/ ./internal/handler/` 通过（含解析/字段映射、限流、路径校验、检索与 facet、批次写入、连续同步不丢行）。
+- [x] 真实同步：Seedance 2 入库 8,833 条、GPT Image 2 入库 21,113 条（合计 29,946）；中文关键词「咖啡」命中 291 条；分页 offset=8830 仍返回 3 条且不重复；封面代理返回真实 JPEG（640×360、31KB）。
+- [x] 封面安全：`../../../etc/passwd`、跨来源路径、URL 编码路径均返回 400；未登录访问 `sources` 返回 401。
+- [x] 浏览器验收：创作页画廊来源筛选出现「Seedance 2 提示词数据集 · CC BY 4.0 8833」与「GPT Image 2 提示词数据集 · CC BY 4.0 21113」；选中 Seedance 后列表 8,833 条、封面 24/24 加载、卡片带来源/许可/原帖跳转；点卡片回填创作输入框 865 字符成功；后台索引页显示两个来源的条数与同步时间。
+- [ ] 未验收：PostgreSQL 下的同步与检索（本机是 SQLite）；AI 搜索用 hf-* 来源规划条件；同步失败（上游 5xx / 断流）后的重试与半途数据表现。
+
 ## Agent 画布权限与大事件审批
 
 - 已修复：权限查询使用 `canvas_projects`；大画布增量超过事件上限时改为完整快照刷新通知，避免审批执行事务回滚。

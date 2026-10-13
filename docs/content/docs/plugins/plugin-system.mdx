@@ -85,6 +85,25 @@ Eagle 插件属于此类，具体方案见第 8 节。
 
 云端 Agent 通过后端受控工具合同读取和修改画布。插件只能通过版本化的宿主贡献点提供技能或能力声明，不能注入本地进程、MCP 连接或浏览器私有状态。
 
+### 4.7 提示词画廊来源
+
+插件可以在 `contributes.promptSources` 里声明“这份提示词目录从哪里来”。宿主负责画按钮、抽屉、筛选和回填，插件只提供“查目录”和“把自然语言解析成检索条件”两个能力，因此这一形态不需要执行插件自带的 Web 代码。
+
+输入框按钮走 `contributes.promptEditorSlots`（当前只有 `prompt-composer-actions` 一个插槽）。宿主在三个输入框各渲染一处 `PromptEditorActions`，插件在 `activate()` 阶段用 `registerPromptEditorSlot` 提供渲染函数；按钮、弹层和状态都留在插件侧，输入框只保留“怎么回填”：
+
+- 插槽上下文给出 `surface`（`canvas-node` / `canvas-config` / `creation-composer`）、`mode`、当前正文 `prompt`、`readPrompt()` 和 `applyPrompt(text)`。
+- 回填语义由宿主决定：画布节点面板与创作页输入框空则填入、非空按新行追加；生成配置组装框按光标插入，保留已引用的 `@` 素材。插件不需要拿 ref 或读 store。
+- 插件停用时 `unregisterPluginPromptEditorSlots(pluginId)` 清掉它的动作，输入框里的入口随之消失（`effectiveEnabled` 仍由服务端状态决定）。
+
+加一个新按钮只需要插件自己写一个组件 + 注册一次，不改输入框组件。当前 `prompt-gallery` 就是按这个方式接入的：宿主三个输入框文件里没有任何画廊代码。
+
+当前内置的 `prompt-gallery` 插件声明两份来源：
+
+- `inspiration-catalog`：站内静态目录（`web/public/inspirations` 的导入产物，含 awesome-seedance、好好学 AI、YouMind 与蓝书视频库）。来源没有配图时（如蓝书视频库），卡片走「分类 + 规格 + 来源名」的文字版式，宿主不会塞入无关示意图或留下破图。
+- `remote-index`：后端索引的远端大库（HuggingFace 的 Seedance 2 与 GPT Image 2，合计约 3 万条，见专题文档的「提示词画廊索引」）。正文不进前端包，检索走 `POST /api/prompt-gallery/search`，封面走 `GET /api/prompt-gallery/cover` 按需代理并缓存。
+
+检索时站内条目在前、远端条目接续，分页跨过交界处由 `planMergedPage` 计算；任一端不可用时结果会带 `warnings`，抽屉必须显示「部分结果不可用」，不能把少了一半的结果当成完整目录。声明了 `ai.text` 权限时，宿主允许它用当前文本模型把一句话需求解析成关键词、类型、来源、分类和“仅收藏”等检索条件；模型给出的未知来源或分类会被丢弃并回落到用户当前筛选，解析失败时保留普通关键词搜索。用户可以在插件中心停用这个插件，输入框旁的入口随之消失。
+
 ## 5. 插件包与清单
 
 插件以一个统一的 `.yingce-plugin` 包作为入口。包内固定包含 `manifest.json`，也可以包含受沙箱约束的 Web 入口和静态资源。Manifest 负责描述插件能力、权限和运行时；包文件负责承载对应版本的实现，不能再把“协议 JSON”和“UI 插件源码”拆成两套安装系统。
@@ -120,7 +139,7 @@ eagle-asset-connector.yingce-plugin
 - `id`：全局唯一，使用小写 kebab-case；安装后不能随意变更。
 - `version`：遵循 SemVer，用于更新和回滚判断。
 - `apiVersion`：固定为 `yingce.plugin/v1`，不接受旧版本或平行 Manifest。
-- `contributes`：声明 provider、workflow、canvasNodes、transforms、assetSources、agents 等能力。
+- `contributes`：声明 provider、workflow、canvasNodes、transforms、assetSources、promptSources、promptEditorSlots、agents 等能力。
 - `permissions`：最小权限集合，宿主在安装和首次使用时展示。
 - `dependencies`：插件依赖的其他插件或宿主能力。
 - `integrity`：用于校验远程产物是否被替换。

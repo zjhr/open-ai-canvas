@@ -114,6 +114,8 @@ func Models() []any {
 		&model.TaskTextDelta{},
 		&model.TaskLog{},
 		&model.Result{},
+		&model.PromptGallerySource{},
+		&model.PromptGalleryPrompt{},
 	}
 }
 

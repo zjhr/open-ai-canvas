@@ -134,3 +134,48 @@ func TestEditorShellReportsPlatformAvailableWithoutPlatformState(t *testing.T) {
 		t.Fatalf("editor shell reported as admin-disabled: %#v", state)
 	}
 }
+
+// prompt-gallery 是宿主渲染 UI 的官方应用插件：漏登记会被当作系统协议，
+// 用户既看不到开关，也拿不到默认开启的输入框入口。
+func TestPromptGalleryIsUserToggleableApplication(t *testing.T) {
+	policy := pluginManagement(PluginPromptGallery, "bundled")
+	if policy.Origin != PluginOriginOfficial || policy.Kind != PluginKindApplication || policy.ActivationScope != PluginScopeUser || policy.ConfigurationScope != PluginConfigurationNone {
+		t.Fatalf("prompt gallery policy = %#v", policy)
+	}
+}
+
+func TestPromptGalleryIsEnabledByDefaultForNewUsers(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+newID()+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.PluginPlatformState{}, &model.UserPluginState{}, &model.AdminAuditEvent{}); err != nil {
+		t.Fatal(err)
+	}
+	center, err := newPluginRuntime(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{repo: repository.New(db), pluginRuntime: center}
+	user := &model.User{ID: "user-1", Role: model.UserRoleUser}
+
+	states, err := svc.PluginStatesForUser(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, ok := states[PluginPromptGallery]
+	if !ok {
+		t.Fatalf("prompt gallery missing from plugin states: %#v", states)
+	}
+	if !state.PlatformAvailable || !state.CanToggle || !state.EffectiveEnabled || state.UserConfigured {
+		t.Fatalf("prompt gallery default state = %#v", state)
+	}
+
+	disabled, err := svc.SetUserPluginEnabled(user, PluginPromptGallery, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled.UserConfigured || disabled.UserEnabled || disabled.EffectiveEnabled {
+		t.Fatalf("prompt gallery stays enabled after user opt-out: %#v", disabled)
+	}
+}

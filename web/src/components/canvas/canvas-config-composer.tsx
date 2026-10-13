@@ -4,6 +4,7 @@ import { X } from "lucide-react";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { isCanvasWorkflowProvider } from "@/lib/canvas/canvas-workflow";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
+import { PromptEditorActions } from "@/components/prompt-gallery/prompt-editor-actions";
 import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import type { CanvasGenerationMode, CanvasNodeMetadata, CanvasWorkspaceMode } from "@/types/canvas";
 import { normalizeGenerationNodeMentionTokens, type NodeGenerationInput } from "./canvas-node-generation";
@@ -35,11 +36,11 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
         const editor = container.current?.querySelector<HTMLElement>("[contenteditable='true'],textarea");
         caret.current = editor instanceof HTMLTextAreaElement ? { start: editor.selectionStart, end: editor.selectionEnd } : getEditableSelection(editor || null);
     };
-    const insertPreset = (preset: CanvasPromptPreset) => {
+    // 预设与插件回填都按光标插入：组装框里可能已经引用了 @ 素材，替换整段会丢掉这些引用。
+    const insertAtCaret = (text: string) => {
         const position = caret.current || { start: prompt.length, end: prompt.length };
-        const next = insertComposerPreset(prompt, position.start, position.end, preset.prompt);
+        const next = insertComposerPreset(prompt, position.start, position.end, text);
         onChange(next.text);
-        setPresetsOpen(false);
         requestAnimationFrame(() => {
             const editor = container.current?.querySelector<HTMLElement>("[contenteditable='true'],textarea");
             editor?.focus();
@@ -47,8 +48,13 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
             else if (editor) setEditableSelection(editor, next.caret);
         });
     };
+    const insertPreset = (preset: CanvasPromptPreset) => {
+        insertAtCaret(preset.prompt);
+        setPresetsOpen(false);
+    };
     const frameOptions = references.filter((ref) => ref.kind === "image" && ref.previewUrl).map((ref) => ({ nodeId: ref.nodeId, label: ref.label, title: ref.title, previewUrl: ref.previewUrl }));
     return (
+        <>
         <section data-canvas-no-zoom className="canvas-config-composer rounded-xl bg-surface-active p-4" style={{ background: theme.spatial.elevated, color: theme.node.text }}
             onPointerDown={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
             <header className="mb-3 flex items-start justify-between gap-3">
@@ -57,6 +63,14 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
                     <p className="mt-1 text-xs opacity-60">{workflow ? "工作流按字段顺序接收连接素材" : "输入 @ 选择已连接素材或技能"}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
+                    {/* 插件按钮区：点击前先记住光标位置，回填时按光标插入而不是替换整段。 */}
+                    <PromptEditorActions
+                        surface="canvas-config"
+                        mode={generationMode === "video" ? "video" : "image"}
+                        prompt={prompt}
+                        readPrompt={() => prompt}
+                        applyPrompt={(text) => { rememberCaret(); insertAtCaret(text.trim()); }}
+                    />
                     {!simple ? <CanvasPresetPicker mode={generationMode} skillReferences={skillReferences} open={presetsOpen} onOpenChange={setPresetsOpen} onSelect={insertPreset} /> : null}
                     <Button size="small" type="text" aria-label="关闭提示词编辑器" icon={<X className="size-4" />} onClick={onClose} />
                 </div>
@@ -74,5 +88,6 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
                     }} />
             </div>
         </section>
+        </>
     );
 }

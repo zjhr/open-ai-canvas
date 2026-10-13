@@ -8,7 +8,7 @@
  *   - src/lib/inspirations/highlights.ts  打进包里的精选，供首页纵深画廊即时渲染
  *
  * 用法：
- *   bun scripts/import-inspirations.mjs [--only seedance|haohaoxue|youmind] [--thumbs 120] [--force]
+ *   bun scripts/import-inspirations.mjs [--only seedance|haohaoxue|youmind|lanshu] [--thumbs 120] [--force]
  *   bun scripts/import-inspirations.mjs --seedance-input <cases.json> --haohaoxue-input <prompts.html>
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -30,6 +30,11 @@ const YOUMIND_REPOS = [
     { repo: "YouMind-OpenLab/awesome-nano-banana-pro-prompts", slug: "nano-banana" },
     { repo: "YouMind-OpenLab/awesome-gpt-image-2", slug: "gpt-image-2" },
 ];
+/**
+ * 蓝书视频库：604 条单模型 + 110 条跨模型对照，MIT 许可，分类与厂商名都带中文。
+ * 它是纯提示词清单，上游没有任何配图，所以只导入正文、不进首页画廊池。
+ */
+const LANSHU_REPO = "cclank/lanshu-awesome-ai-video-kit";
 
 /** 卡片描述最多两行，完整正文仍在 prompt 里。 */
 const DESCRIPTION_LIMIT = 44;
@@ -150,11 +155,7 @@ async function downloadImage(url, target) {
 // ── awesome-seedance ────────────────────────────────────────────────────────
 
 async function resolveSeedanceRevision() {
-    const response = await fetch(`https://api.github.com/repos/${SEEDANCE_REPO}/commits/main`, {
-        headers: { Accept: "application/vnd.github.sha", "User-Agent": UA },
-    });
-    if (!response.ok) throw new Error(`取 seedance revision 失败: HTTP ${response.status}`);
-    return (await response.text()).trim();
+    return resolveRepoRevision(SEEDANCE_REPO);
 }
 
 async function loadSeedance(options) {
@@ -283,12 +284,21 @@ function buildHaohaoxueEntries(raw) {
 
 // ── YouMind 提示词库（nano-banana-pro / gpt-image-2） ──────────────────────
 
+/**
+ * 取仓库最新提交号。优先用 GitHub API，未认证时它的配额只有 60 次/小时，
+ * 命中限流（403）就退回 commits atom feed —— 那份 XML 不受配额限制，够拿到提交号。
+ */
 async function resolveRepoRevision(repo) {
     const response = await fetch(`https://api.github.com/repos/${repo}/commits/main`, {
         headers: { Accept: "application/vnd.github.sha", "User-Agent": UA },
     });
-    if (!response.ok) throw new Error(`取 ${repo} revision 失败: HTTP ${response.status}`);
-    return (await response.text()).trim();
+    if (response.ok) return (await response.text()).trim();
+    if (response.status !== 403) throw new Error(`取 ${repo} revision 失败: HTTP ${response.status}`);
+    const atom = await fetchText(`https://github.com/${repo}/commits/main.atom`);
+    const match = /Grit::Commit\/([0-9a-f]{40})/.exec(atom);
+    if (!match) throw new Error(`取 ${repo} revision 失败：API 被限流，atom feed 里也没有提交号`);
+    console.warn(`  ℹ ${repo}: GitHub API 被限流，改用 atom feed 取 revision`);
+    return match[1];
 }
 
 /**
@@ -360,6 +370,79 @@ async function loadYoumind() {
     return { revision: revisions.join(" + "), entries: unique, categories };
 }
 
+// ── 蓝书 AI 视频提示词库 ────────────────────────────────────────────────────
+
+/**
+ * 单一数据源 `prompts/data/all-prompts.json`：`prompts` 是条目数组，
+ * `categories` 带中文名，`models` 带厂商与模型名，条目本身只有正文、没有配图。
+ */
+async function loadLanshu() {
+    const revision = await resolveRepoRevision(LANSHU_REPO);
+    const parsed = JSON.parse(await fetchText(`https://raw.githubusercontent.com/${LANSHU_REPO}/${revision}/prompts/data/all-prompts.json`));
+    const raw = parsed?.prompts;
+    if (!Array.isArray(raw)) throw new Error("蓝书 all-prompts.json 结构不符合预期：缺少 prompts 数组");
+    const matrix = JSON.parse(await fetchText(`https://raw.githubusercontent.com/${LANSHU_REPO}/${revision}/prompts/data/cross-model-matrix.json`));
+    const categories = Object.fromEntries((Array.isArray(parsed.categories) ? parsed.categories : []).filter((item) => item?.id).map((item) => [item.id, item.zh || item.id]));
+    const models = parsed.models && typeof parsed.models === "object" ? parsed.models : {};
+    return { revision, raw, matrix, categories, models, schemaVersion: parsed.schema_version, updated: parsed.updated };
+}
+
+/**
+ * 蓝书条目是"可复用的生产配方"：中文标题 + 英文正文 + 模型/比例/时长。
+ * 正文保持原文（官方样板多为英文，改写会失真），中文信息放在标题和描述里；
+ * 模型 id 一并塞进 tags，让画廊搜"seedance"这类模型名能直接命中。
+ */
+function buildLanshuEntries(raw, categories, models) {
+    return raw
+        .filter((item) => item?.id && item.prompt && item.title)
+        .map((item) => {
+            const model = models[item.model] ?? {};
+            const spec = [item.params?.aspect, item.params?.duration].filter(Boolean).join(" · ");
+            return {
+                id: `lanshu:${item.id}`,
+                title: item.title,
+                description: hasCjk(item.notes) ? clip(item.notes, DESCRIPTION_LIMIT) : categories[item.category] ?? "",
+                mode: "video",
+                prompt: item.prompt,
+                ...(item.category ? { category: item.category } : {}),
+                ...(spec ? { ratio: spec } : {}),
+                tags: [...(Array.isArray(item.tags) ? item.tags : []), item.model].filter(Boolean),
+                sourceId: "lanshu",
+                credit: item.source?.name || model.name || "",
+                ...(item.source?.url ? { sourceUrl: item.source.url } : {}),
+            };
+        });
+}
+
+/**
+ * 跨模型对照矩阵：10 个场景 × 11 个模型 = 110 条，同一场景只按各模型公式改写结构，
+ * 适合横向比较模型提示词风格。条目挂在 `scenarios[].by_model[模型]` 下，所以单独展开。
+ */
+function buildLanshuMatrixEntries(matrix, categories, models) {
+    const scenarios = Array.isArray(matrix?.scenarios) ? matrix.scenarios : [];
+    const entries = [];
+    for (const scenario of scenarios) {
+        const byModel = scenario?.by_model && typeof scenario.by_model === "object" ? scenario.by_model : {};
+        for (const [modelId, variant] of Object.entries(byModel)) {
+            if (!variant?.prompt || !scenario?.title) continue;
+            const modelName = models[modelId]?.name || modelId;
+            entries.push({
+                id: `lanshu:mx-${scenario.id}-${modelId}`,
+                title: `${scenario.title} · ${modelName}`,
+                description: clip(`跨模型对照：${variant.method || categories[scenario.category] || ""}`, DESCRIPTION_LIMIT),
+                mode: "video",
+                prompt: variant.prompt,
+                ...(scenario.category ? { category: scenario.category } : {}),
+                tags: ["跨模型对照", modelId].filter(Boolean),
+                sourceId: "lanshu",
+                credit: "蓝书跨模型对照矩阵",
+                sourceUrl: `https://github.com/${LANSHU_REPO}/blob/main/prompts/data/cross-model-matrix.json`,
+            });
+        }
+    }
+    return entries;
+}
+
 // ── 产物 ────────────────────────────────────────────────────────────────────
 
 /** 目录里只留跨源共用的字段，heat/updated 这类排序辅助不落库。 */
@@ -388,13 +471,19 @@ ${Object.entries(revisions)
  * 只收描述非空的条目：画廊卡片是"行动点 / 标题 / 描述"三行固定版式，
  * 描述空着的卡片第三行会缺一块。这些条目仍留在全量目录里，灵感页照常展示。
  */
-function renderGalleryPool(revisions, highlights) {
-    const entries = Object.values(highlights)
-        .flat()
-        .filter((entry) => entry.description)
-        .map((entry) => ({ ...toCatalogEntry(entry), featured: true }));
-    return JSON.stringify({ generatedAt: new Date().toISOString(), revisions, entries });
+/**
+ * 画廊池落盘：按历史缩进风格整体序列化。
+ *
+ * 参数里的 carriedEntries 是"本次没有同步、但上次产物里已有"的条目，
+ * 保证 `--only <source>` 局部同步不会把其它来源的池子清空。
+ */
+function renderGalleryPool(revisions, highlights, carriedEntries = []) {
+    const entries = [...carriedEntries, ...Object.values(highlights).flat().filter((entry) => entry.description).map((entry) => ({ ...toCatalogEntry(entry), featured: true }))];
+    const revisionsText = `{ ${Object.entries(revisions).map(([key, value]) => `${JSON.stringify(key)}: ${JSON.stringify(value)}`).join(", ")} }`;
+    const serializedEntries = entries.map((entry) => `        ${JSON.stringify(entry, null, 4).replace(/\n/g, "\n    ")}`).join(",\n");
+    return `{\n    "generatedAt": ${JSON.stringify(new Date().toISOString())},\n    "revisions": ${revisionsText},\n    "entries": [\n${serializedEntries}\n    ]\n}\n`;
 }
+
 /**
  * 下载上游封面并压成本地缩略图，返回可写进目录的相对路径。
  * 返回 skipped 表示这张封面不可用（下载失败除外——那是抛错），调用方应把该条移出画廊池。
@@ -461,6 +550,23 @@ const SOURCE_PIPELINES = [
             return { revision, note: "两个姊妹库", entries, categories };
         },
     },
+    {
+        name: "lanshu",
+        file: "lanshu.json",
+        coverName: (entry) => sanitizeFileName(entry.id.replace(/^lanshu:/, "")),
+        /** 上游是纯提示词清单、没有任何配图：不生成缩略图，也不进首页画廊池。 */
+        noCover: true,
+        load: async () => {
+            const { revision, raw, matrix, categories, models, schemaVersion, updated } = await loadLanshu();
+            const matrixEntries = buildLanshuMatrixEntries(matrix, categories, models);
+            return {
+                revision: `${revision.slice(0, 8)} · schema ${schemaVersion} · ${updated}`,
+                note: `单模型 ${raw.length} 条 + 跨模型对照 ${matrixEntries.length} 条`,
+                entries: [...buildLanshuEntries(raw, categories, models), ...matrixEntries],
+                categories,
+            };
+        },
+    },
 ];
 
 /**
@@ -496,6 +602,12 @@ async function main() {
     let skippedThumbs = 0;
     let pruned = 0;
 
+    // 画廊池是按来源重建的：只同步部分来源时，未同步来源的池子条目必须从上次产物里带过来，
+    // 否则 `--only lanshu` 这种局部同步会把首页画廊其它来源的条目整片清掉。
+    const selectedNames = new Set(selected.map((pipeline) => pipeline.name));
+    const previousPool = existsSync(GALLERY_POOL_FILE) ? JSON.parse(readFileSync(GALLERY_POOL_FILE, "utf8")) : { entries: [] };
+    const carriedPoolEntries = (Array.isArray(previousPool.entries) ? previousPool.entries : []).filter((entry) => entry?.sourceId && !selectedNames.has(entry.sourceId));
+
     for (const pipeline of SOURCE_PIPELINES) {
         if (!selected.includes(pipeline)) {
             // 只同步其中一部分来源时，其余来源沿用上次落盘的 revision 与条目数，
@@ -516,32 +628,34 @@ async function main() {
         categoriesBySource[pipeline.name] = loaded.categories ?? {};
 
         // 只给一部分条目生成本地缩略图：全量一千多条都压一遍会让仓库和同步时间都失控，
-        // 其余继续引用上游 CDN，由灵感页按需拉取。
+        // 其余继续引用上游 CDN，由灵感页按需拉取。无配图来源直接跳过这一段。
         const thumbed = [];
         const thumbNames = new Set();
-        for (const entry of strideSample(entries, options.thumbs)) {
-            const name = pipeline.coverName(entry);
-            const result = await buildThumb(pipeline.name, entry, name, options.force);
-            if (result.skipped) {
-                skippedThumbs += 1;
-                continue;
+        if (!pipeline.noCover) {
+            for (const entry of strideSample(entries, options.thumbs)) {
+                const name = pipeline.coverName(entry);
+                const result = await buildThumb(pipeline.name, entry, name, options.force);
+                if (result.skipped) {
+                    skippedThumbs += 1;
+                    continue;
+                }
+                // 直接把 image 指向本地缩略图：目录 JSON 和精选模块都从这里取值。
+                entry.image = result.relative;
+                thumbNames.add(name);
+                thumbed.push(entry);
+                if (result.downloaded) downloaded += 1;
             }
-            // 直接把 image 指向本地缩略图：目录 JSON 和精选模块都从这里取值。
-            entry.image = result.relative;
-            thumbNames.add(name);
-            thumbed.push(entry);
-            if (result.downloaded) downloaded += 1;
+            pruned += pruneOrphanThumbs(pipeline.name, thumbNames);
         }
-        pruned += pruneOrphanThumbs(pipeline.name, thumbNames);
         highlights[pipeline.name] = thumbed;
 
         writeFileSync(join(PUBLIC_DIR, pipeline.file), JSON.stringify({ source: pipeline.name, revision: loaded.revision, count: entries.length, categories: loaded.categories ?? {}, entries: entries.map(toCatalogEntry) }), "utf8");
 
-        console.log(`${pipeline.name.padEnd(12)}: ${loaded.note} → 入库 ${entries.length} 条，本地缩略图 ${thumbed.length} 张`);
+        console.log(`${pipeline.name.padEnd(12)}: ${loaded.note} → 入库 ${entries.length} 条${pipeline.noCover ? "（上游无配图）" : `，本地缩略图 ${thumbed.length} 张`}`);
     }
 
     writeFileSync(REVISIONS_FILE, renderSourceRevisions(revisions), "utf8");
-    writeFileSync(GALLERY_POOL_FILE, renderGalleryPool(revisions, highlights), "utf8");
+    writeFileSync(GALLERY_POOL_FILE, renderGalleryPool(revisions, highlights, carriedPoolEntries), "utf8");
 
     const manifest = {
         generatedAt: new Date().toISOString(),

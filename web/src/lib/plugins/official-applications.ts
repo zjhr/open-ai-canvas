@@ -1,5 +1,6 @@
 import { ART_CRITIQUE_PLUGIN_ID } from "@/lib/art-critique/contracts";
 import { EAGLE_PLUGIN_ID } from "@/lib/plugins/builtin/eagle";
+import { PROMPT_GALLERY_PLUGIN_ID } from "@/lib/plugins/builtin/prompt-gallery";
 import { PROMPT_OPTIMIZER_PLUGIN_ID } from "@/lib/plugins/builtin/prompt-optimizer";
 import { RUNNINGHUB_PLUGIN_ID } from "@/lib/plugins/builtin/workflows";
 
@@ -15,6 +16,7 @@ export const OFFICIAL_APPLICATION_PLUGIN_IDS = [
     RUNNINGHUB_PLUGIN_ID,
     EAGLE_PLUGIN_ID,
     PROMPT_OPTIMIZER_PLUGIN_ID,
+    PROMPT_GALLERY_PLUGIN_ID,
     ART_CRITIQUE_PLUGIN_ID,
     EDITOR_SHELL_PLUGIN_ID,
 ] as const;

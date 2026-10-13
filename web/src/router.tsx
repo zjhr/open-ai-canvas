@@ -23,6 +23,7 @@ const ChannelsPage = lazy(() => import("@/pages/admin/channels/channels-page"));
 const LogicalModelsPage = lazy(() => import("@/pages/admin/logical-models/logical-models-page"));
 const AdminPluginsPage = lazy(() => import("@/pages/admin/plugins/plugins-page"));
 const SkillCurationPage = lazy(() => import("@/pages/admin/skill-curation-page"));
+const PromptGalleryIndexPage = lazy(() => import("@/pages/admin/prompt-gallery-index-page").then((module) => ({ default: module.PromptGalleryIndexPage })));
 const AdminPaymentsPage = lazy(() => import("@/pages/admin/payments/payments-page"));
 const LogsPage = lazy(() => import("@/pages/admin/logs/logs-page"));
 const RedemptionCodesPage = lazy(() => import("@/pages/admin/redemption-codes/redemption-codes-page"));
@@ -195,6 +196,7 @@ export const router = createBrowserRouter([
                     { path: "skill-curation", element: <SkillCurationPage /> },
                     { path: "payments", element: <AdminPaymentsPage /> },
                     { path: "prompt-templates", element: <StoryboardPromptsPage /> },
+                    { path: "prompt-gallery", element: <PromptGalleryIndexPage /> },
                     { path: "storyboard-prompts", element: <Navigate to="/admin/prompt-templates" replace /> },
                     { path: "announcements", element: <AnnouncementsPage /> },
                     { path: "banner-announcements", element: <BannerAnnouncementsPage /> },

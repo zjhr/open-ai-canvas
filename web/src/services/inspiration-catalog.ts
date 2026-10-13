@@ -31,6 +31,7 @@ const CATALOG_SOURCES: { key: InspirationSourceId; file: string }[] = [
     { key: "seedance", file: "/inspirations/seedance.json" },
     { key: "haohaoxue", file: "/inspirations/haohaoxue.json" },
     { key: "youmind", file: "/inspirations/youmind.json" },
+    { key: "lanshu", file: "/inspirations/lanshu.json" },
 ];
 
 let pending: Promise<InspirationCatalog> | null = null;

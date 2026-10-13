@@ -1,6 +1,6 @@
 import { Button, InputNumber, Modal } from "antd";
 import { Tooltip } from "@/components/ui/base/tooltip";
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { ArrowUp, ChevronDown, FileText, ImagePlus, LayoutList, LoaderCircle, Maximize2, Music2, SlidersHorizontal, Video, WandSparkles, X } from "lucide-react";
 
 import { ModelPicker } from "@/components/model-picker";
@@ -30,6 +30,7 @@ import { CanvasPromptOptimizerDrawer } from "./canvas-prompt-optimizer-drawer";
 import { CanvasNodeType, type CanvasGenerationMode, type CanvasNodeData, type CanvasNodeMetadata, type CanvasWorkspaceMode } from "@/types/canvas";
 import { applyToolMention, removeToolMentions, autoMentionCanvasResourceReferences, buildToolMentionReference, canvasResourceMentionToken, normalizeCanvasNodeMentionTokens, overwriteSameTypeToolMention, parseToolMentionTokens, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { promptOptimizerPlugin, PROMPT_OPTIMIZER_PLUGIN_ID } from "@/lib/plugins/builtin/prompt-optimizer";
+import { PromptEditorActions } from "@/components/prompt-gallery/prompt-editor-actions";
 import { createPluginHostContext } from "@/services/plugin-host";
 import { usePluginStore } from "@/stores/use-plugin-store";
 import { useResolvedCanvasResourceReferences } from "./use-resolved-canvas-resource-references";
@@ -280,6 +281,13 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
         updatePrompt(withoutSlash ? `${withoutSlash}\n${preset.prompt}` : preset.prompt);
     };
 
+    // 插件（提示词画廊等）回填与预设一致：输入框为空直接填入，已有内容按新行追加，避免误点覆盖草稿。
+    const applyPluginPrompt = useCallback((text: string) => {
+        const value = text.trim();
+        if (!value) return;
+        updatePromptFromCurrent((currentPrompt) => (currentPrompt.trim() ? `${currentPrompt.trimEnd()}\n${value}` : value));
+    }, []);
+
     const insertPromptReference = (reference: CanvasResourceReference) => {
         const insertText = `${canvasResourceMentionToken(reference)} `;
         const pendingMentionMatch = /@[^\s@，。！？、,.!?;:]*\s*$/.exec(prompt);
@@ -347,6 +355,8 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
                 </>}
             </div> : null}
             {showPromptTemplates ? <CanvasPresetPicker mode={mode} skillReferences={skillReferences} open={expanded ? expandedPresetOpen : presetOpen} onOpenChange={expanded ? setExpandedPresetOpen : setPresetOpen} onSelect={applyPreset} dense appearance="quiet" /> : null}
+            {/* 插件按钮区：提示词画廊等动作由插件注册，本组件不再内联任何插件 UI。 */}
+            <PromptEditorActions surface="canvas-node" mode={mode === "video" ? "video" : "image"} prompt={prompt} readPrompt={() => promptRef.current} applyPrompt={applyPluginPrompt} />
             {canOptimizePrompt ? (
                 <Tooltip title="用 AI 润色提示词">
                     <button
@@ -575,6 +585,7 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
     };
 
     return (
+        <>
         <CanvasPromptOptimizerDrawer
             open={promptOptimizerOpen}
             prompt={prompt}
@@ -660,6 +671,7 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
 
             </div>
         </CanvasPromptOptimizerDrawer>
+        </>
     );
 }
 

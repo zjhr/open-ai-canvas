@@ -1,7 +1,7 @@
 import type { CreationMode } from "@/lib/creation-mode";
 import { HIGHLIGHT_REVISIONS } from "./source-revisions";
 
-export type InspirationSourceId = "original" | "chatgpt-prompts" | "seedance" | "haohaoxue" | "youmind";
+export type InspirationSourceId = "original" | "chatgpt-prompts" | "seedance" | "haohaoxue" | "youmind" | "lanshu";
 
 export type InspirationSourceInfo = {
     /** 卡片来源行上的短标签。 */
@@ -50,6 +50,14 @@ export const inspirationSources: Record<InspirationSourceId, InspirationSourceIn
         license: "CC BY 4.0",
         notice: "图片提示词与配图来自 YouMind OpenLab 的 awesome-nano-banana-pro-prompts 与 awesome-gpt-image-2 两个姊妹库（Nano Banana Pro / GPT Image 2 中文提示词），按 CC BY 4.0 署名使用。作者署名取条目内置的 author 字段。配图为原提示词的生成示例，不代表本平台生成结果。",
     },
+    lanshu: {
+        label: "蓝书视频库 · MIT",
+        name: "蓝书视频库",
+        repository: "https://github.com/cclank/lanshu-awesome-ai-video-kit",
+        revision: HIGHLIGHT_REVISIONS.lanshu,
+        license: "MIT · 正文来自各厂商公开文档",
+        notice: "视频提示词来自蓝书 AI 视频提示词库（MIT 许可，494 条单模型配方，覆盖 Seedance、可灵、Veo、Sora、MiniMax 海螺、Wan 等 24 个模型）。上游注明 prompt 正文来自各厂商公开文档、仅供教育与研究，各模型版权归各家所有；此处保留原文与来源链接，署名取条目内置的 source 字段。该库没有配图，卡片以文字配方展示，不代表本平台生成结果。",
+    },
 };
 
 export function inspirationSourceOf(item: CreationInspiration): InspirationSourceInfo {
@@ -65,7 +73,8 @@ export type CreationInspiration = {
     id?: string;
     title: string;
     description: string;
-    image: string;
+    /** 封面。少数来源（如纯提示词清单的蓝书）没有配图，卡片走文字版式。 */
+    image?: string;
     mode: CreationMode;
     prompt: string;
     /** 中文正文，双语来源才有（好好学 AI 的中英双语条目）。 */

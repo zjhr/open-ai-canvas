@@ -11,6 +11,7 @@ import { listRegisteredPlugins } from "@/lib/plugins/plugin-registry";
 import "@/lib/plugins/builtin";
 import { EAGLE_PLUGIN_ID } from "@/lib/plugins/builtin/eagle";
 import { PROMPT_OPTIMIZER_PLUGIN_ID } from "@/lib/plugins/builtin/prompt-optimizer";
+import { PROMPT_GALLERY_PLUGIN_ID } from "@/lib/plugins/builtin/prompt-gallery";
 import { RUNNINGHUB_PLUGIN_ID } from "@/lib/plugins/builtin/workflows";
 import { isOfficialApplicationPluginId } from "@/lib/plugins/official-applications";
 import type { PluginManifest, PluginManifestV2, RegisteredPlugin } from "@/lib/plugins/plugin-types";
@@ -35,6 +36,7 @@ const categoryLabels: Record<string, string> = {
     "usage-observer": "用量观察",
     agent: "智能体",
     "import-export": "导入导出",
+    "prompt-source": "提示词画廊",
 };
 
 const surfaceLabels: Record<string, string> = {
@@ -42,6 +44,7 @@ const surfaceLabels: Record<string, string> = {
     fullscreen: "全屏工作台",
     hybrid: "混合接入",
     "asset-source": "素材库",
+    "prompt-gallery": "提示词画廊",
 };
 
 const permissionLabels: Record<string, string> = {
@@ -560,6 +563,11 @@ export default function PluginsPage() {
                                             <p>在创作页或图片、视频节点的提示词编辑器中使用“优化”按钮，即可让当前文本模型整理提示词。</p>
                                             <p className="mt-2 text-[var(--fs-micro)] text-foreground/50">插件不会自动覆盖原提示词，只有点击“采用”后才会回填到当前输入框。</p>
                                         </div>
+                                    ) : settingsPlugin.manifest.id === PROMPT_GALLERY_PLUGIN_ID ? (
+                                        <div className="rounded-[var(--r-md)] border border-border/60 bg-muted/25 px-3 py-3 text-[var(--fs-body)] leading-6 text-foreground/70">
+                                            <p>启用后，图片和视频的提示词输入框旁会出现「画廊」按钮，可在其中按关键词或一句话检索灵感目录并回填。</p>
+                                            <p className="mt-2 text-[var(--fs-micro)] text-foreground/50">画廊使用站点已内置的提示词目录，不会把你的输入或账号信息发送给外部来源；AI 搜索会把你的描述交给当前文本模型解析成检索条件。</p>
+                                        </div>
                                     ) : settingsPlugin.manifest.id === RUNNINGHUB_PLUGIN_ID ? (
                                         <div className="plugin-settings-empty">
                                             <p>RunningHub 的 API Key、Workflow / App 和字段映射在宿主设置页维护。</p>
@@ -635,6 +643,7 @@ function contributionKindsFor(manifest: PluginManifest | PluginManifestV2): stri
     if (contributions.usageObservers?.length) kinds.push("usage-observer");
     if (contributions.agents?.length) kinds.push("agent");
     if (contributions.importExport?.length) kinds.push("import-export");
+    if (contributions.promptSources?.length) kinds.push("prompt-source");
     return kinds;
 }
 

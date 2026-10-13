@@ -28,6 +28,7 @@ import { quoteModel, type LogicalModelQuote } from "@/services/api/logical-model
 import { modelOptionName, resolveModelChannel, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { PromptOptimizerProvider } from "@/lib/plugins/plugin-types";
+import { PromptEditorActions } from "@/components/prompt-gallery/prompt-editor-actions";
 import { type CreationReference } from "./creation-references";
 import { creationAttachmentKind, type CreationAttachment, type CreationMode } from "./creation-assets";
 import { countOptions, modeLabels, qualityOptions, resolutionOptions, type CreationShotRailEntry } from "./creation-types";
@@ -372,6 +373,14 @@ export function CreationComposer(props: ComposerProps) {
                     className="creation-voice-trigger"
                     disabled={interactionBusy}
                     onTranscribed={(text) => props.setPrompt(props.prompt.trim() ? `${props.prompt} ${text}` : text)}
+                />
+                {/* 插件按钮区：画廊等动作由插件注册，输入框只负责回填语义。 */}
+                <PromptEditorActions
+                    surface="creation-composer"
+                    mode={props.mode === "video" ? "video" : "image"}
+                    prompt={props.prompt}
+                    readPrompt={() => props.prompt}
+                    applyPrompt={(text) => props.setPrompt(props.prompt.trim() ? `${props.prompt.trimEnd()}\n${text.trim()}` : text.trim())}
                 />
                 {canOptimizePrompt ? <Tooltip title="用 AI 优化提示词">
                     <button

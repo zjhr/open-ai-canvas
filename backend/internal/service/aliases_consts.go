@@ -63,6 +63,7 @@ const (
 	PluginOriginSystem                 = app.PluginOriginSystem
 	PluginOriginUploaded               = app.PluginOriginUploaded
 	PluginPortraitClearance            = app.PluginPortraitClearance
+	PluginPromptGallery                = app.PluginPromptGallery
 	PluginPromptOptimizer              = app.PluginPromptOptimizer
 	PluginScopeSystem                  = app.PluginScopeSystem
 	PluginScopeUser                    = app.PluginScopeUser

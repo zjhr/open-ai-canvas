@@ -53,6 +53,10 @@ AutoDL 视频模型在“能力与参数 → 画面规格”直接多选当前�
 
 画布中的远程图片、视频和音频展示统一使用资源文件地址，不把浏览器 Blob Object URL 写入节点或预览状态；Blob 缓存只用于导出、抽帧、供应商输入等字节处理。画布生成的视频在进入成功态前会先完成资源 Blob 缓存，缓存失败会保留失败语义，不会显示为已成功。
 
+两个 HuggingFace 大库（Seedance 2 约 8.8 千条、GPT Image 2 约 2.1 万条）不进静态目录：元数据合计 155MB、封面 3 万张，由后端流式同步进 `prompt_gallery_prompts` 索引，提示词画廊按来源筛选时经 `POST /api/prompt-gallery/search` 检索，封面经 `GET /api/prompt-gallery/cover` 按需代理并缓存到数据目录。同步入口在后台「提示词画廊索引」页（模型与资源分组），只允许管理员触发。
+
+提示词输入框的按钮由插件插槽提供（`contributes.promptEditorSlots`）：宿主在画布节点面板、生成配置组装框与创作页输入框各渲染一处 `PromptEditorActions`，插件注册按钮与弹层。新增输入框按钮不需要修改输入框组件本身。
+
 ### 相关实现
 
 - `web/src/pages/assets/index.tsx`：素材库分类筛选、新建、重命名、删除和批量移动入口。
@@ -475,7 +479,7 @@ SEO 标题、描述、可选关键词会投影到浏览器 metadata、Open Graph
 
 工作区左侧「创作」下方新增灵感页 `/inspirations`，展示全部提示词，按来源、分类和创作类型筛选，支持搜索、收藏、视图切换和分页；自建灵感支持新建、编辑、删除和 JSON 导入导出，改动只存在本地。
 
-外部提示词由 `web/scripts/import-inspirations.mjs` 同步：`awesome-seedance`、好好学 AI 提示词库、YouMind 的两个姊妹库。脚本同时为画廊池生成本地缩略图（560px、webp、约 35KB 一张）。上游封面平均 400KB～700KB，直接引用一屏 11 张要拉 5MB 以上，换成本地缩略图后约 400KB。
+外部提示词由 `web/scripts/import-inspirations.mjs` 同步：`awesome-seedance`、好好学 AI 提示词库、YouMind 的两个姊妹库、蓝书 AI 视频提示词库（MIT，604 条视频配方 = 494 条单模型 + 110 条跨模型对照）。脚本同时为画廊池生成本地缩略图（560px、webp、约 35KB 一张）。上游封面平均 400KB～700KB，直接引用一屏 11 张要拉 5MB 以上，换成本地缩略图后约 400KB。蓝书上游是纯提示词清单、没有配图，因此不生成缩略图也不进画廊池，卡片改用「分类 + 规格 + 来源名」的文字版式；灵感页、详情弹窗与提示词画廊抽屉都按 `image` 缺省分支渲染，不出现破图。
 
 画廊池走 `public/inspirations/gallery-pool.json` 运行时拉取，不打进首屏 JS：几百条提示词正文压在包里是白背的，而这份数据只服务画廊一处。池子按来源等距抽取以横跨各分类，并且只收描述非空的条目，保证卡片三行版式不缺角；这些条目仍留在全量目录里供灵感页展示。
 
