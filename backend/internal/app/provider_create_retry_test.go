@@ -208,3 +208,72 @@ func TestVideoCreateRetryAppliesDefaultsEmptyModeToVideo(t *testing.T) {
 		t.Fatal("expected Agnes video to enable create retry")
 	}
 }
+
+func TestVideoCreateRetryDelayUsesExponentialBackoff(t *testing.T) {
+	err := providerHTTPError{StatusCode: http.StatusServiceUnavailable}
+	want := []time.Duration{
+		videoCreateRetryBaseDelay,     // 2s
+		2 * videoCreateRetryBaseDelay, // 4s
+		4 * videoCreateRetryBaseDelay, // 8s
+		8 * videoCreateRetryBaseDelay, // 16s
+	}
+	for attempt, expected := range want {
+		if got := videoCreateRetryDelay(err, attempt); got != expected {
+			t.Fatalf("attempt %d: got %v, want %v", attempt, got, expected)
+		}
+	}
+}
+
+func TestVideoCreateRetryDelayCapsBackoff(t *testing.T) {
+	err := providerHTTPError{StatusCode: http.StatusServiceUnavailable}
+	// 指数增长最终要被 videoCreateRetryMaxDelay 截断。
+	if got := videoCreateRetryDelay(err, 20); got != videoCreateRetryMaxDelay {
+		t.Fatalf("got %v, want capped %v", got, videoCreateRetryMaxDelay)
+	}
+}
+
+func TestVideoCreateRetryDelayCapsExcessiveRetryAfter(t *testing.T) {
+	// 极端 Retry-After 不能一次吃光任务预算。
+	err := providerHTTPError{StatusCode: http.StatusTooManyRequests, RetryAfter: 10 * time.Minute}
+	if got := videoCreateRetryDelay(err, 0); got != videoCreateRetrySleepCap {
+		t.Fatalf("got %v, want capped %v", got, videoCreateRetrySleepCap)
+	}
+}
+
+func TestVideoCreateRetryDelayPrefersRetryAfterWithinCap(t *testing.T) {
+	err := providerHTTPError{StatusCode: http.StatusTooManyRequests, RetryAfter: 7 * time.Second}
+	if got := videoCreateRetryDelay(err, 3); got != 7*time.Second {
+		t.Fatalf("got %v, want the upstream Retry-After", got)
+	}
+}
+
+// 上游 503（队列已满）必须判为「明确拒绝」，否则任务会被标成 submission_unknown
+// 并停止自动重发，把可自愈的瞬时故障变成用户可见的失败。
+func TestSafeRouteRejectionTreatsUpstream503AsRejection(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"503 队列已满", providerHTTPError{StatusCode: http.StatusServiceUnavailable}, true},
+		{"429 限速", providerHTTPError{StatusCode: http.StatusTooManyRequests}, true},
+		{"500 上游内部错误", providerHTTPError{StatusCode: http.StatusInternalServerError}, true},
+		{"501 未实现", providerHTTPError{StatusCode: http.StatusNotImplemented}, true},
+		{"401 鉴权失败", providerHTTPError{StatusCode: http.StatusUnauthorized}, true},
+		{"404 路径不存在", providerHTTPError{StatusCode: http.StatusNotFound}, true},
+		// 网关层：请求可能已送达源站并受理，重发有重复计费风险。
+		{"502 网关错误", providerHTTPError{StatusCode: http.StatusBadGateway}, false},
+		{"504 网关超时", providerHTTPError{StatusCode: http.StatusGatewayTimeout}, false},
+		// 连接类错误无法确认是否已受理。
+		{"EOF", io.EOF, false},
+		{"上下文取消", context.Canceled, false},
+		{"普通业务错误", errors.New("解析响应失败"), false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := safeRouteRejection(test.err); got != test.want {
+				t.Fatalf("safeRouteRejection(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+}

@@ -32,10 +32,16 @@ import (
 const (
 	// agnesVideoAdapterID 与 protocol 包 agnesAdapter() 的 metadata ID 保持一致。
 	agnesVideoAdapterID = "agnes-video"
-	// videoCreateMaxRetries 是首次尝试之外的重试次数（总计至多 1+2 次请求）。
-	videoCreateMaxRetries = 2
-	// videoCreateRetryBaseDelay 是无 Retry-After 时的退避基数，按次数线性递增。
-	videoCreateRetryBaseDelay = 700 * time.Millisecond
+	// videoCreateMaxRetries 是首次尝试之外的重试次数（总计至多 1+4 次请求）。
+	// 上游「视频队列已满」这类窗口实测可持续数分钟，2 秒级重试无法穿越，因此配合
+	// 下面的指数退避给出约 30 秒的等待窗口；视频任务本身有 ≥5 分钟执行预算。
+	videoCreateMaxRetries = 4
+	// videoCreateRetryBaseDelay 是无 Retry-After 时的指数退避基数（2s/4s/8s/16s）。
+	videoCreateRetryBaseDelay = 2 * time.Second
+	// videoCreateRetryMaxDelay 限制指数退避的单次上限。
+	videoCreateRetryMaxDelay = 20 * time.Second
+	// videoCreateRetrySleepCap 限制单次等待上限，避免极端的 Retry-After 一次吃光任务预算。
+	videoCreateRetrySleepCap = 60 * time.Second
 )
 
 // videoCreateRetryable 判断创建阶段的错误是否值得自动重试。
@@ -68,12 +74,16 @@ func videoCreateRetryable(ctx context.Context, err error) bool {
 }
 
 // videoCreateRetryDelay 复用轮询阶段的退避口径：优先尊重上游 Retry-After，
-// 否则按尝试次数线性退避。
+// 否则按指数退避（2s/4s/8s/16s，单次上限 20s）。
+// Retry-After 与指数退避都受 videoCreateRetrySleepCap 约束，避免单次等待超预算。
 func videoCreateRetryDelay(err error, attempt int) time.Duration {
 	if retryAfter := providerRetryAfter(err); retryAfter > 0 {
-		return retryAfter
+		return min(retryAfter, videoCreateRetrySleepCap)
 	}
-	return time.Duration(attempt+1) * videoCreateRetryBaseDelay
+	if attempt < 0 {
+		attempt = 0
+	}
+	return min(videoCreateRetryBaseDelay<<uint(attempt), videoCreateRetryMaxDelay)
 }
 
 // runProtocolAdapterCreateWithRetry 在 create 阶段对瞬时错误做有限次重试。

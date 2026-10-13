@@ -483,6 +483,9 @@ func routeFailureCode(err error) string {
 	return "submission_unknown"
 }
 
+// safeRouteRejection 判定「上游明确拒绝、且没有创建任务」，因此重新派发不会重复计费。
+// 判错的代价不对称：把已受理的请求误判为拒绝会重复扣费，把拒绝误判为「结果未知」会让
+// 任务永久停止自动重发（submission_unknown），把可自愈的瞬时故障变成用户可见的失败。
 func safeRouteRejection(err error) bool {
 	if err == nil {
 		return false
@@ -495,7 +498,14 @@ func safeRouteRejection(err error) bool {
 		switch upstream.StatusCode {
 		case 401, 403, 404, 429:
 			return true
+		// 上游应用层明确拒绝或不可用（如 Agnes 高峰期的 503「视频队列已满，请稍后重试」），
+		// 本次请求没有创建任务，属可安全重发。此前只列了 429，导致 503 被归为
+		// submission_unknown，任务被判定「提交结果不明确，为避免重复扣费已停止自动重发」，
+		// 而实际上上游已明确要求稍后重试。
+		case 500, 501, 503:
+			return true
 		}
+		// 502/504 属网关层：请求可能已经送达源站并受理，此时重发有重复计费风险，故不纳入。
 	}
 	return false
 }
