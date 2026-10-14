@@ -65,4 +65,16 @@ describe("提示词输入框插槽注册表", () => {
             expect(source).not.toContain("usePromptGalleryProvider");
         }
     });
+
+    // 回归：内置插槽插件必须能在「任意页面」被加载到。
+    // 病根：builtin/index 的注册是模块副作用，若它只被插件中心页引入，
+    // 直接进画布/创作页时插件模块从未加载，插槽恒为空、按钮静默消失。
+    test("应用入口加载内置插件，保证非插件中心页面也能拿到输入框插槽", () => {
+        const entry = readFileSync(resolve(import.meta.dir, "../src/application.tsx"), "utf8");
+        expect(entry).toContain('import "@/lib/plugins/builtin"');
+
+        // builtin/index 必须仍以副作用方式引入插槽插件。
+        const builtin = readFileSync(resolve(import.meta.dir, "../src/lib/plugins/builtin/index.ts"), "utf8");
+        expect(builtin).toContain('import "./prompt-gallery"');
+    });
 });
