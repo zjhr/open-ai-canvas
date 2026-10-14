@@ -1,6 +1,6 @@
 import { CanvasWorkspacePanel } from "@/components/canvas/canvas-workspace-panel";
-import "@/lib/plugins/builtin/ai-art-critique";
-import "@/lib/plugins/builtin/media-conversion";
+// 内置插件（ai-art-critique / media-conversion 等）由应用入口统一加载，
+// 本页不再单独副作用 import，避免出现多个加载来源导致某条路径漏注册。
 import { useCanvasImageLayerGroups } from "./use-canvas-image-layer-groups";
 import { useCanvasImageLayerMaterials } from "./use-canvas-image-layer-materials";
 import { isCanvasNodeGenerating } from "@/lib/canvas/canvas-node-task-state";

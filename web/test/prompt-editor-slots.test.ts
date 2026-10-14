@@ -66,15 +66,34 @@ describe("提示词输入框插槽注册表", () => {
         }
     });
 
-    // 回归：内置插槽插件必须能在「任意页面」被加载到。
+    // 回归：内置插件必须在「任意页面」都能被加载到。
     // 病根：builtin/index 的注册是模块副作用，若它只被插件中心页引入，
     // 直接进画布/创作页时插件模块从未加载，插槽恒为空、按钮静默消失。
     test("应用入口加载内置插件，保证非插件中心页面也能拿到输入框插槽", () => {
         const entry = readFileSync(resolve(import.meta.dir, "../src/application.tsx"), "utf8");
         expect(entry).toContain('import "@/lib/plugins/builtin"');
+    });
 
-        // builtin/index 必须仍以副作用方式引入插槽插件。
-        const builtin = readFileSync(resolve(import.meta.dir, "../src/lib/plugins/builtin/index.ts"), "utf8");
-        expect(builtin).toContain('import "./prompt-gallery"');
+    // 收口：内置插件只能有一个加载来源，禁止页面再自行副作用 import。
+    // 否则新增页面/插件时容易再出现"某条路径漏注册"的静默故障。
+    test("内置插件只有一个加载入口，页面不再各自副作用 import", () => {
+        const root = resolve(import.meta.dir, "../src");
+        const builtin = readFileSync(resolve(root, "lib/plugins/builtin/index.ts"), "utf8");
+
+        // 所有内置插件都经由 builtin/index 加载。
+        for (const plugin of ["eagle", "prompt-optimizer", "prompt-gallery", "workflows", "ai-art-critique", "media-conversion", "editor/editor-shell"]) {
+            expect(builtin).toContain(`import "./${plugin}";`);
+        }
+
+        // 曾在页面里单独副作用 import 的三个插件，现在不得再出现裸 import。
+        // 允许 `import { ... } from "..."`（值/类型依赖），只禁止 `import "..."`（副作用依赖）。
+        for (const [file, plugin] of [
+            ["pages/canvas/project.tsx", "ai-art-critique"],
+            ["pages/canvas/project.tsx", "media-conversion"],
+            ["pages/projects/detail/editor.tsx", "editor/editor-shell"],
+        ] as const) {
+            const source = readFileSync(resolve(root, file), "utf8");
+            expect(source).not.toContain(`import "@/lib/plugins/builtin/${plugin}";`);
+        }
     });
 });

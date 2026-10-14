@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import "@/lib/plugins/builtin/editor/editor-shell";
+// editor-shell 由应用入口统一加载，本页不再单独副作用 import。
 import {
     AlertTriangle,
     Check,
