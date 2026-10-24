@@ -474,5 +474,7 @@ func migrations() []tableMigration {
 		migrateTable[model.TaskTextDelta]("task_text_delta"),
 		migrateTable[model.TaskLog]("task_logs"),
 		migrateTable[model.Result]("results"),
+		migrateTable[model.PromptGallerySource]("prompt_gallery_sources"),
+		migrateTable[model.PromptGalleryPrompt]("prompt_gallery_prompts"),
 	}
 }
