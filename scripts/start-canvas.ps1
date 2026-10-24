@@ -1,5 +1,14 @@
+﻿# 影策画布一键启动：已在运行就直接开浏览器，否则拉起前后端并等待就绪。
+#
+# 真正的前后端启动逻辑在 start-local.ps1（含 CGO/gcc、NODE_ENV、出站白名单、依赖安装），
+# 停止逻辑在 stop-local.ps1；-Restart 等价于"先停后起"。
 [CmdletBinding()]
-param()
+param(
+    # 先停止已在运行的服务再启动。
+    [switch]$Restart,
+    # 不自动打开浏览器（自动化/无桌面环境用）。
+    [switch]$NoBrowser
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -25,9 +34,30 @@ function Test-ListeningPort([int]$Port) {
     }
 }
 
+function Open-Canvas([string]$Url) {
+    if ($NoBrowser) {
+        Write-Host "（-NoBrowser：未打开浏览器）$Url" -ForegroundColor DarkGray
+        return
+    }
+    Start-Process $Url
+}
+
+if ($Restart) {
+    $stopScript = Join-Path $PSScriptRoot "stop-local.ps1"
+    if (-not (Test-Path -LiteralPath $stopScript)) {
+        throw "未找到停止脚本：$stopScript"
+    }
+    & $stopScript
+    foreach ($port in @(3000, 8080)) {
+        if (Test-ListeningPort $port) {
+            throw "重启中止：端口 $port 在停止后仍被占用。"
+        }
+    }
+}
+
 if (Test-CanvasHttp $healthUrl) {
     Write-Host "影策画布已经在运行，正在打开..." -ForegroundColor Green
-    Start-Process $canvasUrl
+    Open-Canvas $canvasUrl
     exit 0
 }
 
@@ -43,14 +73,14 @@ if (-not (Test-Path -LiteralPath $localStarter)) {
 Write-Host "正在启动影策前端和后端，请稍候..." -ForegroundColor Cyan
 & $localStarter
 
-$deadline = (Get-Date).AddMinutes(3)
+$deadline = (Get-Date).AddMinutes(5)
 do {
     Start-Sleep -Seconds 2
     if (Test-CanvasHttp $healthUrl) {
         Write-Host "影策画布已启动，正在打开浏览器..." -ForegroundColor Green
-        Start-Process $canvasUrl
+        Open-Canvas $canvasUrl
         exit 0
     }
 } while ((Get-Date) -lt $deadline)
 
-throw "影策服务已拉起，但 3 分钟内未通过健康检查。请查看打开的前端、后端窗口。"
+throw "影策服务已拉起，但 5 分钟内未通过健康检查。请查看打开的前端、后端窗口。"
