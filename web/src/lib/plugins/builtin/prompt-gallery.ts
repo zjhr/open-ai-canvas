@@ -120,6 +120,20 @@ function remoteQueryOf(query: PromptGalleryQuery) {
     };
 }
 
+/**
+ * 远端分面请求：把当前筛选原样带上（含来源与分类），只取 1 条结果，计数由服务端给。
+ *
+ * 服务端算来源计数时忽略来源、算分类计数时忽略分类，所以两个维度都得发过去；
+ * 漏掉来源会让「选定来源后的分类计数」仍按全库算，数字就又骗人了。
+ */
+function remoteFacetQuery(query: PromptGalleryQuery | undefined) {
+    return {
+        ...remoteQueryOf(query ?? {}),
+        sourceId: query?.sourceId && query.sourceId !== "all" ? query.sourceId : undefined,
+        limit: 1,
+    };
+}
+
 function remoteFailureMessage(error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);
     return `远端提示词索引暂时不可用，本次只返回站内目录（${detail}）`;
@@ -287,11 +301,11 @@ function createPromptGallery(context: Parameters<NonNullable<RegisteredPlugin["c
             }
             return searchAllSources(query);
         },
-        facets: async () => {
+        facets: async (query) => {
             const { items } = await loadLocalGalleryItems();
-            const local = promptGalleryFacets(items);
+            const local = promptGalleryFacets(items, query);
             try {
-                const [sources, remote] = await Promise.all([loadRemoteSources(), searchRemotePromptGallery({ limit: 1 })]);
+                const [sources, remote] = await Promise.all([loadRemoteSources(), searchRemotePromptGallery(remoteFacetQuery(query))]);
                 const byId = new Map(sources.map((source) => [source.id, source]));
                 return {
                     sources: mergeFacets(

@@ -72,18 +72,19 @@ export function PromptGalleryDrawer({ open, mode, provider, onClose, onApply }: 
 
     useEffect(() => () => planAbort.current?.abort(), []);
 
-    const query = useMemo(
+    /** 分面计数只跟筛选条件有关、与翻页无关，单独拆一份，翻页时不必重算。 */
+    const facetQuery = useMemo(
         () => ({
             keyword: plan?.keyword ?? debouncedKeyword,
             mode: modeFilter === "all" ? undefined : modeFilter,
             sourceId: sourceFilter,
             category: categoryFilter,
             favoritesOnly,
-            limit: pageSize,
-            offset: (page - 1) * pageSize,
         }),
-        [categoryFilter, debouncedKeyword, favoritesOnly, modeFilter, page, pageSize, plan?.keyword, sourceFilter],
+        [categoryFilter, debouncedKeyword, favoritesOnly, modeFilter, plan?.keyword, sourceFilter],
     );
+
+    const query = useMemo(() => ({ ...facetQuery, limit: pageSize, offset: (page - 1) * pageSize }), [facetQuery, page, pageSize]);
 
     useEffect(() => {
         if (!open || !provider) return;
@@ -114,8 +115,9 @@ export function PromptGalleryDrawer({ open, mode, provider, onClose, onApply }: 
     useEffect(() => {
         if (!open || !provider?.facets) return;
         let cancelled = false;
+        // 带上当前筛选：下拉里的计数必须等于"再选中它"能筛出的条数，否则用户会以为漏了条目。
         void provider
-            .facets()
+            .facets(facetQuery)
             .then((result) => {
                 if (!cancelled) setFacets(result);
             })
@@ -125,7 +127,7 @@ export function PromptGalleryDrawer({ open, mode, provider, onClose, onApply }: 
         return () => {
             cancelled = true;
         };
-    }, [open, provider, refreshKey]);
+    }, [facetQuery, open, provider, refreshKey]);
 
     const runAiSearch = useCallback(async () => {
         const request = keyword.trim();
