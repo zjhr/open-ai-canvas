@@ -3,7 +3,7 @@ import { createBrowserRouter, Navigate, Outlet, useLocation } from "react-router
 
 import { RequireAuth } from "@/components/auth/require-auth";
 import { FullScreenLoader, WorkspaceRouteLoader } from "@/components/ui/aceternity/full-screen-loader";
-import { loadAssetsPage, loadCanvasPage, loadCanvasProjectPage, loadCreatePage, loadInspirationsPage, loadProjectDetailPage, loadProjectsPage } from "@/lib/workspace-route-modules";
+import { loadAssetsPage, loadCanvasPage, loadCanvasProjectPage, loadCreatePage, loadProjectDetailPage, loadProjectsPage } from "@/lib/workspace-route-modules";
 import { CanvasRefreshShell } from "@/pages/canvas/canvas-refresh-shell";
 import { AuthScene } from "@/pages/auth/auth-scene";
 import RouteErrorPage from "@/pages/route-error";
@@ -39,6 +39,7 @@ const WorkbenchToolsPage = lazy(() => import("@/pages/admin/workbench-tools/work
 const SystemUpdatePage = lazy(() => import("@/pages/admin/settings/system-update-page"));
 const SystemPerformancePage = lazy(() => import("@/pages/admin/settings/system-performance-page"));
 const StoryboardPromptsPage = lazy(() => import("@/pages/admin/storyboard-prompts/storyboard-prompts-page"));
+const AdminFeedbacksPage = lazy(() => import("@/pages/admin/feedbacks/feedbacks-page"));
 const UsersPage = lazy(() => import("@/pages/admin/users/users-page"));
 const AssetsPage = lazy(loadAssetsPage);
 const LoginPage = lazy(() => import("@/pages/auth/login"));
@@ -50,7 +51,6 @@ const SharedCanvasPage = lazy(() => import("@/pages/canvas/shared"));
 const CreatePage = lazy(loadCreatePage);
 const ImageWorkbenchPage = lazy(() => import("@/pages/workbench/image-workbench-route"));
 const VideoWorkbenchPage = lazy(() => import("@/pages/workbench/video-workbench-page"));
-const InspirationsPage = lazy(loadInspirationsPage);
 const NotFound = lazy(() => import("@/pages/not-found"));
 const SkillsPage = lazy(() => import("@/pages/skills"));
 const PluginsPage = lazy(() => import("@/pages/plugins"));
@@ -137,7 +137,6 @@ export const router = createBrowserRouter([
                     </RequireAuth>
                 ),
             },
-            { path: "/inspirations", element: deferred(<InspirationsPage />) },
             {
                 path: "/tasks",
                 element: (
@@ -226,6 +225,7 @@ export const router = createBrowserRouter([
                     { index: true, element: <AnalyticsPage /> },
                     { path: "users", element: <UsersPage /> },
                     { path: "login-logs", element: <LoginLogsPage /> },
+                    { path: "feedbacks", element: <AdminFeedbacksPage /> },
                     { path: "channels", element: <ChannelsPage /> },
                     {
                         path: "models",

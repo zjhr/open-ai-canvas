@@ -8,7 +8,7 @@ import { Switch } from "@/components/ui/base/switch";
 import { configuredModelMatchesCapability, defaultConfig, modelOptionName, normalizeRunningHubCapability, resolveModelChannel, useEffectiveConfig, type AiConfig, type RunningHubCapability, type RunningHubWorkflow, type RunningHubWorkflowKind } from "@/stores/use-config-store";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { normalizeVideoDuration, normalizeVideoResolution } from "@/lib/video-generation-options";
-import { defaultModelCapabilityConfig, modelCapabilityConfigFor, normalizeImageValue, normalizeVideoValue, workflowFieldChoiceValues, workflowFieldCurrentValue, workflowFieldKey, workflowFieldNumberBounds, workflowFieldRandomKey, workflowFieldSubmissionValue, workflowFieldValueError, workflowImageCapabilityConfig, workflowOutputSizeValue, workflowParameterFields, workflowVideoCapabilityConfig, workflowVideoFieldsFromJson, type WorkflowVideoFieldLike } from "@/lib/model-capabilities";
+import { defaultModelCapabilityConfig, modelCapabilityConfigFor, normalizeImageValue, normalizeVideoValue, workflowFieldChoiceValues, workflowFieldCurrentValue, workflowFieldIsRatioChoices, workflowFieldKey, workflowFieldNumberBounds, workflowFieldOptionValue, workflowFieldRandomKey, workflowFieldSubmissionValue, workflowFieldValueError, workflowImageCapabilityConfig, workflowOutputSizeValue, workflowParameterFields, workflowVideoCapabilityConfig, workflowVideoFieldsFromJson, type WorkflowVideoFieldLike } from "@/lib/model-capabilities";
 import { defaultImageParamsForModel, modelCompatibilityError, modelRequestOptions, resolveCompatibleModel, resolveModelGenerationDefaults, type ModelRequirements } from "@/lib/model-selection";
 import { resolveCanvasWorkflowProvider } from "@/lib/canvas/canvas-workflow";
 import { canonicalGenerationMetadata, nodeGenerationPrompt } from "@/lib/canvas/generation-contract";
@@ -87,7 +87,7 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
             vquality: node.metadata?.vquality || globalConfig.vquality,
             videoGenerateAudio: node.metadata?.generateAudio ?? globalConfig.videoGenerateAudio,
             videoWatermark: node.metadata?.watermark ?? globalConfig.videoWatermark,
-            audioVoice: node.metadata?.audioVoice || globalConfig.audioVoice,
+            audioVoice: node.metadata?.audioVoice ?? globalConfig.audioVoice,
             audioFormat: node.metadata?.audioFormat || globalConfig.audioFormat,
             audioSpeed: node.metadata?.audioSpeed || globalConfig.audioSpeed,
             audioLanguage: node.metadata?.audioLanguage || globalConfig.audioLanguage,
@@ -363,11 +363,20 @@ export function WorkflowParameterControls({ fields, node, theme, onConfigChange,
                 const fieldType = ["FLOAT", "INT", "INTEGER"].includes(rawFieldType) ? "NUMBER" : rawFieldType;
                 const options = workflowFieldChoiceValues(field);
                 const selectOptions = options.length ? options : fieldType === "SELECT" && value !== "" ? [value] : [];
+                const ratioOptions = workflowFieldIsRatioChoices(field, selectOptions);
                 const bounds = workflowFieldNumberBounds(field);
                 const numeric = fieldType === "NUMBER" || fieldType === "SLIDER" || typeof value === "number" || bounds.min !== undefined || bounds.max !== undefined || bounds.step !== undefined;
                 const numericValue = value === "" || !Number.isFinite(Number(value)) ? undefined : Number(value);
                 const valueError = randomEnabled ? "" : workflowFieldValueError(field, value);
-                const control = fieldType === "SELECT" || selectOptions.length ? (
+                const control = ratioOptions ? (
+                    <div className="flex min-w-0 flex-wrap gap-1">
+                        {selectOptions.map((option) => {
+                            const optionValue = workflowFieldOptionValue(option);
+                            const selected = optionValue === workflowFieldOptionValue(value);
+                            return <button key={optionValue} type="button" className="min-h-7 rounded-md px-2 py-1 text-[var(--fs-label)] font-medium transition-colors hover:brightness-110 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1" style={{ background: selected ? theme.accent.primary : "transparent", color: selected ? theme.accent.onPrimary : theme.node.text, outlineColor: theme.node.muted }} aria-pressed={selected} onClick={() => update(field, optionValue)}>{optionValue}</button>;
+                        })}
+                    </div>
+                ) : fieldType === "SELECT" || selectOptions.length ? (
                     <Select status={valueError ? "error" : undefined} size="small" className="w-full" value={value === "" ? undefined : value as string | number} options={selectOptions.map((option) => ({ label: workflowParameterOptionLabel(option), value: workflowParameterOptionValue(option) }))} onChange={(next) => update(field, next)} />
                 ) : fieldType === "BOOLEAN" || typeof value === "boolean" ? (
                     <Switch size="sm" checked={value === true || value === "true"} onChange={(checked) => update(field, checked)} />
@@ -499,7 +508,7 @@ function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode: Can
         vquality: String(node.metadata?.vquality || globalConfig.vquality || defaultConfig.vquality),
         videoGenerateAudio: videoProfile?.generateAudio.supported ? node.metadata?.generateAudio ?? globalConfig.videoGenerateAudio ?? String(videoProfile.generateAudio.default) : "false",
         videoWatermark: videoProfile?.watermark.supported ? node.metadata?.watermark ?? globalConfig.videoWatermark ?? String(videoProfile.watermark.default) : "false",
-        audioVoice: node.metadata?.audioVoice || globalConfig.audioVoice || defaultConfig.audioVoice,
+        audioVoice: node.metadata?.audioVoice ?? globalConfig.audioVoice ?? defaultConfig.audioVoice,
         audioFormat: node.metadata?.audioFormat || globalConfig.audioFormat || defaultConfig.audioFormat,
         audioSpeed: node.metadata?.audioSpeed || globalConfig.audioSpeed || defaultConfig.audioSpeed,
         audioLanguage: node.metadata?.audioLanguage || globalConfig.audioLanguage || defaultConfig.audioLanguage,
@@ -533,6 +542,8 @@ function buildModelNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode
         mode === "image"
             ? {
                   size: node.metadata?.size,
+                  imageResolution: node.metadata?.imageResolution,
+                  imageParameters: node.metadata?.imageParameters,
                   quality: node.metadata?.quality,
                   transparentBackground: node.metadata?.transparentBackground,
                   count: String(node.metadata?.count || globalConfig.canvasImageCount || globalConfig.count || defaultConfig.count),
@@ -546,6 +557,8 @@ function buildModelNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode
               },
         {
             size: globalConfig.size || defaultConfig.size,
+            imageResolution: globalConfig.imageResolution || defaultConfig.imageResolution,
+            imageParameters: globalConfig.imageParameters ?? "{}",
             quality: globalConfig.quality || defaultConfig.quality,
             transparentBackground: globalConfig.transparentBackground || defaultConfig.transparentBackground,
             count: String(globalConfig.canvasImageCount || globalConfig.count || defaultConfig.count),
@@ -561,13 +574,15 @@ function buildModelNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode
         taskWorkflowProvider: "model",
         model,
         quality: generationDefaults.quality || globalConfig.quality || defaultConfig.quality,
+        imageResolution: generationDefaults.imageResolution || globalConfig.imageResolution || defaultConfig.imageResolution,
+        imageParameters: generationDefaults.imageParameters ?? globalConfig.imageParameters ?? "{}",
         size: generationDefaults.size ?? globalConfig.size ?? defaultConfig.size,
         transparentBackground: generationDefaults.transparentBackground || "false",
         videoSeconds: generationDefaults.videoSeconds ?? normalizeVideoDuration(globalConfig.videoSeconds || defaultConfig.videoSeconds),
         vquality: generationDefaults.vquality ?? normalizeVideoResolution(globalConfig.vquality || defaultConfig.vquality),
         videoGenerateAudio: videoProfile?.generateAudio.supported ? generationDefaults.videoGenerateAudio ?? String(videoProfile.generateAudio.default) : "false",
         videoWatermark: videoProfile?.watermark.supported ? generationDefaults.videoWatermark ?? String(videoProfile.watermark.default) : "false",
-        audioVoice: node.metadata?.audioVoice || globalConfig.audioVoice || defaultConfig.audioVoice,
+        audioVoice: node.metadata?.audioVoice ?? globalConfig.audioVoice ?? defaultConfig.audioVoice,
         audioFormat: node.metadata?.audioFormat || globalConfig.audioFormat || defaultConfig.audioFormat,
         audioSpeed: node.metadata?.audioSpeed || globalConfig.audioSpeed || defaultConfig.audioSpeed,
         audioLanguage: node.metadata?.audioLanguage || globalConfig.audioLanguage || defaultConfig.audioLanguage,

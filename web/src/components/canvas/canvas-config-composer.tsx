@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Button } from "antd";
 import { X } from "lucide-react";
 import { canvasThemes } from "@/lib/canvas-theme";
@@ -15,13 +15,15 @@ import { getEditableSelection, setEditableSelection } from "./canvas-mention-edi
 import { composerReferences, insertComposerPreset } from "./canvas-composer-references";
 
 type ComposerProps = {
+    nodeId: string; canvasId: string;
     value: string; inputs: NodeGenerationInput[]; skillReferences?: CanvasResourceReference[];
     generationMode?: CanvasGenerationMode; metadata?: CanvasNodeMetadata;
-    onChange: (value: string) => void; onMetadataChange?: (patch: Partial<CanvasNodeMetadata>) => void;
+    onChange: (value: string) => boolean | void; onMetadataChange?: (patch: Partial<CanvasNodeMetadata>) => void;
     onClose: () => void; workspaceMode?: CanvasWorkspaceMode;
 };
 
-export function CanvasConfigComposer({ value, inputs, skillReferences = [], generationMode = "image", metadata, onChange, onMetadataChange, onClose, workspaceMode = "professional" }: ComposerProps) {
+export function CanvasConfigComposer({ nodeId, canvasId, value, inputs, skillReferences = [], generationMode = "image", metadata, onChange, onMetadataChange, onClose, workspaceMode = "professional" }: ComposerProps) {
+    const readOnly = Boolean(metadata?.locked);
     const theme = canvasThemes[useActiveTheme()];
     const container = useRef<HTMLDivElement>(null);
     const caret = useRef<{ start: number; end: number } | null>(null);
@@ -30,7 +32,11 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
     const prompt = useMemo(() => normalizeGenerationNodeMentionTokens(value, inputs), [value, inputs]);
     const simple = workspaceMode === "simple";
     const workflow = generationMode === "video" && isCanvasWorkflowProvider(metadata);
-    useEffect(() => { if (prompt !== value) onChange(prompt); }, [prompt, value, onChange]);
+    const updatePrompt = (next: string) => {
+        if (readOnly) return false;
+        if (next === prompt) return true;
+        return onChange(next);
+    };
 
     const rememberCaret = () => {
         const editor = container.current?.querySelector<HTMLElement>("[contenteditable='true'],textarea");
@@ -40,17 +46,17 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
     const insertAtCaret = (text: string) => {
         const position = caret.current || { start: prompt.length, end: prompt.length };
         const next = insertComposerPreset(prompt, position.start, position.end, text);
-        onChange(next.text);
+        if (updatePrompt(next.text) === false) return false;
         requestAnimationFrame(() => {
             const editor = container.current?.querySelector<HTMLElement>("[contenteditable='true'],textarea");
             editor?.focus();
             if (editor instanceof HTMLTextAreaElement) editor.setSelectionRange(next.caret, next.caret);
             else if (editor) setEditableSelection(editor, next.caret);
         });
+        return true;
     };
     const insertPreset = (preset: CanvasPromptPreset) => {
-        insertAtCaret(preset.prompt);
-        setPresetsOpen(false);
+        if (insertAtCaret(preset.prompt)) setPresetsOpen(false);
     };
     const frameOptions = references.filter((ref) => ref.kind === "image" && ref.previewUrl).map((ref) => ({ nodeId: ref.nodeId, label: ref.label, title: ref.title, previewUrl: ref.previewUrl }));
     return (
@@ -80,11 +86,11 @@ export function CanvasConfigComposer({ value, inputs, skillReferences = [], gene
                     referenceSummary={{ imageCount: inputs.filter((input) => input.type === "image" || input.type === "character").length, videoCount: inputs.filter((input) => input.type === "video").length, audioCount: inputs.filter((input) => input.type === "audio").length }} onMetadataChange={onMetadataChange} />
             </div> : null}
             <div ref={container} className="canvas-config-composer-editor rounded-lg" style={{ background: theme.node.fill }} onBlurCapture={rememberCaret} onKeyUpCapture={rememberCaret} onPointerUpCapture={rememberCaret}>
-                <CanvasResourceMentionTextarea aria-label="组装生成提示词" value={prompt} references={references} onChange={onChange} sendOnEnter={false}
+                <CanvasResourceMentionTextarea aria-label="组装生成提示词" value={prompt} references={references} readOnly={readOnly} onChange={updatePrompt} sendOnEnter={false}
                     placeholder="输入提示词，按 @ 引用连接素材或技能" className="min-h-32 max-h-[min(42vh,360px)] w-full px-4 py-3 text-sm leading-7"
                     onKeyDown={(event) => {
                         event.stopPropagation();
-                        if (event.key === "/" && !simple && !event.nativeEvent.isComposing) requestAnimationFrame(() => { rememberCaret(); setPresetsOpen(true); });
+                        if (!readOnly && event.key === "/" && !simple && !event.nativeEvent.isComposing) requestAnimationFrame(() => { rememberCaret(); setPresetsOpen(true); });
                     }} />
             </div>
         </section>

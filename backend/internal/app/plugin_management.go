@@ -16,6 +16,7 @@ const (
 	PluginAIArtCritique       = "ai-art-critique"
 	PluginMediaConversion     = "media-conversion"
 	PluginEditorShell         = "editor-shell"
+	PluginUserFeedback        = "user-feedback"
 
 	PluginOriginOfficial = "official"
 	PluginOriginSystem   = "system"
@@ -89,6 +90,10 @@ var officialApplicationPolicies = map[string]PluginManagementView{
 		ActivationScope: PluginScopeUser, ConfigurationScope: PluginConfigurationNone,
 	},
 	PluginEditorShell: {
+		Origin: PluginOriginOfficial, Kind: PluginKindApplication,
+		ActivationScope: PluginScopeUser, ConfigurationScope: PluginConfigurationNone,
+	},
+	PluginUserFeedback: {
 		Origin: PluginOriginOfficial, Kind: PluginKindApplication,
 		ActivationScope: PluginScopeUser, ConfigurationScope: PluginConfigurationNone,
 	},
@@ -231,9 +236,10 @@ func (s *Service) pluginStateForUser(actor *model.User, pluginID string, items [
 		// explicitly saves a personal choice. Other official applications were
 		// already controlled by each user's local installation state.
 		if !userConfigured {
-			// media-conversion 与 prompt-gallery 是零成本的内置 UI 能力：没有默认开启
-			// 按钮就不会出现在输入框旁，用户也不会知道插件存在；两者都可以在插件中心关掉。
-			if pluginID == PluginMediaConversion || pluginID == PluginPromptGallery {
+			// media-conversion / prompt-gallery / user-feedback 都是零成本的内置 UI
+			// 能力：没有默认开启按钮就不会出现在输入框旁或反馈入口，用户也不会知道
+			// 插件存在；三者都可以在插件中心关掉。
+			if pluginID == PluginMediaConversion || pluginID == PluginPromptGallery || pluginID == PluginUserFeedback {
 				userEnabled = true
 			} else if hasRuntime && pluginID == WorkflowPluginRunningHub {
 				userEnabled = runtimePlugin.Status == "enabled"

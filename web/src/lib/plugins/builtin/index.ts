@@ -21,6 +21,7 @@ import "./workflows";
 import "./ai-art-critique";
 import "./media-conversion";
 import "./editor/editor-shell";
+import "./user-feedback";
 
 /** 供测试断言使用：本文件必须保持为副作用加载的唯一入口。 */
 export const BUILTIN_PLUGIN_BOOTSTRAP_ENTRIES = [
@@ -31,4 +32,7 @@ export const BUILTIN_PLUGIN_BOOTSTRAP_ENTRIES = [
     "ai-art-critique",
     "media-conversion",
     "editor/editor-shell",
+    "user-feedback",
 ] as const;
+
+export * from "./user-feedback";

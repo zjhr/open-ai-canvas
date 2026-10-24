@@ -193,7 +193,7 @@ func TestChannelFromRequestStoresAndClearsHeaders(t *testing.T) {
 func TestChannelFromRequestValidatesProxyURL(t *testing.T) {
 	limit := 4
 	base := model.ModelChannel{}
-	channel, err := channelFromRequest(ChannelRequest{Name: "Proxy", BaseURL: "https://93.184.216.34/v1", ProxyURL: "socks5://user:secret@127.0.0.1:1080", ConcurrencyLimit: &limit}, base)
+	channel, err := channelFromRequest(ChannelRequest{Name: "Proxy", BaseURL: "https://93.184.216.34/v1", ProxyURL: stringPtr("socks5://user:secret@127.0.0.1:1080"), ConcurrencyLimit: &limit}, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,10 +201,60 @@ func TestChannelFromRequestValidatesProxyURL(t *testing.T) {
 		t.Fatalf("proxy URL = %q", channel.ProxyURL)
 	}
 	for _, proxyURL := range []string{"ftp://127.0.0.1:1080", "socks5://", "socks5://127.0.0.1:1080#fragment", "http://" + strings.Repeat("a", 506)} {
-		_, err := channelFromRequest(ChannelRequest{Name: "Proxy", BaseURL: "https://93.184.216.34/v1", ProxyURL: proxyURL, ConcurrencyLimit: &limit}, base)
+		_, err := channelFromRequest(ChannelRequest{Name: "Proxy", BaseURL: "https://93.184.216.34/v1", ProxyURL: stringPtr(proxyURL), ConcurrencyLimit: &limit}, base)
 		if err == nil {
 			t.Fatalf("invalid proxy URL %q was accepted", proxyURL)
 		}
+	}
+}
+
+// 复现线上问题：管理端编辑渠道时把「代理地址」删掉（前端提交 proxyUrl:""）必须真的清空；
+// 未提交该字段（nil）才保持渠道现有值。此前 ProxyURL 是 string 类型，
+// mergeChannelRequest 无法区分「空串」与「没传」，一律回填旧值 → 永远清不掉。
+func TestMergeChannelRequestProxyURLPointerSemantics(t *testing.T) {
+	stored := model.ModelChannel{
+		Name:       "Proxy",
+		BaseURL:    "https://93.184.216.34/v1",
+		APIFormat:  "openai",
+		ModelsJSON: `[]`,
+		ProxyURL:   "http://127.0.0.1:10080",
+	}
+
+	cleared := mergeChannelRequest(ChannelRequest{ProxyURL: stringPtr("")}, stored)
+	if cleared.ProxyURL == nil || *cleared.ProxyURL != "" {
+		t.Fatalf("cleared proxy URL = %v, want pointer to empty string", cleared.ProxyURL)
+	}
+
+	disabled := false
+	kept := mergeChannelRequest(ChannelRequest{Enabled: &disabled}, stored)
+	if kept.ProxyURL == nil || *kept.ProxyURL != stored.ProxyURL {
+		t.Fatalf("omitted proxy URL = %v, want %q kept", kept.ProxyURL, stored.ProxyURL)
+	}
+}
+
+func TestChannelFromRequestClearsProxyURL(t *testing.T) {
+	limit := 4
+	base := model.ModelChannel{ProxyURL: "http://127.0.0.1:10080"}
+	request := ChannelRequest{Name: "Proxy", BaseURL: "https://93.184.216.34/v1", ConcurrencyLimit: &limit}
+
+	clearedReq := request
+	clearedReq.ProxyURL = stringPtr("")
+	cleared, err := channelFromRequest(clearedReq, base)
+	if err != nil {
+		t.Fatalf("channelFromRequest() clear proxy error: %v", err)
+	}
+	if cleared.ProxyURL != "" {
+		t.Fatalf("cleared proxy URL = %q, want empty", cleared.ProxyURL)
+	}
+
+	// 未提交该字段时不应保留传入 base 上的旧值以外的东西：包级入口下 base 值会被
+	// 显式赋空，实际链路依赖 mergeChannelRequest 先回填（见上一个用例）。
+	omitted, err := channelFromRequest(request, model.ModelChannel{})
+	if err != nil {
+		t.Fatalf("channelFromRequest() omitted proxy error: %v", err)
+	}
+	if omitted.ProxyURL != "" {
+		t.Fatalf("omitted proxy URL = %q, want empty", omitted.ProxyURL)
 	}
 }
 
@@ -286,6 +336,9 @@ func TestFetchAdminChannelModelsReaddsDeletedModel(t *testing.T) {
 	if active.ID == deleted.ID || active.Enabled || active.PriceConfigured {
 		t.Fatalf("re-added model = %#v", active)
 	}
+	if active.DisplayName != "未分类" || active.ProviderModelKey != "model-a" {
+		t.Fatalf("discovered model defaults = %#v", active)
+	}
 	var total int64
 	if err := db.Unscoped().Model(&model.ChannelModel{}).Where("channel_id = ? AND model_key = ?", channel.ID, "model-a").Count(&total).Error; err != nil {
 		t.Fatal(err)
@@ -338,6 +391,24 @@ func TestImportAdminChannelModelsOnlyImportsSelectedModels(t *testing.T) {
 	}
 	if len(imported) != 1 || imported[0].ModelKey != "model-b" {
 		t.Fatalf("imported models = %#v, want only model-b", imported)
+	}
+	if imported[0].DisplayName != "未分类" || imported[0].ProviderModelKey != "model-b" {
+		t.Fatalf("imported defaults = %#v", imported)
+	}
+	// 已有分组即使与模型 ID 相同，也不能被重复导入重置。
+	if err := db.Model(&imported[0]).Updates(map[string]any{"display_name": "model-b", "channel_label": "手动名称"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err = svc.ImportAdminChannelModels(context.Background(), admin, channel.ID, []string{"model-b"})
+	if err != nil || result.Added != 0 {
+		t.Fatalf("duplicate import = %#v, %v", result, err)
+	}
+	var unchanged model.ChannelModel
+	if err := db.First(&unchanged, "id = ?", imported[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.DisplayName != "model-b" || unchanged.ChannelLabel != "手动名称" {
+		t.Fatalf("duplicate import overwrote existing names: %#v", unchanged)
 	}
 }
 

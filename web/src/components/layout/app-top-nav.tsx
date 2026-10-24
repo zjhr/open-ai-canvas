@@ -8,6 +8,7 @@ import { readWorkspaceSidebarCollapsed, writeWorkspaceSidebarCollapsed } from "@
 import { WorkspaceTopBar } from "@/components/layout/workspace-top-bar";
 import { WorkspaceTopBarExtensionProvider } from "@/components/layout/workspace-top-bar-extension";
 import { WorkspaceWalletHost } from "@/components/layout/workspace-wallet-modal";
+import { FloatingFeedbackWidget } from "@/components/feedback/floating-feedback-widget";
 import { cn } from "@/lib/utils";
 import { isSpatialWorkbenchPath } from "@/lib/workspace-routes";
 
@@ -23,7 +24,7 @@ export function AppWorkspaceShell({ children }: { children: ReactNode }) {
     const hideChrome = pathname.startsWith("/admin") || /^\/canvas\/[^/]+/.test(pathname);
     const showGlobalTopBar = !hideChrome;
     const spatialWorkbench = isSpatialWorkbenchPath(pathname);
-    const creationWorkspace = pathname === "/";
+    const creationWorkspace = pathname === "/" || pathname === "/create";
 
     const isMobileViewport = () => window.innerWidth < 1024;
 
@@ -114,6 +115,7 @@ export function AppWorkspaceShell({ children }: { children: ReactNode }) {
             </WorkspaceTopBarExtensionProvider>
             <WorkspaceWalletHost />
             <ModelSetupGuide hidden={pathname === "/login" || pathname === "/register" || pathname.startsWith("/admin")} />
+            {!hideChrome && pathname !== "/login" && pathname !== "/register" ? <FloatingFeedbackWidget /> : null}
         </>
     );
 }

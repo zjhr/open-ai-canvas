@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { createClientUUID } from "@/lib/client-id";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import { Button } from "antd";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { MoveDiagonal2 } from "lucide-react";
@@ -11,6 +12,7 @@ import { nanoid } from "nanoid";
 import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { agentSubmissionErrorTitle } from "@/lib/canvas/agent-error-presentation";
+import { CanvasSyncPendingError, waitForCanvasSync } from "@/lib/canvas/sync-recovery";
 import {
     cancelAgentRun,
     getAgentCapabilities,
@@ -21,6 +23,7 @@ import {
     sendAgentInterjection,
     sendAgentMessage,
     subscribeAgentEvents,
+    undoAgentCanvasRun,
     updateAgentProfile,
     type AgentPermissionMode,
     type AgentProfileScope,
@@ -35,6 +38,8 @@ import type { AgentMediaSettings } from "@/services/api/agent";
 import { addSkill, listAddedSkills, listSkillLibraryCategories, listSkills, listSkillPresets, type Skill, type SkillCategory, type SkillLibraryCategory, type SkillPreset } from "@/services/api/skills";
 import {
     clearCloudAgentPendingSubmission,
+    cloudAgentConversationServerId,
+    cloudAgentPendingMatchesRun,
     cloudAgentConversationTitle,
     loadCloudAgentConversations,
     loadCloudAgentPendingSubmission,
@@ -44,15 +49,19 @@ import {
     type CloudAgentPendingSubmission,
     type CloudAgentMessagePresentation,
 } from "@/services/cloud-agent-conversations";
+import { loadCloudAgentConversation, mergeCloudAgentConversations, refreshCloudAgentConversations } from "@/services/cloud-agent-history";
+import { canvasCloudAgentConversation, cloudAgentFollowDecision } from "@/lib/canvas/cloud-agent-follow";
+import { resolveCloudAgentModel } from "@/lib/canvas/cloud-agent-model-restore";
 import { logicalModelIDForConfig, modelOptionName, resolveModelRequestConfig, selectableModelsByCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { selectImageInspectionModel } from "@/lib/canvas/image-to-previs-agent";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { getActiveUserScope } from "@/lib/user-scope";
-import { applyAgentCanvasPatches, refreshCanvasAfterAgent, saveRemoteUserDataNow } from "@/services/user-data-sync";
+import { applyAgentCanvasPatches, refreshCanvasAfterAgent, prepareCanvasForCloudAction } from "@/services/user-data-sync";
 import { createAgentCanvasSync } from "@/services/agent-canvas-sync";
+import { agentCanvasUndoKey, type AgentCanvasUndoState, type AgentCanvasUndoTarget } from "@/lib/canvas/agent-canvas-undo";
+import { canvasEditLeases } from "@/services/canvas-edit-leases";
 import { buildSkillMentionReferences, resolveSkillMentions } from "@/services/skill-runtime";
-import { DEFAULT_CANVAS_AGENT_SKILL_ID, ensureDefaultCanvasAgentSkill } from "@/services/skill-defaults";
 import { AGENT_SCENE_DEFS, AgentChatComposer, parseCloudAgentFormAnswer, AgentPlanBar, AgentQuestionBar, AgentSceneCapsules, type AgentSceneBucket, type CloudAgentChatMessage } from "./canvas-cloud-agent-chat-ui";
 import { CanvasAgentSkillLibraryModal } from "./canvas-agent-skill-library-modal";
 import { useSkillCuration, curationQuery } from "@/components/skills/skill-curation-browser";
@@ -62,27 +71,41 @@ import "./canvas-cloud-agent.css";
 import { appendAgentError, appendUniqueMessage, applyAgentEvent, positiveNumber, type ApprovalState } from "./canvas-cloud-agent-events";
 import { AgentContextRing, AgentConversation, AgentHeader, AgentHistory, AgentLauncher, ComposerControls } from "./canvas-cloud-agent-panel-parts";
 import { AgentConnectorsBar } from "./canvas-cloud-agent-connectors";
+import { useGlobalAgentStore, type AgentPrefillRequest } from "@/stores/use-global-agent-store";
 
-type CloudAgentPanelProps = {
-    canvasId: string;
-    domainProjectId?: string;
-    nodeCount: number;
-    selectedNodeIds: string[];
-    references: CanvasResourceReference[];
-    open: boolean;
-    /** 外部预填请求（如右键“发送到 Agent”）；id 变化即追加一次 text，可选自动提交和视觉模型路由。 */
-    prefillRequest?: (CloudAgentMessagePresentation & { id: number; text: string; autoSubmit?: boolean; requiresVision?: boolean }) | null;
-    onOpen: () => void;
-    onCollapse: () => void;
-    onFocusNode?: (nodeId: string) => void;
-    /** 画布节点快照：用于识别审批目标节点是否已被用户直接提交生成。 */
-    canvasNodes?: readonly CanvasNodeData[];
-    runningNodeId?: string | null;
-};
 type AgentPanelView = "chat" | "history" | "settings";
 
-export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, selectedNodeIds, references, open, prefillRequest, onOpen, onCollapse, onFocusNode, canvasNodes, runningNodeId }: CloudAgentPanelProps) {
+function approvalStateFromRun(nextRun: AgentRun | null): ApprovalState | null {
+    const approval = nextRun?.approval;
+    if (!approval?.approvalId || approval.decision) return null;
+    return { approvalId: approval.approvalId, detail: approval, reason: approval.reason || "" };
+}
+
+const EMPTY_IDS: string[] = [];
+const EMPTY_REFERENCES: CanvasResourceReference[] = [];
+
+/**
+ * 平台唯一的 Agent 面板，挂在用户布局上，所有页面共用同一份对话。
+ * 画布编辑器通过 useGlobalAgentStore 发布当前画布；发送时有画布就绑定该画布，
+ * 离开画布后下一轮不再携带画布 ID（后端只开放无画布工具）。
+ */
+export const CanvasCloudAgentPanel = memo(function CanvasCloudAgentPanel() {
+    const canvasContext = useGlobalAgentStore((state) => state.canvas);
+    const open = useGlobalAgentStore((state) => state.open);
+    const onOpen = useGlobalAgentStore((state) => state.openAgent);
+    const onCollapse = useGlobalAgentStore((state) => state.closeAgent);
+    const canvasId = canvasContext?.canvasId ?? "";
+    const domainProjectId = canvasContext?.domainProjectId;
+    const nodeCount = canvasContext?.nodeCount ?? 0;
+    const selectedNodeIds = canvasContext?.selectedNodeIds ?? EMPTY_IDS;
+    const references = canvasContext?.references ?? EMPTY_REFERENCES;
+    const prefillRequest = canvasContext?.prefillRequest ?? null;
+    const onFocusNode = canvasContext?.onFocusNode;
+    const canvasNodes = canvasContext?.canvasNodes;
+    const runningNodeId = canvasContext?.runningNodeId;
     const userId = useUserStore((state) => state.user?.id);
+    const accountScope = getActiveUserScope();
+    const accountIsCurrent = () => getActiveUserScope() === accountScope && useUserStore.getState().user?.id === userId;
     const theme = canvasThemes[useActiveTheme()];
     const config = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
@@ -94,9 +117,10 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     const [connectionEpoch, setConnectionEpoch] = useState(0);
     const [messages, setMessages] = useState<CloudAgentChatMessage[]>([]);
     const [prompt, setPrompt] = useState("");
+    const [restoredModel, setRestoredModel] = useState<string | null>(null);
     const lastPrefillIdRef = useRef(0);
-    const [pendingAutoSubmit, setPendingAutoSubmit] = useState<CloudAgentPanelProps["prefillRequest"]>(null);
-    const prefilledSubmissionRef = useRef<CloudAgentPanelProps["prefillRequest"]>(null);
+    const [pendingAutoSubmit, setPendingAutoSubmit] = useState<AgentPrefillRequest | null>(null);
+    const prefilledSubmissionRef = useRef<AgentPrefillRequest | null>(null);
     const [reasoningMode, setReasoningMode] = useState<AgentReasoningMode>("off");
     const [profileView, setProfileView] = useState<AgentProfileView | null>(null);
     const [profileLoading, setProfileLoading] = useState(false);
@@ -123,6 +147,8 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     useEffect(() => { if (curationState.curation?.enabled) setSkillTag("all"); }, [curationState.curation?.enabled]);
     const [busy, setBusy] = useState(false);
     const [approvalSubmitting, setApprovalSubmitting] = useState(false);
+    const [undoStates, setUndoStates] = useState<Record<string, AgentCanvasUndoState>>({});
+    const undoRequestsRef = useRef(new Set<string>());
     const [exporting, setExporting] = useState(false);
     const [stopping, setStopping] = useState(false);
     const [approval, setApproval] = useState<ApprovalState | null>(null);
@@ -132,9 +158,22 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     const [maxGenerationTasks, setMaxGenerationTasks] = useState("0");
     const [maxVideoSeconds, setMaxVideoSeconds] = useState("0");
     const [conversations, setConversations] = useState<CloudAgentConversation[]>([]);
+    const conversationSnapshots = useRef(conversations);
+    conversationSnapshots.current = conversations;
     const [activeConversationId, setActiveConversationId] = useState(() => nanoid());
     const [historyHydrated, setHistoryHydrated] = useState(false);
     const [pendingHydrated, setPendingHydrated] = useState(false);
+    const [historyRestoreAttempt, setHistoryRestoreAttempt] = useState(0);
+    const [cloudHistoryLoading, setCloudHistoryLoading] = useState(false);
+    const [cloudHistoryError, setCloudHistoryError] = useState<string>();
+    const [cloudHistoryReady, setCloudHistoryReady] = useState(false);
+    const [cloudRefreshEpoch, setCloudRefreshEpoch] = useState(0);
+    const [cloudOpeningId, setCloudOpeningId] = useState("");
+    const cloudOpeningRef = useRef<string | null>(null);
+    const conversationLoadControllerRef = useRef<AbortController | null>(null);
+    const cloudRunTransitionRef = useRef<string | null>(null);
+    const historyRestoreScope = useRef("");
+    const hydratedAccount = useRef("");
     const [planMinimized, setPlanMinimized] = useState(false);
     const planItems = useMemo(() => latestAgentPlanItems(messages), [messages]);
     const planTerminal = useMemo(() => latestAgentPlanTerminal(messages), [messages]);
@@ -147,33 +186,48 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     const [connectorsVisible, setConnectorsVisible] = useState(true);
     const panelLayout = useAgentPanelLayout();
     const lastSeqRef = useRef(0);
+    const replayCursorRef = useRef({ runId: "", seq: 0 });
     const canvasSyncRef = useRef<ReturnType<typeof createAgentCanvasSync> | null>(null);
+    // 写回同步跟随“这一轮运行绑定的画布”，不跟随当前页面：离开画布后进行中的那一轮仍要把结果落回原画布。
+    const runCanvasId = run?.canvasId || "";
     useEffect(() => {
+        if (!runCanvasId) return;
         const sync = createAgentCanvasSync({
-            canvasId,
-            applyPatches: (patches) => applyAgentCanvasPatches(canvasId, patches),
-            refresh: () => refreshCanvasAfterAgent(canvasId),
-            onError: (cause) => setMessages((current) => appendAgentError(current, `canvas-sync-${canvasId}`, cause, "画布同步冲突")),
+            canvasId: runCanvasId,
+            applyPatches: (patches) => applyAgentCanvasPatches(runCanvasId, patches),
+            refresh: () => refreshCanvasAfterAgent(runCanvasId),
+            onError: (cause) => console.warn("画布后台同步尚未完成", cause),
         });
         canvasSyncRef.current = sync;
         return () => {
             sync.dispose();
             if (canvasSyncRef.current === sync) canvasSyncRef.current = null;
         };
-    }, [canvasId]);
+    }, [runCanvasId]);
     const skillPageRequestRef = useRef(false);
     const approvalRequestRef = useRef<string | null>(null);
     const pendingSubmission = useRef<CloudAgentPendingSubmission | null>(null);
     const submissionRequestRef = useRef(false);
-    const conversationScope = `${canvasId}:${activeConversationId}`;
+    const conversationScope = activeConversationId;
     const currentScope = useRef(conversationScope);
     currentScope.current = conversationScope;
+    useEffect(() => () => { currentScope.current = ""; conversationLoadControllerRef.current?.abort(); }, []);
     const running = Boolean(run?.cleanupPending) || run?.status === "running" || run?.status === "queued" || run?.status === "waiting_approval";
+    useSyncExternalStore(canvasEditLeases.subscribe, canvasEditLeases.snapshot, () => 0);
+    const canvasAgent = canvasId ? canvasEditLeases.agent(canvasId) : null;
+    const otherAgentRunning = Boolean(canvasAgent && canvasAgent.runId !== run?.id);
+    const cloudLiveState = useRef({ activeConversationId, run, prompt, messages, busy, running, approvalSubmitting, canvasId, pendingHydrated });
+    cloudLiveState.current = { activeConversationId, run, prompt, messages, busy, running, approvalSubmitting, canvasId, pendingHydrated };
+    const canvasCloudConversation = useMemo(() => canvasCloudAgentConversation(conversations, canvasId, canvasAgent?.runId), [conversations, canvasId, canvasAgent?.runId]);
+    const canvasCloudConversationIsCurrent = Boolean(canvasCloudConversation && (canvasCloudConversation.id === activeConversationId || cloudAgentConversationServerId(canvasCloudConversation) === run?.conversationId));
+    const restoredModelResolution = useMemo(() => restoredModel ? resolveCloudAgentModel(restoredModel, selectableModelsByCapability(config, "text")) : null, [config, restoredModel]);
+    const modelRestoreError = restoredModelResolution?.problem === "ambiguous" ? "原会话模型对应多个渠道，请先手动选择模型后继续。" : restoredModelResolution?.problem === "unavailable" ? "原会话模型当前不可用，请先手动选择模型后继续。" : "";
     const selectedModel = useMemo(() => {
+        if (restoredModelResolution) return restoredModelResolution.model;
         const textModels = selectableModelsByCapability(config, "text");
         const preferred = config.textModel || config.model || "";
         return textModels.includes(preferred) ? preferred : textModels[0] || "";
-    }, [config]);
+    }, [config, restoredModelResolution]);
     const installedSkills = useMemo(() => skills.filter((skill) => skill.isAdded), [skills]);
     const installedSkillIds = useMemo(() => new Set(installedSkills.map((skill) => skill.skillId)), [installedSkills]);
 
@@ -237,7 +291,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
             if (running || busy || presetApplyingRef.current || !historyHydrated || !pendingHydrated) return;
             const scope = conversationScope;
             const account = getActiveUserScope();
-            const token = crypto.randomUUID();
+            const token = createClientUUID();
             const isCurrent = () => presetApplyingRef.current === token && currentScope.current === scope && getActiveUserScope() === account;
             const missing = preset.skillIds.filter((id) => !installedSkillIds.has(id));
             presetApplyingRef.current = token;
@@ -281,7 +335,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
             if (running || busy || presetApplyingRef.current || !historyHydrated || !pendingHydrated) return;
             const scope = conversationScope;
             const account = getActiveUserScope();
-            const token = crypto.randomUUID();
+            const token = createClientUUID();
             const isCurrent = () => presetApplyingRef.current === token && currentScope.current === scope && getActiveUserScope() === account;
             presetApplyingRef.current = token;
             setPresetApplyingId(skill.skillId);
@@ -317,7 +371,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     );
     const status = run?.status || "idle";
     const statusLabel =
-        status === "waiting_approval" ? "等待审批" : status === "running" || status === "queued" ? "运行中" : status === "completed" ? "已完成" : status === "failed" ? "异常" : status === "cancelled" ? "已停止" : status === "rejected" ? "已拒绝" : "待命";
+        status === "waiting_approval" ? "等待审批" : status === "queued" ? "排队中" : status === "running" ? "运行中" : status === "completed" ? "已完成" : status === "failed" ? "异常" : status === "cancelled" ? "已停止" : status === "rejected" ? "已拒绝" : "待命";
     const statusColor = status === "failed" ? "#e66b6b" : status === "rejected" || status === "cancelled" ? theme.node.muted : status === "waiting_approval" ? "#d6a24a" : status === "running" || status === "queued" ? "#69c29b" : theme.node.muted;
 
     useEffect(() => {
@@ -468,47 +522,59 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
 
     useEffect(() => {
         let active = true;
+        hydratedAccount.current = "";
         setHistoryHydrated(false);
         setPendingHydrated(false);
+        setCloudHistoryReady(false);
+        setCloudHistoryError(undefined);
+        setCloudOpeningId("");
+        cloudOpeningRef.current = null;
+        conversationLoadControllerRef.current?.abort();
+        cloudRunTransitionRef.current = null;
+        replayCursorRef.current = { runId: "", seq: 0 };
+        setRestoredModel(null);
         pendingSubmission.current = null;
         setBusy(false);
         presetApplyingRef.current = null;
         setPresetApplyingId("");
         setConversations([]);
         setRun(null);
+        setUndoStates({});
         setMessages([]);
         setSelectedSkillIds([]);
         setApproval(null);
         setApprovalSubmitting(false);
         approvalRequestRef.current = null;
-        setPrompt("");
-        void loadCloudAgentConversations(canvasId)
+        const restoreScope = `${userId}:${accountScope}`;
+        if (historyRestoreScope.current !== restoreScope) setPrompt("");
+        historyRestoreScope.current = restoreScope;
+        void waitForCanvasSync(loadCloudAgentConversations(accountScope))
             .then(async (document) => {
                 if (!active) return;
                 const current = document.conversations.find((conversation) => conversation.id === document.activeId) || document.conversations[0];
                 let initialSkillIds = current?.skillIds || [];
                 if (!document.conversations.length) {
-                    try {
-                        const defaults = await ensureDefaultCanvasAgentSkill();
-                        if (!active) return;
-                        setSkills(defaults.skills);
-                        initialSkillIds = defaults.skills.some((skill) => skill.skillId === DEFAULT_CANVAS_AGENT_SKILL_ID && skill.isAdded)
-                            ? [DEFAULT_CANVAS_AGENT_SKILL_ID]
-                            : [];
-                    } catch (cause) {
-                        if (active) setMessages((currentMessages) => appendAgentError(currentMessages, "default-skill-error", cause, "默认短剧技能未能安装，已保留空技能选择"));
-                    }
+                    initialSkillIds = [];
                 }
                 setConversations(document.conversations);
                 if (current) {
                     setActiveConversationId(current.id);
                     setMessages(current.messages);
                     setRun(current.run);
+                    replayCursorRef.current = { runId: current.run?.id || "", seq: current.lastEventSeq || 0 };
+                    setApproval(approvalStateFromRun(current.run));
+                    setPrompt(current.draft || "");
                     setPermissionMode(current.permissionMode);
                     setSelectedSkillIds(initialSkillIds);
-                    if (current.model) setModel(current.model);
-                    const pending = await loadCloudAgentPendingSubmission(canvasId, current.id);
+                    setRestoredModel(current.model || null);
+                    let pending = await waitForCanvasSync(loadCloudAgentPendingSubmission(current.id, accountScope));
                     if (!active) return;
+                    if (cloudAgentPendingMatchesRun(pending, current.run)) {
+                        await waitForCanvasSync(clearCloudAgentPendingSubmission(current.id, accountScope));
+                        if (!active) return;
+                        if (current.draft === (pending?.displayText || pending?.request?.prompt)) setPrompt("");
+                        pending = null;
+                    }
                     pendingSubmission.current = pending;
                     if (pending?.request) setPrompt(pending.displayText || pending.request.prompt);
                 } else {
@@ -529,44 +595,131 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                     setConversations([initialConversation]);
                     setSelectedSkillIds(initialSkillIds);
                     pendingSubmission.current = null;
-                    void saveCloudAgentConversations(canvasId, initialConversationId, [initialConversation]).catch((cause) => {
-                        if (active) setMessages((currentMessages) => appendAgentError(currentMessages, "initial-conversation-save-error", cause, "新对话初始化保存失败，请重试后再发送"));
-                    });
+                    await saveCloudAgentConversations(initialConversationId, [initialConversation], accountScope);
                 }
-                setPendingHydrated(true);
+                if (active) setPendingHydrated(true);
             })
             .catch((cause) => {
                 if (!active) return;
-                setMessages((current) => appendAgentError(current, "history-error", cause, "对话恢复失败，已暂停发送；请重新打开对话核对"));
+                setMessages((current) => appendAgentError(current, "history-error", cause, "提交记录待确认，可继续输入并重新读取记录"));
             })
             .finally(() => {
-                if (active) setHistoryHydrated(true);
+                if (active) {
+                    hydratedAccount.current = restoreScope;
+                    setHistoryHydrated(true);
+                }
             });
         return () => {
             active = false;
         };
-    }, [canvasId, userId]);
+    }, [userId, accountScope, historyRestoreAttempt]);
 
     useEffect(() => {
-        if (!historyHydrated) return;
-        if (!messages.length && !run) {
-            setConversations((current) => {
-                const existing = current.find((conversation) => conversation.id === activeConversationId);
-                if (!existing || existing.skillIds?.join("\0") === selectedSkillIds.join("\0")) return current;
-                const now = new Date().toISOString();
-                return current.map((conversation) => conversation.id === activeConversationId ? { ...conversation, skillIds: selectedSkillIds, updatedAt: now } : conversation);
-            });
-            return;
-        }
+        if (!historyHydrated || !pendingHydrated || !userId || hydratedAccount.current !== `${userId}:${accountScope}`) return;
+        let active = true;
+        let refreshing = false;
+        let timer: ReturnType<typeof setTimeout>;
+        const controller = new AbortController();
+        setCloudHistoryReady(false);
+        const refresh = async () => {
+            if (!active || refreshing || !accountIsCurrent()) return;
+            refreshing = true;
+            setCloudHistoryLoading(true);
+            try {
+                const cache = conversationSnapshots.current;
+                const selected = cache.find((item) => item.id === cloudLiveState.current.activeConversationId);
+                const selectedId = selected ? cloudAgentConversationServerId(selected) : undefined;
+                const remote = await refreshCloudAgentConversations({ canvasId: canvasId || undefined, observedConversationIds: selectedId ? [selectedId] : [], existing: cache, scope: accountScope, signal: controller.signal });
+                if (!active || !accountIsCurrent() || cloudLiveState.current.canvasId !== canvasId) return;
+                const live = cloudLiveState.current;
+                const updates = remote.filter((item) => !cache.includes(item));
+                const merged = updates.length ? mergeCloudAgentConversations(conversationSnapshots.current, updates) : conversationSnapshots.current;
+                if (updates.length) setConversations((current) => mergeCloudAgentConversations(current, updates));
+                setCloudHistoryError(undefined);
+                setCloudHistoryReady(true);
+                const existing = merged.find((item) => item.id === live.activeConversationId);
+                if (!existing) return;
+                const current = { ...existing, run: live.run, messages: live.messages, draft: live.prompt };
+                const currentId = cloudAgentConversationServerId(existing);
+                const currentCloud = currentId ? merged.find((item) => cloudAgentConversationServerId(item) === currentId) : undefined;
+                const latestCanvasCandidate = canvasCloudAgentConversation(merged, canvasId, canvasId ? canvasEditLeases.agent(canvasId)?.runId : undefined);
+                const candidate = currentCloud?.run?.id !== live.run?.id ? currentCloud || latestCanvasCandidate : latestCanvasCandidate || currentCloud;
+                const blocked = live.busy || live.approvalSubmitting || submissionRequestRef.current || Boolean(pendingSubmission.current) || Boolean(cloudOpeningRef.current) || !live.pendingHydrated;
+                const decision = cloudAgentFollowDecision({ current, candidate, canvasId, blocked });
+                if (!candidate?.run || decision !== "current" && decision !== "switch") return;
+                const sameRun = candidate.id === live.activeConversationId && candidate.run.id === live.run?.id;
+                if (sameRun && (candidate.lastEventSeq || 0) < lastSeqRef.current) return;
+                if (sameRun && (candidate.run.revision || 0) <= (live.run?.revision || 0) && candidate.run.status === live.run?.status && Boolean(candidate.run.cleanupPending) === Boolean(live.run?.cleanupPending)) return;
+                // 未知 POST 身份属于原本地对话；切换前必须先读出，不能用目录发现覆盖它。
+                const pending = candidate.id === live.activeConversationId ? null : await loadCloudAgentPendingSubmission(candidate.id, accountScope);
+                if (!active || !accountIsCurrent() || cloudLiveState.current.activeConversationId !== live.activeConversationId || cloudLiveState.current.prompt !== live.prompt || submissionRequestRef.current || pendingSubmission.current || cloudOpeningRef.current || cloudLiveState.current.canvasId !== canvasId) return;
+                const sameConversation = decision === "current";
+                currentScope.current = candidate.id;
+                cloudRunTransitionRef.current = candidate.run.id;
+                replayCursorRef.current = { runId: candidate.run.id, seq: candidate.lastEventSeq || 0 };
+                // 同一轮 GET 可能先于缓冲中的 SSE delta 到达，两个水位必须一起前进。
+                lastSeqRef.current = candidate.lastEventSeq || 0;
+                presetApplyingRef.current = null;
+                setPresetApplyingId("");
+                pendingSubmission.current = pending;
+                approvalRequestRef.current = null;
+                setApprovalSubmitting(false);
+                setActiveConversationId(candidate.id);
+                setRun(candidate.run);
+                setMessages(candidate.messages);
+                setUndoStates({});
+                const nextApproval = approvalStateFromRun(candidate.run);
+                setApproval((previous) => previous?.approvalId && previous.approvalId === nextApproval?.approvalId ? { ...nextApproval, reason: previous.reason } : nextApproval);
+                if (!sameRun) {
+                    setContextUsage(emptyAgentContextUsage(candidate.run.id));
+                    setConnectionStatus("connecting");
+                }
+                if (!sameConversation) {
+                    setPrompt(pending?.request ? pending.displayText || pending.request.prompt : candidate.draft || "");
+                    setPermissionMode(candidate.permissionMode);
+                    setSelectedSkillIds(candidate.skillIds || []);
+                    setRestoredModel(candidate.model || null);
+                }
+            } catch (cause) {
+                if (active && !controller.signal.aborted && accountIsCurrent()) setCloudHistoryError(cause instanceof Error ? cause.message : "云端对话暂时无法读取");
+            } finally {
+                refreshing = false;
+                if (active) {
+                    setCloudHistoryLoading(false);
+                    clearTimeout(timer);
+                    timer = setTimeout(() => { void refresh(); }, 4000);
+                }
+            }
+        };
+        const wake = () => { if (document.visibilityState !== "hidden") void refresh(); };
+        void refresh();
+        window.addEventListener("focus", wake);
+        window.addEventListener("online", wake);
+        document.addEventListener("visibilitychange", wake);
+        return () => {
+            active = false;
+            controller.abort();
+            clearTimeout(timer);
+            window.removeEventListener("focus", wake);
+            window.removeEventListener("online", wake);
+            document.removeEventListener("visibilitychange", wake);
+        };
+    }, [historyHydrated, pendingHydrated, userId, accountScope, canvasId, cloudRefreshEpoch]);
+
+    useEffect(() => {
+        if (!historyHydrated || !pendingHydrated || hydratedAccount.current !== `${userId}:${accountScope}`) return;
         const now = new Date().toISOString();
         setConversations((current) => {
             const existing = current.find((conversation) => conversation.id === activeConversationId);
             const next: CloudAgentConversation = {
+                ...existing,
                 id: activeConversationId,
                 title: cloudAgentConversationTitle(messages),
                 messages,
                 run,
-                model: selectedModel || undefined,
+                lastEventSeq: run?.id === replayCursorRef.current.runId ? replayCursorRef.current.seq : existing?.lastEventSeq,
+                draft: prompt || undefined,
+                model: restoredModel || selectedModel || undefined,
                 permissionMode,
                 skillIds: selectedSkillIds,
                 createdAt: existing?.createdAt || now,
@@ -574,28 +727,32 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
             };
             return [next, ...current.filter((conversation) => conversation.id !== activeConversationId)];
         });
-    }, [activeConversationId, historyHydrated, messages, permissionMode, run, selectedModel, selectedSkillIds]);
+    }, [activeConversationId, historyHydrated, pendingHydrated, messages, permissionMode, prompt, run, selectedModel, restoredModel, selectedSkillIds, userId, accountScope]);
 
     useEffect(() => {
-        if (!historyHydrated) return;
-        const timer = window.setTimeout(() => {
-            void saveCloudAgentConversations(canvasId, activeConversationId, conversations);
-        }, 180);
-        return () => window.clearTimeout(timer);
-    }, [activeConversationId, canvasId, conversations, historyHydrated]);
+        if (!historyHydrated || !pendingHydrated || hydratedAccount.current !== `${userId}:${accountScope}`) return;
+        void saveCloudAgentConversations(activeConversationId, conversations, accountScope).catch((cause) => {
+            if (accountIsCurrent()) setCloudHistoryError(cause instanceof Error ? cause.message : "本机对话缓存保存失败");
+        });
+    }, [activeConversationId, conversations, historyHydrated, pendingHydrated, userId, accountScope]);
 
     useEffect(() => {
         if (!run?.id) return;
-        lastSeqRef.current = 0;
+        cloudRunTransitionRef.current = run.id;
+        const after = replayCursorRef.current.runId === run.id ? replayCursorRef.current.seq : 0;
+        replayCursorRef.current = { runId: run.id, seq: after };
+        lastSeqRef.current = after;
         return subscribeAgentEvents(
             run.id,
             (event) => {
+                if (!accountIsCurrent() || currentScope.current !== conversationScope || cloudRunTransitionRef.current !== run.id) return;
                 // Only persisted agent events participate in the replay cursor.
                 // Snapshot-derived UI events intentionally use seq=0.
                 if (event.seq > 0) {
                     if (event.seq <= lastSeqRef.current) return;
                     if (event.seq > lastSeqRef.current + 1) canvasSyncRef.current?.reconcile();
                     lastSeqRef.current = event.seq;
+                    replayCursorRef.current = { runId: run.id, seq: event.seq };
                 }
                 setMessages((current) => current.some((item) => item.id === `stream-error-${run.id}`) ? current.filter((item) => item.id !== `stream-error-${run.id}`) : current);
                 setContextUsage((current) => reduceAgentContextUsage(current, event));
@@ -603,9 +760,10 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                 canvasSyncRef.current?.receive(event);
             },
             {
-                after: 0,
-                onConnectionChange: setConnectionStatus,
+                after,
+                onConnectionChange: (next) => { if (accountIsCurrent() && currentScope.current === conversationScope && cloudRunTransitionRef.current === run.id) setConnectionStatus(next); },
                 onError: (cause) => {
+                    if (!accountIsCurrent() || currentScope.current !== conversationScope || cloudRunTransitionRef.current !== run.id) return;
                     canvasSyncRef.current?.reconcile();
                     setMessages((current) => appendAgentError(current, `stream-error-${run.id}`, cause, "Agent 事件流已断开"));
                     // The observation channel failed, not the durable run. Keep
@@ -614,37 +772,53 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                 },
             },
         );
-    }, [run?.id, connectionEpoch]);
+    }, [run?.id, connectionEpoch, accountScope, conversationScope]);
 
     useEffect(() => {
         if (!run?.id || connectionStatus !== "disconnected") return;
-        const reconnect = () => setConnectionEpoch((value) => value + 1);
+        let queued = false;
+        const reconnect = () => {
+            if (queued || !accountIsCurrent() || currentScope.current !== conversationScope || cloudRunTransitionRef.current !== run.id) return;
+            queued = true;
+            setConnectionEpoch((value) => value + 1);
+        };
+        const wake = () => { if (document.visibilityState !== "hidden") reconnect(); };
         window.addEventListener("online", reconnect);
-        return () => window.removeEventListener("online", reconnect);
-    }, [run?.id, connectionStatus]);
+        window.addEventListener("focus", wake);
+        document.addEventListener("visibilitychange", wake);
+        return () => {
+            window.removeEventListener("online", reconnect);
+            window.removeEventListener("focus", wake);
+            document.removeEventListener("visibilitychange", wake);
+        };
+    }, [run?.id, connectionStatus, conversationScope, accountScope]);
 
     const interject = async (value: string) => {
+        if (!accountIsCurrent() || pendingSubmission.current) return;
         const activeRun = run;
         if (!value || !activeRun?.id || busy || connectionStatus !== "connected" || currentScope.current !== conversationScope || !historyHydrated) return;
         const scope = conversationScope;
-        const messageId = `user-${crypto.randomUUID()}`;
+        const messageId = `user-${createClientUUID()}`;
         setBusy(true);
         try {
             await sendAgentInterjection(activeRun.id, { text: value, messageId });
-            if (currentScope.current !== scope) return;
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
             setPrompt("");
             setMessages((current) => appendUniqueMessage(current, { id: messageId, role: "user", text: value, interjection: "sent" }));
         } catch (cause) {
-            if (currentScope.current !== scope) return;
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
             const status = (cause as { status?: number }).status;
             setMessages((current) => appendAgentError(current, `interject-error-${activeConversationId}-${messageId}`, cause, "插话没有送达"));
             if (status === 409) setPrompt(value);
         } finally {
-            if (currentScope.current === scope) setBusy(false);
+            if (accountIsCurrent() && currentScope.current === scope) setBusy(false);
         }
     };
 
     const submit = async (override?: string, options?: CloudAgentMessagePresentation & { requiresVision?: boolean }) => {
+        if (!accountIsCurrent() || cloudOpeningRef.current || canvasId && !cloudHistoryReady && !pendingSubmission.current?.request || modelRestoreError && !pendingSubmission.current?.request) return;
+        const activity = canvasId ? canvasEditLeases.agent(canvasId) : null;
+        if (activity && activity.runId !== run?.id && !pendingSubmission.current?.request) return;
         const draft = (override ?? prompt).trim();
         const pendingRequest = pendingSubmission.current;
         const prefilled = prefilledSubmissionRef.current;
@@ -652,15 +826,16 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
         const matchesPrefill = prefilled?.displayText === draft;
         const value = matchesPending ? pendingRequest.request!.prompt : matchesPrefill ? prefilled!.text : draft;
         options = matchesPending ? { ...options, displayText: pendingRequest.displayText, canvasReferenceNodeId: pendingRequest.canvasReferenceNodeId } : matchesPrefill ? prefilled! : options;
-        if (running) {
+        if (running && !pendingRequest?.request) {
             await interject(value);
             return;
         }
-        if (!value || busy || running || (run && connectionStatus !== "connected") || submissionRequestRef.current || !historyHydrated || !pendingHydrated || currentScope.current !== conversationScope) return;
+        if (!value || busy || (run && connectionStatus !== "connected" && !pendingRequest?.request) || submissionRequestRef.current || !historyHydrated || !pendingHydrated || currentScope.current !== conversationScope) return;
         const scope = conversationScope;
         submissionRequestRef.current = true;
         setBusy(true);
         let accepted = false;
+        let requestSent = false;
         try {
             const effectiveModel = options?.requiresVision ? selectImageInspectionModel(config, selectedModel) : selectedModel;
             if (options?.requiresVision && !effectiveModel) throw new Error("当前没有配置支持图片输入的文本模型，请在模型能力设置中为一个文本模型开启图片输入后重试");
@@ -672,11 +847,12 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                 if (profileLoading) throw new Error("正在确认长期偏好快照，请稍后再发送");
                 if (!profileView || profileError) throw new Error("长期偏好快照尚未确认，请重新读取后再发送");
                 const capabilities = await getAgentCapabilities();
-                if (currentScope.current !== scope) return;
+                if (!accountIsCurrent() || currentScope.current !== scope) return;
                 if (!capabilities.permissionModes.includes(permissionMode)) throw new Error("当前后端不支持所选 Agent 权限，请更新后端");
                 if (selectedSkillIds.length && !capabilities.skills) throw new Error("当前后端尚未接入技能库");
-                await saveRemoteUserDataNow();
-                if (currentScope.current !== scope) return;
+                // 只有当前页面是画布时才绑定画布；其他页面发出的是平台级对话轮次。
+                if (canvasId) await prepareCanvasForCloudAction(canvasId);
+                if (!accountIsCurrent() || currentScope.current !== scope) return;
                 const agentConfig = { ...config, model: effectiveModel };
                 const requestConfig = resolveModelRequestConfig(agentConfig, effectiveModel);
                 const logicalModelId = logicalModelIDForConfig(agentConfig);
@@ -688,19 +864,20 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                     model: modelOptionName(effectiveModel) || undefined,
                     ...(logicalModelId ? { logicalModelId } : requestConfig.channelId ? { channelId: requestConfig.channelId, channelModelKey: modelOptionName(effectiveModel) || undefined } : {}),
                     skillIds: [...new Set([...selectedSkillIds, ...resolveSkillMentions(value, installedSkills).map((skill) => skill.skillId)])],
-                    focusNodeIds: selectedNodeIds.length <= 8 ? selectedNodeIds : [],
+                    focusNodeIds: canvasId ? selectedNodeIds.slice(0, 8) : [],
+                    focusNodeOmittedCount: canvasId ? Math.max(0, selectedNodeIds.length - 8) : 0,
                     permissionMode,
-                    contextScope,
+                    contextScope: canvasId ? contextScope : [],
                     budget: { maxCredits: positiveNumber(maxCredits), maxGenerationTasks: permissionMode === "read_only" ? 0 : Number(maxGenerationTasks), maxVideoSeconds: permissionMode === "read_only" ? 0 : Number(maxVideoSeconds) },
                 };
                 const fingerprint = JSON.stringify({ scope, parent: run?.id, input });
                 if (pending && pending.fingerprint !== fingerprint) throw new Error("上一条请求尚未确认，请恢复原消息与设置后核对，不能覆盖原幂等记录");
-                const key = pending?.key || crypto.randomUUID();
+                const key = pending?.key || createClientUUID();
                 const next = { fingerprint, key, request: { ...input, idempotencyKey: key }, parentRunId: run?.id, messageId: `user-${key}`, displayText: options?.displayText, canvasReferenceNodeId: options?.canvasReferenceNodeId };
                 // Persist before sending. A failed local save must not submit a request
                 // whose recovery identity will disappear on reload.
-                await saveCloudAgentPendingSubmission(canvasId, activeConversationId, next);
-                if (currentScope.current !== scope) return;
+                await waitForCanvasSync(saveCloudAgentPendingSubmission(activeConversationId, next, accountScope));
+                if (!accountIsCurrent() || currentScope.current !== scope) return;
                 pendingSubmission.current = next;
             }
             const submission = pendingSubmission.current!;
@@ -717,8 +894,9 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
             const existing = conversations.find((item) => item.id === activeConversationId);
             // Persist a discoverable conversation before POST as well as its key;
             // otherwise a reload of a brand-new chat can orphan the pending record.
-            await saveCloudAgentConversations(canvasId, activeConversationId, [
+            await waitForCanvasSync(saveCloudAgentConversations(activeConversationId, [
                 {
+                    ...existing,
                     id: activeConversationId,
                     title: cloudAgentConversationTitle(nextMessages),
                     messages: nextMessages,
@@ -730,62 +908,121 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                     updatedAt: now,
                 },
                 ...conversations.filter((item) => item.id !== activeConversationId),
-            ]);
-            if (currentScope.current !== scope) return;
+            ], accountScope));
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
             setPrompt("");
             prefilledSubmissionRef.current = null;
             setMessages(nextMessages);
+            requestSent = true;
             const result = submission.parentRunId ? await sendAgentMessage(submission.parentRunId, request) : await createAgentRun(request);
             accepted = true;
-            if (currentScope.current === scope) {
+            if (accountIsCurrent() && currentScope.current === scope) {
+                replayCursorRef.current = { runId: result.run.id, seq: 0 };
+                cloudRunTransitionRef.current = result.run.id;
                 setRun(result.run);
+                setConversations((current) => current.map((item) => item.id === activeConversationId ? { ...item, serverConversationId: result.run.conversationId, run: result.run, lastEventSeq: 0 } : item));
             }
-            await clearCloudAgentPendingSubmission(canvasId, activeConversationId);
-            if (currentScope.current === scope) pendingSubmission.current = null;
+            await waitForCanvasSync(clearCloudAgentPendingSubmission(activeConversationId, accountScope));
+            if (accountIsCurrent() && currentScope.current === scope) pendingSubmission.current = null;
         } catch (cause) {
-            if (currentScope.current !== scope) return;
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
+            if (cause instanceof CanvasSyncPendingError) return;
+            if (canvasId) canvasEditLeases.agentRejected(canvasId, cause);
             if (!accepted) {
                 setPrompt(value);
                 const status = (cause as { status?: number }).status;
-                if (status && [400, 401, 403, 404, 422].includes(status)) {
+                const reason = (cause as { reason?: string }).reason;
+                if (reason === "agent_conversation_stale_parent" || !pendingRequest?.request && (reason === "canvas_agent_busy" || (status && [400, 401, 403, 404, 422].includes(status)))) {
                     // These admission responses explicitly rejected the write.
-                    // Transport errors and conflicts retain the pending identity.
+                    // stale_parent is checked after same-key replay, so even an
+                    // original retry has now been confirmed unaccepted. Other
+                    // ambiguous retries retain their original body and key.
                     try {
-                        await clearCloudAgentPendingSubmission(canvasId, activeConversationId);
+                        const rejectedMessageId = pendingSubmission.current?.messageId;
+                        await waitForCanvasSync(clearCloudAgentPendingSubmission(activeConversationId, accountScope));
+                        if (!accountIsCurrent() || currentScope.current !== scope) return;
                         pendingSubmission.current = null;
+                        if (reason === "agent_conversation_stale_parent") {
+                            const correctedMessages = appendUniqueMessage(cloudLiveState.current.messages.filter((item) => item.id !== rejectedMessageId), {
+                                id: `stale-parent-${activeConversationId}-${run?.id || "initial"}`,
+                                role: "system",
+                                text: "另一端已接续新一轮，正在同步对话。输入已保留，请确认最新上下文后再发送。",
+                            });
+                            const corrected = conversationSnapshots.current.map((item) => item.id === activeConversationId ? { ...item, messages: correctedMessages, draft: value } : item);
+                            conversationSnapshots.current = corrected;
+                            setConversations(corrected);
+                            setMessages(correctedMessages);
+                            setCloudRefreshEpoch((value) => value + 1);
+                            return;
+                        }
+                        if (reason === "canvas_agent_busy") setCloudRefreshEpoch((value) => value + 1);
                     } catch (storageError) {
+                        if (!accountIsCurrent() || currentScope.current !== scope) return;
                         setMessages((current) => appendAgentError(current, `pending-storage-${activeConversationId}`, storageError, "提交记录更新失败"));
                     }
                 }
             }
-            setMessages((current) => appendAgentError(current, `submit-error-${activeConversationId}`, cause, agentSubmissionErrorTitle(cause, accepted)));
+            setMessages((current) => appendAgentError(current, `submit-error-${activeConversationId}`, cause, agentSubmissionErrorTitle(cause, accepted, requestSent)));
         } finally {
             submissionRequestRef.current = false;
-            if (currentScope.current === scope) setBusy(false);
+            if (accountIsCurrent() && currentScope.current === scope) setBusy(false);
         }
     };
 
     useEffect(() => {
         const pending = pendingAutoSubmit;
-        if (!pending || !historyHydrated || !pendingHydrated || profileLoading || !profileView || profileError || busy || running) return;
+        if (!pending || !historyHydrated || !pendingHydrated || !cloudHistoryReady || modelRestoreError || profileLoading || !profileView || profileError || busy || running || otherAgentRunning) return;
         setPendingAutoSubmit(null);
         void submit(pending.text, { requiresVision: pending.requiresVision, displayText: pending.displayText, canvasReferenceNodeId: pending.canvasReferenceNodeId });
-    }, [busy, historyHydrated, pendingAutoSubmit, pendingHydrated, profileError, profileLoading, profileView, running]);
+    }, [busy, historyHydrated, cloudHistoryReady, modelRestoreError, otherAgentRunning, pendingAutoSubmit, pendingHydrated, profileError, profileLoading, profileView, running]);
+
+    const undoCanvasStep = async (target: AgentCanvasUndoTarget) => {
+        const activeRun = run;
+        const scope = conversationScope;
+        const key = agentCanvasUndoKey(target);
+        if (!activeRun?.canvasId || target.canvasId !== activeRun.canvasId || busy || running || otherAgentRunning || currentScope.current !== scope || undoRequestsRef.current.has(key)) return;
+        if (undoStates[key]?.status === "done" || undoStates[key]?.status === "pending") return;
+        undoRequestsRef.current.add(key);
+        setUndoStates((current) => ({ ...current, [key]: { status: "pending" } }));
+        try {
+            const result = await undoAgentCanvasRun(target.runId, { stepId: target.stepId, expectedSnapshotHash: target.expectedSnapshotHash, reason: "用户在 Agent 面板撤销画布写入" });
+            if (!result.accepted) throw new Error("服务端没有确认撤销");
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
+            setUndoStates((current) => ({ ...current, [key]: { status: "done" } }));
+            setMessages((current) => current.map((item) => {
+                const detail = item.detail as { runId?: string; callId?: string } | undefined;
+                return detail?.runId === target.runId && detail.callId === target.stepId ? { ...item, detail: { ...detail, undoStatus: "undone" } } : item;
+            }));
+            try {
+                const [, snapshot] = await Promise.all([refreshCanvasAfterAgent(target.canvasId), getAgentRun(activeRun.id, AbortSignal.timeout(10_000))]);
+                if (accountIsCurrent() && currentScope.current === scope) {
+                    setRun((current) => (current?.id === activeRun.id ? snapshot.run : current));
+                    setConnectionEpoch((value) => value + 1);
+                }
+            } catch (refreshError) {
+                if (accountIsCurrent() && currentScope.current === scope) setMessages((current) => appendAgentError(current, `undo-refresh-${key}`, refreshError, "已撤销，但画布或运行状态刷新失败"));
+            }
+        } catch (cause) {
+            if (accountIsCurrent() && currentScope.current === scope) setUndoStates((current) => ({ ...current, [key]: { status: "error", error: cause instanceof Error ? cause.message : String(cause) } }));
+        } finally {
+            undoRequestsRef.current.delete(key);
+        }
+    };
 
     const stop = async () => {
         const activeRun = run;
-        if (!activeRun?.id || stopping) return;
+        if (!activeRun?.id || stopping || otherAgentRunning) return;
         setStopping(true);
         try {
             await cancelAgentRun(activeRun.id);
             const snapshot = await getAgentRun(activeRun.id, AbortSignal.timeout(5_000));
-            if (currentScope.current === conversationScope) {
+            if (accountIsCurrent() && currentScope.current === conversationScope) {
                 setRun((current) => (current?.id === activeRun.id ? snapshot.run : current));
                 if (!snapshot.run.approval) setApproval(null);
                 setConnectionEpoch((value) => value + 1);
             }
         } catch (cause) {
-            if (currentScope.current === conversationScope) {
+            if (accountIsCurrent() && currentScope.current === conversationScope) {
                 // An ambiguous cancellation is not proof of a terminal run. Keep
                 // the run and approval until the server confirms their state.
                 setConnectionEpoch((value) => value + 1);
@@ -797,17 +1034,20 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     };
 
     const submitApproval = async (decision: "approve" | "reject", mediaSettings?: AgentMediaSettings) => {
-        if (!run || !approval || connectionStatus !== "connected" || approvalRequestRef.current === approval.approvalId) return;
+        if (!run || !approval || otherAgentRunning || connectionStatus !== "connected" || approvalRequestRef.current === approval.approvalId) return;
         const runId = run.id;
         const approvalId = approval.approvalId;
         const scope = conversationScope;
         approvalRequestRef.current = approvalId;
         setApprovalSubmitting(true);
         try {
-            if (decision === "approve") await saveRemoteUserDataNow();
-            if (currentScope.current !== scope) return;
+            if (decision === "approve" && run.canvasId) {
+                await prepareCanvasForCloudAction(run.canvasId);
+                if (!accountIsCurrent() || currentScope.current !== scope) return;
+            }
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
             await decideAgentApproval(runId, approvalId, decision, approval.reason, AbortSignal.timeout(15_000), mediaSettings);
-            if (currentScope.current === scope) {
+            if (accountIsCurrent() && currentScope.current === scope) {
                 setApproval((current) => (current?.approvalId === approvalId ? null : current));
                 setRun((current) =>
                     current?.id === runId && current.status === "waiting_approval" && (!current.approval || current.approval.approvalId === approvalId)
@@ -816,11 +1056,21 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                 );
             }
         } catch (cause) {
-            if (currentScope.current !== scope) return;
+            if (!accountIsCurrent() || currentScope.current !== scope) return;
+            if (cause instanceof CanvasSyncPendingError) return;
             // A timed-out response is ambiguous: query the durable decision before
             // asking the user to retry. The backend treats identical decisions idempotently.
             try {
                 const snapshot = await getAgentRun(runId, AbortSignal.timeout(5_000));
+                if (!accountIsCurrent() || currentScope.current !== scope) return;
+                if (snapshot.run.approval?.approvalId !== approvalId || snapshot.run.approval?.decision || snapshot.run.status !== "waiting_approval") {
+                    // 另一端已经处理审批：读取实际状态，不自动重发当前端的决定。
+                    setRun(snapshot.run);
+                    setApproval(approvalStateFromRun(snapshot.run));
+                    setConnectionEpoch((value) => value + 1);
+                    setCloudRefreshEpoch((value) => value + 1);
+                    return;
+                }
                 const decided = snapshot.run.events?.some(
                     (event) => event.type === "approval_decided" && event.payload.approvalId === approvalId && event.payload.decision === decision && (!mediaSettings || agentApprovalMatchesSettings(event.payload.arguments, mediaSettings)),
                 );
@@ -835,7 +1085,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
             setMessages((current) => appendAgentError(current, `approval-error-${Date.now()}`, cause, "审批未确认，请重试"));
         } finally {
             if (approvalRequestRef.current === approvalId) approvalRequestRef.current = null;
-            if (currentScope.current === scope) setApprovalSubmitting(false);
+            if (accountIsCurrent() && currentScope.current === scope) setApprovalSubmitting(false);
         }
     };
 
@@ -852,15 +1102,24 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
     };
 
     const setModel = (model: string) => {
+        setRestoredModel(null);
         updateConfig("textModel", model);
         updateConfig("model", model);
     };
 
+    const canSwitchConversation = () => {
+        if (!accountIsCurrent() || !historyHydrated || !pendingHydrated || busy || running || submissionRequestRef.current || pendingSubmission.current || cloudOpeningRef.current) return false;
+        return true;
+    };
+
     const newConversation = () => {
+        if (!canSwitchConversation()) return;
+        if (selectedModel) setModel(selectedModel);
+        else setRestoredModel(null);
         const id = nanoid();
         const now = new Date().toISOString();
         const inheritedSkillIds = [...selectedSkillIds];
-        currentScope.current = `${canvasId}:${id}`;
+        currentScope.current = id;
         presetApplyingRef.current = null;
         setPresetApplyingId("");
         setPendingHydrated(true);
@@ -870,6 +1129,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
         setApprovalSubmitting(false);
         setActiveConversationId(id);
         setRun(null);
+        setUndoStates({});
         setMessages([]);
         // Skills are a user-selected Agent workspace setting. Keep them when
         // starting a fresh conversation so the skill picker does not appear to
@@ -887,19 +1147,25 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                 title: "新对话",
                 messages: [],
                 run: null,
+                draft: "",
+                localNewCanvasId: canvasId || "global",
                 model: selectedModel || undefined,
                 permissionMode,
                 skillIds: inheritedSkillIds,
                 createdAt: now,
                 updatedAt: now,
             },
-            ...current.filter((conversation) => conversation.messages.length > 0 || conversation.run),
+            ...current.filter((conversation) => conversation.messages.length > 0 || conversation.run || conversation.draft?.trim()),
         ]);
         setView("chat");
     };
 
-    const openConversation = (conversation: CloudAgentConversation) => {
-        currentScope.current = `${canvasId}:${conversation.id}`;
+    const restoreConversation = (conversation: CloudAgentConversation) => {
+        const cursor = conversation.run?.id === replayCursorRef.current.runId ? Math.max(lastSeqRef.current, conversation.lastEventSeq || 0) : conversation.lastEventSeq || 0;
+        currentScope.current = conversation.id;
+        cloudRunTransitionRef.current = conversation.run?.id || null;
+        replayCursorRef.current = { runId: conversation.run?.id || "", seq: cursor };
+        lastSeqRef.current = cursor;
         presetApplyingRef.current = null;
         setPresetApplyingId("");
         setPendingHydrated(false);
@@ -909,35 +1175,78 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
         setApprovalSubmitting(false);
         setActiveConversationId(conversation.id);
         setRun(conversation.run);
+        setUndoStates({});
         setMessages(conversation.messages);
         setPermissionMode(conversation.permissionMode);
         setSelectedSkillIds(conversation.skillIds || []);
-        setApproval(null);
-        setPrompt("");
-        if (conversation.model) setModel(conversation.model);
+        setApproval(approvalStateFromRun(conversation.run));
+        setPrompt(conversation.draft || "");
+        setRestoredModel(conversation.model || null);
         setView("chat");
-        void loadCloudAgentPendingSubmission(canvasId, conversation.id)
-            .then((pending) => {
-                if (currentScope.current === `${canvasId}:${conversation.id}`) {
+        void waitForCanvasSync(loadCloudAgentPendingSubmission(conversation.id, accountScope))
+            .then(async (pending) => {
+                if (cloudAgentPendingMatchesRun(pending, conversation.run)) {
+                    await waitForCanvasSync(clearCloudAgentPendingSubmission(conversation.id, accountScope));
+                    if (accountIsCurrent() && currentScope.current === conversation.id && conversation.draft === (pending?.displayText || pending?.request?.prompt)) setPrompt("");
+                    pending = null;
+                }
+                if (accountIsCurrent() && currentScope.current === conversation.id) {
                     pendingSubmission.current = pending;
                     setPendingHydrated(true);
                     if (pending?.request) setPrompt(pending.displayText || pending.request.prompt);
                 }
             })
             .catch((cause) => {
-                if (currentScope.current === `${canvasId}:${conversation.id}`) setMessages((current) => appendAgentError(current, `pending-${conversation.id}`, cause, "待确认请求读取失败"));
+                if (accountIsCurrent() && currentScope.current === conversation.id) setMessages((current) => appendAgentError(current, `pending-${conversation.id}`, cause, "待确认请求读取失败"));
             });
     };
+    const openConversation = async (conversation: CloudAgentConversation) => {
+        if (!canSwitchConversation()) return;
+        const id = cloudAgentConversationServerId(conversation);
+        if (!id) {
+            const selected = { ...conversation, localSelectedCanvasId: canvasId || "global" };
+            setConversations((current) => current.map((item) => item.id === selected.id ? selected : item));
+            restoreConversation(selected);
+            return;
+        }
+        const token = createClientUUID();
+        const openingScope = currentScope.current;
+        const openingCanvas = canvasId;
+        const controller = new AbortController();
+        conversationLoadControllerRef.current?.abort();
+        conversationLoadControllerRef.current = controller;
+        cloudOpeningRef.current = token;
+        setCloudOpeningId(conversation.id);
+        try {
+            const loaded = await loadCloudAgentConversation(id, { signal: controller.signal, scope: accountScope, existing: conversation });
+            if (!accountIsCurrent() || cloudOpeningRef.current !== token || currentScope.current !== openingScope || cloudLiveState.current.canvasId !== openingCanvas) return;
+            const next = mergeCloudAgentConversations(conversationSnapshots.current, [loaded]);
+            const matching = next.find((item) => cloudAgentConversationServerId(item) === id);
+            if (!matching) throw new Error("云端对话尚未确认，请刷新后重试");
+            const restored = { ...matching, localSelectedCanvasId: openingCanvas || "global" };
+            setConversations(next.map((item) => item.id === restored.id ? restored : item));
+            restoreConversation(restored);
+        } catch (cause) {
+            if (!controller.signal.aborted && accountIsCurrent() && cloudOpeningRef.current === token) setCloudHistoryError(cause instanceof Error ? cause.message : "云端对话读取失败");
+        } finally {
+            if (cloudOpeningRef.current === token) {
+                cloudOpeningRef.current = null;
+                setCloudOpeningId("");
+            }
+            if (conversationLoadControllerRef.current === controller) conversationLoadControllerRef.current = null;
+        }
+    };
     const deleteConversation = (id: string) => {
+        if (!canSwitchConversation() || conversations.some((item) => item.id === id && cloudAgentConversationServerId(item))) return;
         const next = conversations.filter((item) => item.id !== id);
         setConversations(next);
         if (id === activeConversationId) newConversation();
-        void saveCloudAgentConversations(canvasId, id === activeConversationId ? null : activeConversationId, next);
+        void saveCloudAgentConversations(id === activeConversationId ? null : activeConversationId, next, accountScope).catch((cause) => { if (accountIsCurrent()) setCloudHistoryError(String(cause)); });
     };
 
     return (
         <>
-            <AgentLauncher theme={theme} statusColor={statusColor} approvalPending={Boolean(approval)} reducedMotion={Boolean(reducedMotion)} hidden={open} onOpen={onOpen} />
+            <AgentLauncher theme={theme} statusColor={statusColor} approvalPending={Boolean(approval)} reducedMotion={Boolean(reducedMotion)} status={status} hidden={open} onOpen={onOpen} />
             <AnimatePresence>
                 {open ? (
                     <motion.aside
@@ -951,6 +1260,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                 Record<`--${string}`, string>
                         }
                         aria-label="Agent 工作台"
+                        data-popover-anchor-container
                         data-canvas-no-zoom
                         data-canvas-wheel-scroll
                         {...panelLayout.pointerHandlers}
@@ -978,7 +1288,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                         selectedModel={selectedModel}
                                         permissionMode={permissionMode}
                                         contextScope={contextScope}
-                                        nodeCount={nodeCount}
+                                        nodeCount={canvasId ? nodeCount : null}
                                         installedSkills={installedSkills}
                                         marketSkills={marketSkills}
                                         selectedSkillIds={selectedSkillIds}
@@ -1013,7 +1323,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                 </motion.div>
                             ) : view === "history" ? (
                                 <motion.div key="history" className="flex min-h-0 flex-1" initial={{ opacity: 0, x: 18 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 18 }} transition={{ duration: reducedMotion ? 0 : 0.18 }}>
-                                    <AgentHistory conversations={conversations} activeConversationId={activeConversationId} theme={theme} onBack={() => setView("chat")} onNew={newConversation} onOpen={openConversation} onDelete={deleteConversation} />
+                                    <AgentHistory conversations={conversations} activeConversationId={activeConversationId} theme={theme} onBack={() => setView("chat")} onNew={newConversation} onOpen={(conversation) => void openConversation(conversation)} onDelete={deleteConversation} loading={cloudHistoryLoading} error={cloudHistoryError} openingId={cloudOpeningId} onRefresh={() => setCloudRefreshEpoch((value) => value + 1)} />
                                 </motion.div>
                             ) : (
                                 <motion.div key="chat" className="flex min-h-0 flex-1 flex-col" initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: reducedMotion ? 0 : 0.18 }}>
@@ -1022,7 +1332,7 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                         hasMessages={messages.length > 0}
                                         statusLabel={statusLabel}
                                         statusColor={statusColor}
-                                        nodeCount={nodeCount}
+                                        nodeCount={canvasId ? nodeCount : null}
                                         onNew={newConversation}
                                         onHistory={() => setView("history")}
                                         exporting={exporting}
@@ -1049,6 +1359,12 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                         onResetLayout={panelLayout.reset}
                                         onCollapse={onCollapse}
                                     />
+                                    {cloudHistoryError || canvasId && !cloudHistoryReady ? (
+                                        <div role="status" className="flex items-center justify-between gap-2 px-5 py-2 text-xs" style={{ color: theme.node.muted }}>
+                                            <span>{cloudHistoryError ? "云端对话暂时未同步，本机草稿已保留。" : "正在同步此画布的云端对话…"}</span>
+                                            {cloudHistoryError ? <Button size="small" loading={cloudHistoryLoading} onClick={() => setCloudRefreshEpoch((value) => value + 1)}>重新同步</Button> : null}
+                                        </div>
+                                    ) : null}
                                     {run && connectionStatus !== "connected" ? (
                                         <div role="status" className="flex items-center justify-between gap-2 px-5 py-2 text-xs" style={{ color: theme.node.muted }}>
                                             <span>{connectionStatus === "disconnected" ? "连接已断开，服务端任务可能仍在执行；运行记录已保留" : "正在连接并校准运行状态…"}</span>
@@ -1064,18 +1380,30 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                         theme={theme}
                                         messages={messages}
                                         onFocusNode={onFocusNode}
+                                        onUndo={busy || running || otherAgentRunning ? undefined : (target) => void undoCanvasStep(target)}
+                                        undoStates={undoStates}
                                         references={[...references, ...buildSkillMentionReferences(installedSkills)]}
                                         busy={busy || running}
                                         approval={approval}
                                         approvalTargetGenerating={approval ? agentApprovalTargetGenerating(approval.detail, canvasNodes, runningNodeId) : undefined}
-                                        nodeCount={nodeCount}
-                                        approvalSubmitting={approvalSubmitting || connectionStatus !== "connected"}
+                                        nodeCount={canvasId ? nodeCount : null}
+                                        approvalSubmitting={otherAgentRunning || approvalSubmitting || connectionStatus !== "connected"}
                                         onChooseSkill={() => setSkillsOpen(true)}
                                         onDraftPrompt={(draft) => setPrompt((current) => (current.trim() ? `${current}\n\n${draft}` : draft))}
                                         onApprovalReasonChange={(reason) => setApproval((current) => (current ? { ...current, reason } : current))}
                                         onApprove={(settings) => void submitApproval("approve", settings)}
                                         onReject={() => void submitApproval("reject")}
                                     />
+                                    {canvasCloudConversation && !canvasCloudConversationIsCurrent ? (
+                                        <div role="status" className="flex items-center justify-between gap-2 px-5 py-2 text-xs" style={{ color: theme.node.muted }}>
+                                            <span>此画布有可接续的云端对话。{prompt.trim() ? "未发送内容会保留在原对话。" : "手机、电脑可查看同一进度。"}</span>
+                                            <Button size="small" loading={cloudOpeningId === canvasCloudConversation.id} disabled={busy || running || !pendingHydrated || Boolean(pendingSubmission.current) || Boolean(cloudOpeningId)} onClick={() => void openConversation(canvasCloudConversation)}>接续此画布对话</Button>
+                                        </div>
+                                    ) : otherAgentRunning ? (
+                                        <div role="status" className="px-5 py-2 text-xs" style={{ color: theme.node.muted }}>
+                                            {canvasAgent?.cleanupPending ? "当前画布的 Agent 正在收尾，完成后即可使用" : "当前画布有正在执行的 Agent 任务，正在同步对话；同步前暂不重复发送"}
+                                        </div>
+                                    ) : null}
                                     {planVisible ? (
                                         <AgentPlanBar
                                             items={planItems}
@@ -1091,27 +1419,29 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
                                             buckets={sceneBuckets}
                                             installedIds={installedSkillIds}
                                             theme={theme}
-                                            disabled={busy || running || !pendingHydrated || Boolean(presetApplyingId)}
+                                            disabled={otherAgentRunning || busy || running || !pendingHydrated || Boolean(presetApplyingId)}
                                             onPick={(preset) => void applyScenePreset(preset)}
                                             onPickSkill={(skill) => void applySingleSkill(skill)}
                                         />
                                     ) : null}
-                                    {pendingQuestion ? <AgentQuestionBar question={pendingQuestion} theme={theme} disabled={approvalSubmitting || connectionStatus !== "connected"} onAnswer={(label) => void submit(label)} /> : null}
+                                    {pendingQuestion ? <AgentQuestionBar question={pendingQuestion} theme={theme} disabled={otherAgentRunning || approvalSubmitting || connectionStatus !== "connected"} onAnswer={(label) => void submit(label)} /> : null}
+                                    {historyHydrated && !pendingHydrated ? <div className="flex items-center gap-2 px-5 py-2 text-xs" role="status"><span>提交记录尚未确认，输入保留；画布可继续编辑。</span><Button size="small" onClick={() => setHistoryRestoreAttempt((attempt) => attempt + 1)}>重新读取记录</Button></div> : null}
+                                    {modelRestoreError ? <div className="px-5 py-2 text-xs" role="status" style={{ color: theme.node.muted }}>{modelRestoreError}</div> : null}
                                     <AgentChatComposer
                                         prompt={prompt}
-                                        disabled={Boolean(run && connectionStatus !== "connected") || !historyHydrated || !pendingHydrated}
+                                        submitDisabled={otherAgentRunning && !pendingSubmission.current?.request || Boolean(run && connectionStatus !== "connected" && !pendingSubmission.current?.request) || !historyHydrated || !pendingHydrated || Boolean(canvasId && !cloudHistoryReady && !pendingSubmission.current?.request) || Boolean(cloudOpeningId) || Boolean(modelRestoreError && !pendingSubmission.current?.request)}
                                         sending={busy}
                                         running={running}
                                         placeholder={running ? "运行中可直接插话，会在它下一步生效" : "输入操作指导；用 @ 引用画布节点，用 / 或 、 引用 Skills"}
                                         theme={theme}
                                         onPromptChange={setPrompt}
                                         onSubmit={() => void submit()}
-                                        onStop={run?.id && running ? stop : undefined}
+                                        onStop={!otherAgentRunning && run?.id && running ? stop : undefined}
                                         stopping={stopping}
                                         references={[...references, ...buildSkillMentionReferences(installedSkills)]}
                                         slashSkills={installedSkills}
                                         includeAssetLibrary={false}
-                                        submitAccessory={<AgentContextRing view={presentAgentContextUsage(contextUsage)} />}
+                                        submitAccessory={<AgentContextRing view={presentAgentContextUsage(contextUsage)} theme={theme} />}
                                         footer={connectorsVisible ? <AgentConnectorsBar onClose={() => setConnectorsVisible(false)} /> : null}
                                         left={
                                             <ComposerControls
@@ -1162,4 +1492,4 @@ export function CanvasCloudAgentPanel({ canvasId, domainProjectId, nodeCount, se
             />
         </>
     );
-}
+});

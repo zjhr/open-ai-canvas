@@ -55,8 +55,8 @@ func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]
 		writeField(writer, "model", input.Config.Model)
 		writeField(writer, "prompt", withSystemPrompt(input.Config, input.Prompt))
 		writeField(writer, "n", "1")
-		if imageParameterSupported(input.ImageCapability, "response_format") {
-			writeField(writer, "response_format", "b64_json")
+		if responseFormat := configuredImageResponseFormat(input.ImageCapability); responseFormat != "" {
+			writeField(writer, "response_format", responseFormat)
 		}
 		if imageParameterSupported(input.ImageCapability, "output_format") {
 			writeField(writer, "output_format", "png")
@@ -92,8 +92,8 @@ func runImageTask(ctx context.Context, input canvasGenerationInput) (map[string]
 			"prompt": withSystemPrompt(input.Config, input.Prompt),
 			"n":      1,
 		}
-		if imageParameterSupported(input.ImageCapability, "response_format") {
-			body["response_format"] = "b64_json"
+		if responseFormat := configuredImageResponseFormat(input.ImageCapability); responseFormat != "" {
+			body["response_format"] = responseFormat
 		}
 		if imageParameterSupported(input.ImageCapability, "output_format") {
 			body["output_format"] = "png"
@@ -306,7 +306,7 @@ func grokImageRequestBody(input canvasGenerationInput) (grokImageRequest, string
 		ResponseFormat: grokImageResponseFormat(input.ImageCapability),
 		// Grok 图片协议用 aspect_ratio 表达画布比例；同时发送 size 会被上游按 OpenAI 枚举校验并拒绝。
 		AspectRatio: normalizeGrokImageAspectRatio(input.Config.Size),
-		Resolution:  normalizeGrokImageResolution(input.Config.Quality),
+		Resolution:  normalizeGrokImageResolution(firstNonEmpty(input.Config.ImageResolution, input.Config.Quality)),
 	}
 	if len(input.ReferenceImages) == 0 {
 		return body, "/images/generations", nil
@@ -323,10 +323,13 @@ func grokImageRequestBody(input canvasGenerationInput) (grokImageRequest, string
 }
 
 func grokImageResponseFormat(profile *ImageCapabilityConfig) string {
-	if imageParameterSupported(profile, "response_format") {
+	if profile == nil {
 		return "b64_json"
 	}
-	return "url"
+	if !profile.ResponseFormat.Supported {
+		return "url"
+	}
+	return configuredImageResponseFormat(profile)
 }
 
 // normalizeGrokImageResolution 把画布 quality（1k/2k/high…）映射为 grok2api / xAI 的 resolution。

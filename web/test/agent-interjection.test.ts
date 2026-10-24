@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { moduleGroupSource } from "./helpers/module-group-source";
 
 // 自研（2026-09-17）：Agent 运行中插话。
 //
@@ -7,7 +8,7 @@ import { expect, test } from "bun:test";
 // 所以这里的断言要盯住两件事：入口真的打开了，以及旧前提没有残留在代码里。
 test("运行中不再锁死输入框，发送走插话而不是新建轮次", async () => {
     // 面板拆分为主组件、展示组件与事件归约三个模块，源码约束覆盖整个模块组。
-    const panel = (await Promise.all(["canvas-cloud-agent-panel.tsx", "canvas-cloud-agent-panel-parts.tsx", "canvas-cloud-agent-events.ts"].map((file) => Bun.file(new URL(`../src/components/canvas/${file}`, import.meta.url)).text()))).join("\n");
+    const panel = moduleGroupSource("components/canvas/canvas-cloud-agent-panel.tsx");
 
     // 运行中走插话分支（不建轮次、不走那套扣费幂等记账）
     expect(panel).toContain("await interject(value)");
@@ -15,9 +16,9 @@ test("运行中不再锁死输入框，发送走插话而不是新建轮次", as
     // 乐观落进时间线时带插话标记，与「开新一轮」的消息在界面上区分开
     expect(panel).toContain('interjection: "sent"');
 
-    // 输入框的禁用条件里不能再有 running —— 只保留「连不上事件流」「历史/待确认未水合」这类真不能发的状态
-    expect(panel).toContain('disabled={Boolean(run && connectionStatus !== "connected")');
-    const composer = panel.match(/<AgentChatComposer[\s\S]*?disabled=\{([^\n]+)\}/)?.[1];
+    // 连接或记录未确认仅禁止发送，不冻结消息草稿输入。
+    expect(panel).toContain("submitDisabled={otherAgentRunning && !pendingSubmission.current?.request");
+    const composer = panel.match(/<AgentChatComposer[\s\S]*?submitDisabled=\{([^\n]+)\}/)?.[1];
     expect(composer).toBeDefined();
     expect(composer).not.toMatch(/\bbusy\b|\brunning\b/);
     // 停止按钮由 running 驱动，发送按钮由我们自己的请求驱动，两者不再互斥
@@ -37,7 +38,7 @@ test("输入框运行中同时给出「发送（插话）」与「停止」", as
 
     // 关键改动：canStop 不再等于 sending —— 否则运行中两个动作只能二选一
     expect(composer).toContain("const canStop = Boolean(running && onStop);");
-    expect(composer).toContain("const canSubmit = !disabled && !sending && Boolean(prompt.trim() || attachments.length);");
+    expect(composer).toContain("const canSubmit = !disabled && !submitDisabled && !sending && Boolean(prompt.trim() || attachments.length);");
     expect(composer).not.toContain("const canStop = Boolean(sending && onStop);");
     expect(composer).toContain('aria-label="停止本轮"');
     // 插话/未送达要有可见标记

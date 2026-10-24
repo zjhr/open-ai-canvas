@@ -47,7 +47,7 @@ type CanvasNodePromptPanelProps = {
     projectId: string;
     node: CanvasNodeData;
     isRunning: boolean;
-    onPromptChange: (nodeId: string, prompt: string) => void;
+    onPromptChange: (nodeId: string, prompt: string) => boolean | void;
     onConfigChange: (nodeId: string, patch: Partial<CanvasNodeMetadata>) => void;
     onGenerate: (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => void;
     mentionReferences?: CanvasResourceReference[];
@@ -152,7 +152,7 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
             vquality: node.metadata?.vquality || globalConfig.vquality,
             videoGenerateAudio: node.metadata?.generateAudio ?? globalConfig.videoGenerateAudio,
             videoWatermark: node.metadata?.watermark ?? globalConfig.videoWatermark,
-            audioVoice: node.metadata?.audioVoice || globalConfig.audioVoice,
+            audioVoice: node.metadata?.audioVoice ?? globalConfig.audioVoice,
             audioFormat: node.metadata?.audioFormat || globalConfig.audioFormat,
             audioSpeed: node.metadata?.audioSpeed || globalConfig.audioSpeed,
         }, mode),
@@ -219,8 +219,7 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
     useEffect(() => {
         promptRef.current = normalizedSavedPrompt;
         setPrompt(normalizedSavedPrompt);
-        if (normalizedSavedPrompt !== savedPrompt) onPromptChange(node.id, normalizedSavedPrompt);
-    }, [node.id, normalizedSavedPrompt, onPromptChange, savedPrompt]);
+    }, [node.id, normalizedSavedPrompt]);
 
     useEffect(() => {
         setExpandedPromptOpen(false);
@@ -263,13 +262,16 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
     const skillReferences = useMemo(() => resolvedMentionReferences.filter((item) => item.kind === "skill"), [resolvedMentionReferences]);
 
     const updatePrompt = (value: string) => {
+        if (node.metadata?.locked) return false;
+        if (value === promptRef.current) return true;
+        if (onPromptChange(node.id, value) === false) return false;
         promptRef.current = value;
         setPrompt(value);
-        onPromptChange(node.id, value);
         if (showPromptTemplates && /(^|\s)\/[\p{L}\p{N}_-]*$/u.test(value)) {
             if (expandedPromptOpen) setExpandedPresetOpen(true);
             else setPresetOpen(true);
         }
+        return true;
     };
 
     const updatePromptFromCurrent = (updater: (currentPrompt: string) => string) => {
@@ -558,6 +560,7 @@ export function CanvasNodePromptPanel({ projectId, node, isRunning, onPromptChan
                     />
                     <CanvasResourceMentionTextarea
                         value={prompt}
+                        readOnly={Boolean(node.metadata?.locked)}
                         references={textareaReferences}
                         onSelectReference={onAddReference ? (reference) => onAddReference(node.id, reference) : undefined}
                         includeAssetLibrary

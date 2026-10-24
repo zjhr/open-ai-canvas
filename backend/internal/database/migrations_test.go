@@ -15,9 +15,55 @@ func TestCurrentSchemaVersionMatchesMigrationPlan(t *testing.T) {
 	if len(schemaMigrations) == 0 {
 		t.Fatal("migration plan is empty")
 	}
+	for index, item := range schemaMigrations {
+		if index > 0 && item.version <= schemaMigrations[index-1].version {
+			t.Fatalf("migration versions must be strictly increasing: %d after %d", item.version, schemaMigrations[index-1].version)
+		}
+	}
 	latest := schemaMigrations[len(schemaMigrations)-1].version
 	if CurrentSchemaVersion != latest {
 		t.Fatalf("supported schema version %d does not match latest migration %d", CurrentSchemaVersion, latest)
+	}
+}
+
+type channelModelProtocolV58 struct {
+	ID       string `gorm:"primaryKey;size:36"`
+	Protocol string `gorm:"size:32;index"`
+}
+
+func (channelModelProtocolV58) TableName() string { return "channel_models" }
+
+func TestMigrateChannelModelProtocolLengthPreservesExistingRows(t *testing.T) {
+	db, err := Open(Config{Driver: "sqlite", DSN: "file:migration-channel-protocol-length?mode=memory&cache=shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&channelModelProtocolV58{}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := channelModelProtocolV58{ID: "existing", Protocol: "chat-completion"}
+	if err := db.Create(&legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateChannelModelProtocolLength(db); err != nil {
+		t.Fatalf("migrateChannelModelProtocolLength() error = %v", err)
+	}
+	statement := &gorm.Statement{DB: db}
+	if err := statement.Parse(&model.ChannelModel{}); err != nil {
+		t.Fatal(err)
+	}
+	protocolField := statement.Schema.LookUpField("Protocol")
+	if protocolField == nil || protocolField.Size != 64 {
+		t.Fatalf("protocol field size = %#v, want 64", protocolField)
+	}
+	var stored struct {
+		Protocol string
+	}
+	if err := db.Table("channel_models").Select("protocol").Where("id = ?", legacy.ID).Scan(&stored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Protocol != legacy.Protocol {
+		t.Fatalf("existing protocol = %q, want %q", stored.Protocol, legacy.Protocol)
 	}
 }
 
@@ -98,6 +144,88 @@ func TestMigrateSchemaRecordsAndValidatesVersion(t *testing.T) {
 	}
 }
 
+func TestMigrateSchemaV56UpgradesProviderCatalogV55(t *testing.T) {
+	db, err := Open(Config{Driver: "sqlite", DSN: "file:migration-sql-perf-v56?mode=memory&cache=shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	var catalogMigration schemaMigration
+	if err := db.First(&catalogMigration, "version = ?", 55).Error; err != nil {
+		t.Fatal(err)
+	}
+	if catalogMigration.Name != "provider_catalog_source" || catalogMigration.Checksum != "sha256:provider-catalog-source-v55" {
+		t.Fatalf("provider catalog migration identity changed: %#v", catalogMigration)
+	}
+	for _, item := range []struct {
+		entity any
+		index  string
+	}{
+		{&model.ApiCallLog{}, "idx_api_logs_created_epoch"},
+		{&model.ApiCallLog{}, "idx_api_logs_user_created"},
+		{&model.Task{}, "idx_tasks_created_epoch"},
+		{&model.Task{}, "idx_tasks_user_project_created"},
+		{&model.CreditLedgerEntry{}, "idx_credit_ledger_user_type"},
+	} {
+		if err := db.Migrator().DropIndex(item.entity, item.index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, entity := range []any{&model.ApiCallLog{}, &model.Task{}} {
+		if err := db.Migrator().DropColumn(entity, "CreatedAtEpoch"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Where("version = ?", 56).Delete(&schemaMigration{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 10, 15, 12, 30, 0, 0, time.UTC)
+	for _, table := range []string{"api_call_logs", "tasks"} {
+		if err := db.Table(table).Create(map[string]any{"id": "legacy-" + table, "created_at": createdAt}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := MigrateSchema(db); err != nil {
+		t.Fatalf("upgrade from provider catalog v55: %v", err)
+	}
+	for _, table := range []string{"api_call_logs", "tasks"} {
+		var epoch int64
+		if err := db.Table(table).Select("created_at_epoch").Where("id = ?", "legacy-"+table).Scan(&epoch).Error; err != nil {
+			t.Fatal(err)
+		}
+		if epoch != createdAt.Unix() {
+			t.Fatalf("%s legacy timestamp = %d, want %d", table, epoch, createdAt.Unix())
+		}
+	}
+	for _, item := range []struct {
+		entity any
+		index  string
+	}{
+		{&model.ApiCallLog{}, "idx_api_logs_user_created"},
+		{&model.Task{}, "idx_tasks_user_project_created"},
+		{&model.CreditLedgerEntry{}, "idx_credit_ledger_user_type"},
+	} {
+		if !db.Migrator().HasIndex(item.entity, item.index) {
+			t.Fatalf("v56 did not restore %s", item.index)
+		}
+	}
+	var after schemaMigration
+	if err := db.First(&after, "version = ?", 55).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after != catalogMigration {
+		t.Fatalf("v56 rewrote provider catalog migration: before=%#v after=%#v", catalogMigration, after)
+	}
+	if !db.Migrator().HasColumn(&model.ModelChannel{}, "CatalogProviderID") || !db.Migrator().HasColumn(&model.ChannelModel{}, "CatalogModelKey") {
+		t.Fatal("provider catalog columns missing after v56 upgrade")
+	}
+	if err := MigrateSchema(db); err != nil {
+		t.Fatalf("v56 upgrade should be idempotent: %v", err)
+	}
+}
+
 func TestMigrateSchemaNormalizesLegacyWorkbenchMigrationV51(t *testing.T) {
 	db, err := Open(Config{Driver: "sqlite", DSN: "file:migration-legacy-workbench-v51?mode=memory&cache=shared"})
 	if err != nil {
@@ -108,7 +236,7 @@ func TestMigrateSchemaNormalizesLegacyWorkbenchMigrationV51(t *testing.T) {
 	}
 	// 构造「旧版本只迁移到 v51 工作台身份」的库：删掉 v51 及之后的账本记录，
 	// 只写回一条旧工作台身份的 v51（建表语句已由上面的完整迁移完成，只改账本）。
-	// 必须把 v51 之后的记录也删干净：否则新增迁移（如 v55）会被归一化逻辑视为
+	// 必须把 v51 之后的记录也删干净：否则新增迁移（如 v61）会被归一化逻辑视为
 	// 「旧记录之后还有后续迁移」，从而按设计拒绝改写账本。
 	const legacyWorkbenchToolsVersion int64 = 51
 	if err := db.Where("version >= ?", legacyWorkbenchToolsVersion).Delete(&schemaMigration{}).Error; err != nil {

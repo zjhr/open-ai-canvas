@@ -19,6 +19,7 @@ type PluginProviderCatalogItem struct {
 	Vendor            string                      `json:"vendor"`
 	Categories        []protocol.Capability       `json:"categories"`
 	Scopes            []protocol.Surface          `json:"scopes"`
+	Kind              protocol.ProviderKind       `json:"kind,omitempty"`
 	Create            string                      `json:"create,omitempty"`
 	Poll              string                      `json:"poll,omitempty"`
 	ContentType       string                      `json:"contentType,omitempty"`
@@ -26,6 +27,7 @@ type PluginProviderCatalogItem struct {
 	Enabled           bool                        `json:"enabled"`
 	UnavailableReason string                      `json:"unavailableReason,omitempty"`
 	Parameters        []protocol.Parameter        `json:"parameters,omitempty"`
+	ImageParameters   []protocol.ImageParameter   `json:"imageParameters,omitempty"`
 	Workflows         []protocol.ManifestWorkflow `json:"workflows,omitempty"`
 }
 
@@ -42,6 +44,8 @@ func (s *Service) PluginProviderCatalog(scope, capability string, includeUnavail
 			}
 			item := PluginProviderCatalogItem{ID: provider.ID, Version: plugin.Manifest.Version, Name: provider.Label, Vendor: plugin.Manifest.Author, Categories: provider.Capabilities, Scopes: provider.Scopes, BaseURL: provider.BaseURL, Enabled: plugin.Status == "enabled", UnavailableReason: plugin.Error, Parameters: provider.Parameters, Workflows: workflowsForProvider(plugin.Manifest.Contributes.Workflows, provider.ID)}
 			item.Create, item.Poll, item.ContentType = operationSummary(provider.Create), operationSummaryPtr(provider.Poll), provider.Create.ContentType
+			item.ImageParameters = provider.ImageParameters
+			item.Kind = provider.Kind
 			// The registry metadata is the canonical provider projection. This keeps
 			// host-backed dispatch paths out of every user-facing catalog consumer.
 			if adapter, ok := canonicalProviderAdapter(s.protocolRegistry(), provider.ID); ok {
@@ -180,6 +184,7 @@ func (s *Service) InstallPlugin(data []byte, fileName string) (PluginView, error
 	}
 	plugin, err := s.pluginRuntime.install(data, fileName)
 	if err == nil {
+		s.invalidateRouteCatalog()
 		s.refreshPaymentRegistry()
 	}
 	return plugin, err
@@ -241,6 +246,7 @@ func (s *Service) SetPluginEnabled(id string, enabled bool) (PluginView, error) 
 	}
 	plugin, err := s.pluginRuntime.setEnabled(id, enabled)
 	if err == nil {
+		s.invalidateRouteCatalog()
 		s.refreshPaymentRegistry()
 	}
 	return plugin, err
@@ -255,6 +261,7 @@ func (s *Service) UninstallPlugin(id string) error {
 	}
 	err := s.pluginRuntime.uninstall(id)
 	if err == nil {
+		s.invalidateRouteCatalog()
 		s.refreshPaymentRegistry()
 	}
 	return err

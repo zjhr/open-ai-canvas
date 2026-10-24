@@ -292,8 +292,28 @@ func ValidateManifest(manifest Manifest) error {
 			return fmt.Errorf("duplicate provider contribution %q", provider.ID)
 		}
 		providerIDs[provider.ID] = struct{}{}
+		if err := ValidateImageParameters(provider.ImageParameters); err != nil {
+			return fmt.Errorf("provider %q image parameters: %w", provider.ID, err)
+		}
+		for _, parameter := range provider.ImageParameters {
+			if parameter.Binding == "" {
+				return fmt.Errorf("provider %q image parameter %s requires a binding", provider.ID, parameter.Name)
+			}
+			if strings.HasPrefix(parameter.Binding, "providerOptions.") && !strings.HasPrefix(parameter.Binding, "providerOptions."+provider.ID+".") {
+				return fmt.Errorf("provider %q image parameter %s must use its own namespace", provider.ID, parameter.Name)
+			}
+		}
 		if len(provider.Capabilities) == 0 || len(provider.Scopes) == 0 {
 			return fmt.Errorf("provider contribution %q requires capabilities and scopes", provider.ID)
+		}
+		switch provider.Kind {
+		case "", ProviderKindGeneration:
+		case ProviderKindProcessing:
+			if len(provider.Capabilities) != 1 || provider.Capabilities[0] == CapabilityText {
+				return fmt.Errorf("processing provider %q must declare exactly one media capability", provider.ID)
+			}
+		default:
+			return fmt.Errorf("unsupported provider kind %q", provider.Kind)
 		}
 		for _, capability := range provider.Capabilities {
 			if capability != CapabilityText && capability != CapabilityImage && capability != CapabilityVideo && capability != CapabilityAudio {
@@ -399,11 +419,13 @@ func normalizeManifestForProvider(manifest *Manifest, index int) error {
 	manifest.Metadata.Categories = provider.Capabilities
 	manifest.Metadata.Scopes = provider.Scopes
 	manifest.Metadata.Parameters = provider.Parameters
+	manifest.Metadata.ImageParameters = provider.ImageParameters
 	manifest.Metadata.Create = operationSummary(provider.Create)
 	manifest.Metadata.Poll = operationSummaryPtr(provider.Poll)
 	manifest.Metadata.Cancel = operationSummaryPtr(provider.Cancel)
 	manifest.Metadata.ContentType = provider.Create.ContentType
 	manifest.Metadata.RequiresPublicMediaURLs = provider.RequiresPublicMediaURLs
+	manifest.Metadata.Kind = provider.Kind
 	manifest.Metadata.Execution = manifest.Runtime.Backend
 	manifest.Create = provider.Create
 	manifest.Agent = provider.Agent

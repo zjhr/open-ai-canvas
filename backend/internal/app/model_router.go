@@ -167,7 +167,7 @@ func (s *Service) loadRouteCatalog() (*routeCatalogSnapshot, error) {
 			if item.PricePolicy == "channel" && !channelModelHasActivePriceTier(channelModel) {
 				continue
 			}
-			capabilitySpec, specErr := channelModelCapabilitySpec(channelModel)
+			capabilitySpec, specErr := channelModelCapabilitySpec(channelModel, s.protocolRegistry())
 			if specErr != nil {
 				log.Printf("logical route omitted from catalog route_id=%s channel_model_id=%s: invalid capability: %v", route.ID, channelModel.ID, specErr)
 				continue
@@ -200,9 +200,14 @@ func (s *Service) ResolveLogicalModel(logicalModelID string, intent ModelRequest
 	if !ok {
 		return nil, BadAuthRequest("所选模型不可用")
 	}
-	intent.Options = mergeIntentDefaults(intent.Options, cached.Defaults)
+	intent = resolveModelRequestIntent(cached.ProductSpec, intent, cached.Defaults)
+	if parameters := cached.ProductSpec.ImageParameters; parameters != nil {
+		if _, err := resolveImageParameterValues(parameters, intent.Options); err != nil {
+			return nil, err
+		}
+	}
 	if match := MatchCapability(cached.ProductSpec, intent); !match.Matched {
-		return nil, BadAuthRequest("所选模型不支持当前请求：" + strings.Join(match.Reasons, "；"))
+		return nil, modelCapabilityMismatchError(match)
 	}
 	eligible := s.eligibleLogicalRoutes(cached.Routes, intent, nil, cached.Model.PricePolicy == "channel")
 	if len(eligible) == 0 {
@@ -211,12 +216,12 @@ func (s *Service) ResolveLogicalModel(logicalModelID string, intent ModelRequest
 	selected := weightedRoute(eligible)
 	var priceTier *model.ChannelModelPriceTier
 	if cached.Model.PricePolicy == "channel" {
-		priceTier = channelModelPriceTierForIntent(selected.ChannelModel, intent)
+		priceTier = channelModelPriceTierForIntent(selected.ChannelModel, intent, selected.CapabilitySpec)
 		if priceTier == nil {
 			return nil, BadAuthRequest("当前模型尚未配置所选规格的价格")
 		}
 	}
-	return &RoutedModel{LogicalModel: cached.Model, Revision: cached.Revision, Route: selected.Route, ChannelModel: selected.ChannelModel, PriceTier: priceTier, Defaults: cached.Defaults}, nil
+	return &RoutedModel{LogicalModel: cached.Model, Revision: cached.Revision, Route: selected.Route, ChannelModel: selected.ChannelModel, CapabilitySpec: selected.CapabilitySpec, PriceTier: priceTier, Defaults: cached.Defaults, Intent: intent}, nil
 }
 
 func (s *Service) eligibleLogicalRoutes(routes []cachedLogicalRoute, intent ModelRequestIntent, tried map[string]bool, requirePriceTier bool) []cachedLogicalRoute {
@@ -229,7 +234,7 @@ func (s *Service) eligibleLogicalRoutes(routes []cachedLogicalRoute, intent Mode
 		if match := MatchCapability(route.CapabilitySpec, intent); !match.Matched {
 			continue
 		}
-		if requirePriceTier && channelModelPriceTierForIntent(route.ChannelModel, intent) == nil {
+		if requirePriceTier && channelModelPriceTierForIntent(route.ChannelModel, intent, route.CapabilitySpec) == nil {
 			continue
 		}
 		if route.Route.Priority > maxPriority {
@@ -254,8 +259,12 @@ func channelModelHasActivePriceTier(channelModel model.ChannelModel) bool {
 
 // channelModelPriceTierForIntent 使用“精确规格优先、通配规格兜底”的规则。SKU 选择器与
 // 运行意图使用同一组规范键，因而图片质量/画幅、视频分辨率/时长和生成操作都能独立定价。
-func channelModelPriceTierForIntent(channelModel model.ChannelModel, intent ModelRequestIntent) *model.ChannelModelPriceTier {
+func channelModelPriceTierForIntent(channelModel model.ChannelModel, intent ModelRequestIntent, specs ...CapabilitySpec) *model.ChannelModelPriceTier {
 	selector := skuSelectorForIntent(intent)
+	parameters := imagePriceParametersForChannel(channelModel, specs...)
+	if parameters != nil {
+		selector = imagePriceSelectorForParameters(parameters, intent)
+	}
 	bestScore := -1
 	var best *model.ChannelModelPriceTier
 	for index := range channelModel.PriceTiers {
@@ -263,7 +272,14 @@ func channelModelPriceTierForIntent(channelModel model.ChannelModel, intent Mode
 		if !tier.Enabled || !tier.PriceConfigured {
 			continue
 		}
-		matched, score := matchSKUSelector(skuSelectorForTier(*tier), selector)
+		tierSelector := skuSelectorForTier(*tier)
+		if parameters != nil {
+			tierSelector = model.DecodeSKUSelector(tier.SelectorJSON)
+			if validateImageParameterPriceSelector(parameters, tierSelector) != nil {
+				continue
+			}
+		}
+		matched, score := matchSKUSelector(tierSelector, selector)
 		if !matched {
 			continue
 		}
@@ -272,6 +288,44 @@ func channelModelPriceTierForIntent(channelModel model.ChannelModel, intent Mode
 		}
 	}
 	return best
+}
+
+// channelModelHasCompatiblePriceTier is only for catalog discovery: an option
+// omitted from the intent is still a choice, while every supplied selector
+// value must be compatible with at least one active, configured tier.
+func channelModelHasCompatiblePriceTier(channelModel model.ChannelModel, intent ModelRequestIntent, specs ...CapabilitySpec) bool {
+	requested := skuSelectorForIntent(intent)
+	parameters := imagePriceParametersForChannel(channelModel, specs...)
+	if parameters != nil {
+		requested = imagePriceSelectorForParameters(parameters, intent)
+	}
+	for _, tier := range channelModel.PriceTiers {
+		if !tier.Enabled || !tier.PriceConfigured {
+			continue
+		}
+		compatible := true
+		tierSelector := skuSelectorForTier(tier)
+		if parameters != nil {
+			tierSelector = model.DecodeSKUSelector(tier.SelectorJSON)
+			if validateImageParameterPriceSelector(parameters, tierSelector) != nil {
+				continue
+			}
+		}
+		for key, expected := range tierSelector {
+			expected = strings.TrimSpace(expected)
+			if expected == "" || expected == "*" {
+				continue
+			}
+			if actual, provided := requested[key]; provided && actual != expected {
+				compatible = false
+				break
+			}
+		}
+		if compatible {
+			return true
+		}
+	}
+	return false
 }
 
 func skuSelectorForIntent(intent ModelRequestIntent) map[string]string {
@@ -284,7 +338,9 @@ func skuSelectorForIntent(intent ModelRequestIntent) map[string]string {
 		// 价格档按实际参考素材归类。供应商执行仍可使用 reference_to_video、extend
 		// 等细分操作；计价时视频参考优先归为视频生视频，其余图片参考无论数量
 		// 都归为图生视频。
-		if intent.Inputs["video"] > 0 {
+		if selector["operation"] == VideoProcessingOperationEnhance {
+			// 画质增强等处理任务保留自身 operation，价格档可单独按 enhance 定价。
+		} else if intent.Inputs["video"] > 0 {
 			selector["operation"] = "video_to_video"
 		} else if intent.Inputs["image"] > 0 {
 			selector["operation"] = "image_to_video"
@@ -301,7 +357,15 @@ func skuSelectorForIntent(intent ModelRequestIntent) map[string]string {
 		if audio := normalizedScalar(intent.Options["videoGenerateAudio"]); audio == "true" || audio == "false" {
 			selector["videoGenerateAudio"] = audio
 		}
+		if band := normalizedScalar(intent.Options["fpsBand"]); band == "le30" || band == "le60" || band == "le120" {
+			selector["fpsBand"] = band
+		}
 	case "image":
+		for name, value := range intent.Options {
+			if value != nil {
+				selector[name] = fmt.Sprint(value)
+			}
+		}
 		if intent.Inputs["image"] > 0 {
 			selector["operation"] = "image_to_image"
 		} else {
@@ -333,6 +397,30 @@ func skuSelectorForIntent(intent ModelRequestIntent) map[string]string {
 	return selector
 }
 
+// Seedream 5.0 官方 1.5K 尺寸；这些尺寸在 2.36M 像素附近，会被通用阈值误判成 2K。
+var seedream15kSizes = map[string]struct{}{
+	"1536x1536": {}, "2048x1152": {}, "1152x2048": {}, "1792x1344": {},
+	"1344x1792": {}, "1872x1248": {}, "1248x1872": {}, "2352x1008": {},
+}
+
+// imageResolutionTierForSize 把精确像素尺寸归入价格档位；5M 上限覆盖含 1.5K 的 Seedream 2K 尺寸。
+func imageResolutionTierForSize(width, height int64) string {
+	if _, isSeedream15k := seedream15kSizes[fmt.Sprintf("%dx%d", width, height)]; isSeedream15k {
+		return "1.5k"
+	}
+	pixels := width * height
+	switch {
+	case pixels <= 2_000_000:
+		return "1k"
+	case pixels <= 5_000_000:
+		return "2k"
+	case pixels <= 8_294_400:
+		return "4k"
+	default:
+		return ""
+	}
+}
+
 func normalizeImagePriceQuality(rawQuality string, rawSize string) string {
 	quality := strings.ToLower(strings.TrimSpace(rawQuality))
 	if quality != "" && quality != "auto" && quality != "any" {
@@ -347,17 +435,7 @@ func normalizeImagePriceQuality(rawQuality string, rawSize string) string {
 	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 || width > (1<<32)/height {
 		return ""
 	}
-	pixels := width * height
-	switch {
-	case pixels <= 2_000_000:
-		return "1k"
-	case pixels <= 4_300_000:
-		return "2k"
-	case pixels <= 8_294_400:
-		return "4k"
-	default:
-		return ""
-	}
+	return imageResolutionTierForSize(width, height)
 }
 
 func imageResolutionFromSize(rawSize string) string {
@@ -370,22 +448,12 @@ func imageResolutionFromSize(rawSize string) string {
 	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 || width > (1<<32)/height {
 		return ""
 	}
-	pixels := width * height
-	switch {
-	case pixels <= 2_000_000:
-		return "1k"
-	case pixels <= 4_300_000:
-		return "2k"
-	case pixels <= 8_294_400:
-		return "4k"
-	default:
-		return ""
-	}
+	return imageResolutionTierForSize(width, height)
 }
 
 func isImageResolutionTier(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1k", "2k", "4k":
+	case "1k", "1.5k", "2k", "4k":
 		return true
 	default:
 		return false
@@ -417,6 +485,10 @@ func matchSKUSelector(tier map[string]string, requested map[string]string) (bool
 			continue
 		}
 		if requested[key] != expected {
+			// 1.5K 请求在只配置了 1K / 2K 价格档时按相邻档命中，保证旧定价继续可用。
+			if (key == "quality" || key == "resolution" || key == "imageResolution") && strings.ToLower(strings.TrimSpace(requested[key])) == "1.5k" && (expected == "2k" || expected == "1k") {
+				continue
+			}
 			return false, 0
 		}
 		score++
