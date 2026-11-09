@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Box, Camera, Clapperboard, Lightbulb, LockKeyhole, Move3d, Sparkles, Timer } from "lucide-react";
+import { Box, Camera, Clapperboard, Lightbulb, LockKeyhole, Move3d, Timer, MousePointerClick } from "lucide-react";
 
 import { CachedResourceImage } from "@/components/cached-resource-image";
 import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
@@ -62,7 +62,7 @@ export function CanvasPrevisNodePanel({ node, scene, readNodeContent, onOpen, pr
                 <Stat icon={<Box className="size-3" />} value={objectCount} label="对象" />
                 <Stat icon={<Camera className="size-3" />} value={cameraCount} label="机位" />
                 <Stat icon={<Lightbulb className="size-3" />} value={lightCount} label="灯光" />
-                <span className="previs-node-card-footer-action"><Sparkles className="size-3" />双击打开</span>
+                <span className="previs-node-card-footer-action"><MousePointerClick className="size-3" />双击打开</span>
             </footer>
         </div>
     );
@@ -76,7 +76,7 @@ function PrevisPreviewState({ kind, theme }: { kind: "loading" | "empty"; theme:
                 <Clapperboard className="size-4" style={{ color: theme.node.muted }} aria-hidden />
             </span>
             <span className="max-w-full truncate text-xs font-semibold" style={{ color: theme.node.text }}>{loading ? "正在准备场景" : "尚未生成预览"}</span>
-            <span className="max-w-full text-[11px] leading-4" style={{ color: theme.node.muted }}>{loading ? "场景数据加载完成后显示" : "进入预演台并回写构图后显示"}</span>
+            <span className="max-w-full text-[var(--fs-label)] leading-4" style={{ color: theme.node.muted }}>{loading ? "场景数据加载完成后显示" : "进入预演台并回写构图后显示"}</span>
         </div>
     );
 }

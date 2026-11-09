@@ -24,7 +24,6 @@ import {
     MoreHorizontal,
     Quote,
     Redo2,
-    Save,
     Strikethrough,
     Underline,
     Undo2,
@@ -33,25 +32,37 @@ import {
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { createCanvasRichTextExtensions, isSafeCanvasRichTextLink } from "@/lib/canvas/canvas-rich-text";
+import { canvasRichTextChangeMap, mergeCanvasRichText, mergeCanvasText } from "@/lib/canvas/canvas-text-merge";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+import { useCanvasTextLease } from "./use-canvas-text-lease";
 
 type CanvasTextEditorModalProps = {
     node: CanvasNodeData | null;
     open: boolean;
     onClose: () => void;
-    onSave: (nodeId: string, title: string, content: string, richText: Record<string, unknown>) => Promise<void> | void;
+    onChange: (nodeId: string, title: string, content: string, richText: Record<string, unknown>) => Promise<void> | void;
 };
 
-export function CanvasTextEditorModal({ node, open, onClose, onSave }: CanvasTextEditorModalProps) {
-    const { message, modal } = App.useApp();
+export function CanvasTextEditorModal({ node, open, onClose, onChange }: CanvasTextEditorModalProps) {
     const theme = canvasThemes[useActiveTheme()];
     const [title, setTitle] = useState("");
     const [markdownContent, setMarkdownContent] = useState("");
-    const [dirty, setDirty] = useState(false);
-    const [saving, setSaving] = useState(false);
     const markdownEditorRef = useRef<TextAreaRef | null>(null);
     const isMarkdown = node?.type === CanvasNodeType.Markdown;
+    const textLease = useCanvasTextLease(node?.id || "");
+    const compositionRef = useRef<{ nodeId: string; content: string; richText: Record<string, unknown> } | null>(null);
+    const draftRef = useRef({ node, title, markdownContent, onChange, textLease });
+    draftRef.current = { node, title, markdownContent, onChange, textLease };
+    const publish = (content: string, richText: Record<string, unknown>, nextTitle = draftRef.current.title) => {
+        const current = draftRef.current;
+        if (!current.node || current.node.metadata?.locked || !current.textLease.input()) return;
+        void Promise.resolve().then(() => current.onChange(current.node!.id, nextTitle, content, richText)).catch((error) => {
+            console.warn("文本草稿写回尚未完成", error);
+        });
+    };
+    const publishRef = useRef(publish);
+    publishRef.current = publish;
     const editor = useEditor({
         immediatelyRender: false,
         extensions: createCanvasRichTextExtensions("输入文本内容…"),
@@ -61,16 +72,41 @@ export function CanvasTextEditorModal({ node, open, onClose, onSave }: CanvasTex
                 class: "min-h-full px-8 py-7 text-[var(--fs-body-lg)] leading-7 outline-none sm:px-12 lg:px-16",
                 "aria-label": "文本节点富文本编辑区",
             },
+            handleDOMEvents: {
+                compositionstart: (view) => {
+                    const current = draftRef.current.node;
+                    if (current) compositionRef.current = { nodeId: current.id, content: view.state.doc.textContent, richText: view.state.doc.toJSON() };
+                    return false;
+                },
+                compositionend: () => {
+                    requestAnimationFrame(() => {
+                        const base = compositionRef.current;
+                        compositionRef.current = null;
+                        const current = draftRef.current.node, active = editorRef.current;
+                        if (!base || !active || active.isDestroyed || current?.id !== base.nodeId) return;
+                        const remote = current.metadata?.richText?.type === "doc" ? current.metadata.richText : plainTextDocument(current.metadata?.content || "");
+                        const merged = mergeCanvasRichText(base.richText, remote, active.getJSON());
+                        applyEditorContent(active, merged.richText);
+                        publishRef.current(merged.content, merged.richText);
+                    });
+                    return false;
+                },
+            },
         },
-        onUpdate: () => setDirty(true),
+        onUpdate: ({ editor: updated }) => {
+            if (!compositionRef.current) publishRef.current(updated.getText({ blockSeparator: "\n" }).trimEnd(), updated.getJSON() as Record<string, unknown>);
+        },
     });
+    const editorRef = useRef(editor);
+    editorRef.current = editor;
+
+    const readOnly = Boolean(node?.metadata?.locked);
+    useEffect(() => { editor?.setEditable(!readOnly, false); }, [editor, readOnly]);
 
     useEffect(() => {
         if (!open || !node) return;
         setTitle(node.title || (node.type === CanvasNodeType.Markdown ? "Markdown" : "文本"));
         setMarkdownContent(node.metadata?.content || "");
-        setDirty(false);
-        setSaving(false);
         if (node.type === CanvasNodeType.Markdown) {
             window.setTimeout(() => markdownEditorRef.current?.focus(), 0);
             return;
@@ -80,48 +116,20 @@ export function CanvasTextEditorModal({ node, open, onClose, onSave }: CanvasTex
         window.setTimeout(() => editor.commands.focus("start"), 0);
     }, [editor, node?.id, node?.type, open]);
 
+    useEffect(() => {
+        if (!open || !node || editor?.view.composing || compositionRef.current) return;
+        setTitle(node.title || "");
+        setMarkdownContent(node.metadata?.content || "");
+        if (editor && node.type !== CanvasNodeType.Markdown) {
+            const content = (node.metadata?.richText as JSONContent | undefined) || plainTextDocument(node.metadata?.content || "");
+            if (JSON.stringify(editor.getJSON()) !== JSON.stringify(content)) applyEditorContent(editor, content);
+        }
+    }, [editor, node, open, textLease.pending]);
+
     const characterCount = isMarkdown ? markdownContent.length : editor?.storage.characterCount?.characters?.() || 0;
     const wordCount = useMemo(() => countWords(isMarkdown ? markdownContent : editor?.getText() || ""), [characterCount, editor, isMarkdown, markdownContent]);
 
-    const save = async () => {
-        if (!node || saving || (!isMarkdown && !editor)) return;
-        setSaving(true);
-        try {
-            if (isMarkdown) {
-                await onSave(node.id, title.trim() || "Markdown", markdownContent, (node.metadata?.richText as Record<string, unknown> | undefined) || {});
-            } else {
-                await onSave(node.id, title.trim() || "文本", editor!.getText({ blockSeparator: "\n" }).trimEnd(), editor!.getJSON() as Record<string, unknown>);
-            }
-            setDirty(false);
-            message.success("文本节点已保存");
-        } catch (error) {
-            message.error(error instanceof Error ? error.message : "文本保存失败");
-        } finally {
-            setSaving(false);
-        }
-    };
-
-    const close = () => {
-        if (!dirty || saving) return onClose();
-        modal.confirm({
-            title: "放弃未保存的修改？",
-            content: `关闭后，本次${isMarkdown ? "Markdown" : "富文本"}编辑不会写回画布节点。`,
-            okText: "放弃修改",
-            cancelText: "继续编辑",
-            onOk: onClose,
-        });
-    };
-
-    useEffect(() => {
-        if (!open) return;
-        const handleKeyDown = (event: KeyboardEvent) => {
-            if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "s") return;
-            event.preventDefault();
-            void save();
-        };
-        window.addEventListener("keydown", handleKeyDown);
-        return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [dirty, editor, isMarkdown, markdownContent, node?.id, open, saving, title]);
+    const close = () => onClose();
 
     return (
         <AppModal
@@ -141,14 +149,20 @@ export function CanvasTextEditorModal({ node, open, onClose, onSave }: CanvasTex
                     <Input
                         variant="borderless"
                         value={title}
-                        onChange={(event) => { setTitle(event.target.value); setDirty(true); }}
+                        readOnly={readOnly}
+                        onChange={(event) => {
+                            if (readOnly) return;
+                            const value = event.target.value;
+                            setTitle(value);
+                            draftRef.current.title = value;
+                            publish(isMarkdown ? markdownContent : editor?.getText({ blockSeparator: "\n" }).trimEnd() || "", isMarkdown ? (node?.metadata?.richText as Record<string, unknown>) || {} : editor?.getJSON() as Record<string, unknown> || {}, value);
+                        }}
                         className="!h-9 min-w-0 max-w-[360px] flex-1 !px-1 text-sm font-semibold"
                         placeholder="文本节点标题"
                         aria-label="文本节点标题"
                     />
                     <span className="hidden shrink-0 text-[var(--fs-label)] sm:inline" style={{ color: theme.node.muted }}>{characterCount.toLocaleString("zh-CN")} 字 · {wordCount.toLocaleString("zh-CN")} 词</span>
-                    <span className="ml-auto hidden text-[var(--fs-label)] sm:inline" style={{ color: dirty ? theme.accent.primary : theme.node.muted }}>{dirty ? "有未保存修改" : "已保存"}</span>
-                    <Button size="small" type="primary" icon={<Save className="size-3.5" />} loading={saving} disabled={!dirty} onClick={() => void save()}>保存</Button>
+                    <span className="ml-auto hidden text-[var(--fs-label)] sm:inline" style={{ color: theme.node.muted }}>画布内容</span>
                     <Tooltip title="关闭">
                         <Button size="small" type="text" icon={<X className="size-4" />} aria-label="关闭文本编辑器" onClick={close} />
                     </Tooltip>
@@ -159,20 +173,37 @@ export function CanvasTextEditorModal({ node, open, onClose, onSave }: CanvasTex
                         Markdown 源码
                     </div>
                 ) : (
-                    <TextEditorToolbar editor={editor} />
+                    <div inert={readOnly || undefined} className={readOnly ? "shrink-0 opacity-50" : "shrink-0"}><TextEditorToolbar editor={readOnly ? null : editor} /></div>
                 )}
 
                 <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto" style={{ background: theme.canvas.background }}>
                     <div
-                        className="mx-auto min-h-full w-full max-w-[920px] [&_.ProseMirror]:min-h-[calc(min(88dvh,840px)-126px)] [&_.ProseMirror_a]:text-blue-600 [&_.ProseMirror_a]:underline [&_.ProseMirror_blockquote]:my-4 [&_.ProseMirror_blockquote]:border-l-2 [&_.ProseMirror_blockquote]:pl-4 [&_.ProseMirror_blockquote]:opacity-70 [&_.ProseMirror_code]:rounded [&_.ProseMirror_code]:bg-black/6 [&_.ProseMirror_code]:px-1 [&_.ProseMirror_code]:py-0.5 dark:[&_.ProseMirror_code]:bg-white/8 [&_.ProseMirror_h1]:mb-4 [&_.ProseMirror_h1]:mt-6 [&_.ProseMirror_h1]:text-3xl [&_.ProseMirror_h1]:font-semibold [&_.ProseMirror_h2]:mb-3 [&_.ProseMirror_h2]:mt-5 [&_.ProseMirror_h2]:text-2xl [&_.ProseMirror_h2]:font-semibold [&_.ProseMirror_h3]:mb-2 [&_.ProseMirror_h3]:mt-4 [&_.ProseMirror_h3]:text-xl [&_.ProseMirror_h3]:font-semibold [&_.ProseMirror_hr]:my-6 [&_.ProseMirror_li]:my-1 [&_.ProseMirror_ol]:my-3 [&_.ProseMirror_ol]:list-decimal [&_.ProseMirror_ol]:pl-6 [&_.ProseMirror_p]:my-2 [&_.ProseMirror_pre]:my-4 [&_.ProseMirror_pre]:overflow-x-auto [&_.ProseMirror_pre]:rounded-md [&_.ProseMirror_pre]:bg-black/90 [&_.ProseMirror_pre]:p-4 [&_.ProseMirror_pre]:text-white [&_.ProseMirror_ul]:my-3 [&_.ProseMirror_ul]:list-disc [&_.ProseMirror_ul]:pl-6 [&_.is-editor-empty:first-child]:before:pointer-events-none [&_.is-editor-empty:first-child]:before:float-left [&_.is-editor-empty:first-child]:before:h-0 [&_.is-editor-empty:first-child]:before:text-foreground/35 [&_.is-editor-empty:first-child]:before:content-[attr(data-placeholder)]"
+                        className="mx-auto min-h-full w-full max-w-[920px] [&_.ProseMirror]:min-h-[calc(min(88dvh,840px)-126px)] [&_.ProseMirror_a]:text-blue-600 [&_.ProseMirror_a]:underline [&_.ProseMirror_blockquote]:my-4 [&_.ProseMirror_blockquote]:rounded-md [&_.ProseMirror_blockquote]:bg-foreground/5 [&_.ProseMirror_blockquote]:px-4 [&_.ProseMirror_blockquote]:py-2 [&_.ProseMirror_blockquote]:opacity-70 [&_.ProseMirror_code]:rounded [&_.ProseMirror_code]:bg-black/6 [&_.ProseMirror_code]:px-1 [&_.ProseMirror_code]:py-0.5 dark:[&_.ProseMirror_code]:bg-white/8 [&_.ProseMirror_h1]:mb-4 [&_.ProseMirror_h1]:mt-6 [&_.ProseMirror_h1]:text-3xl [&_.ProseMirror_h1]:font-semibold [&_.ProseMirror_h2]:mb-3 [&_.ProseMirror_h2]:mt-5 [&_.ProseMirror_h2]:text-2xl [&_.ProseMirror_h2]:font-semibold [&_.ProseMirror_h3]:mb-2 [&_.ProseMirror_h3]:mt-4 [&_.ProseMirror_h3]:text-xl [&_.ProseMirror_h3]:font-semibold [&_.ProseMirror_hr]:my-6 [&_.ProseMirror_li]:my-1 [&_.ProseMirror_ol]:my-3 [&_.ProseMirror_ol]:list-decimal [&_.ProseMirror_ol]:pl-6 [&_.ProseMirror_p]:my-2 [&_.ProseMirror_pre]:my-4 [&_.ProseMirror_pre]:overflow-x-auto [&_.ProseMirror_pre]:rounded-md [&_.ProseMirror_pre]:bg-black/90 [&_.ProseMirror_pre]:p-4 [&_.ProseMirror_pre]:text-white [&_.ProseMirror_ul]:my-3 [&_.ProseMirror_ul]:list-disc [&_.ProseMirror_ul]:pl-6 [&_.is-editor-empty:first-child]:before:pointer-events-none [&_.is-editor-empty:first-child]:before:float-left [&_.is-editor-empty:first-child]:before:h-0 [&_.is-editor-empty:first-child]:before:text-foreground/35 [&_.is-editor-empty:first-child]:before:content-[attr(data-placeholder)]"
                     >
                         {isMarkdown ? (
                             <Input.TextArea
                                 ref={markdownEditorRef}
                                 value={markdownContent}
+                                readOnly={readOnly}
                                 onChange={(event) => {
+                                    if (readOnly) return;
                                     setMarkdownContent(event.target.value);
-                                    setDirty(true);
+                                    draftRef.current.markdownContent = event.target.value;
+                                    if (compositionRef.current) return;
+                                    publish(event.target.value, (node?.metadata?.richText as Record<string, unknown>) || {});
+                                }}
+                                onCompositionStart={(event) => {
+                                    if (node) compositionRef.current = { nodeId: node.id, content: event.currentTarget.value, richText: {} };
+                                }}
+                                onCompositionEnd={(event) => {
+                                    const base = compositionRef.current;
+                                    compositionRef.current = null;
+                                    if (!base) return;
+                                    const merged = mergeCanvasText(base.content, draftRef.current.node?.metadata?.content || "", event.currentTarget.value);
+                                    event.currentTarget.value = merged;
+                                    setMarkdownContent(merged);
+                                    draftRef.current.markdownContent = merged;
+                                    publish(merged, {});
                                 }}
                                 placeholder="输入 Markdown 内容…"
                                 autoSize={false}
@@ -186,12 +217,17 @@ export function CanvasTextEditorModal({ node, open, onClose, onSave }: CanvasTex
                 </div>
 
                 <footer className="flex h-8 shrink-0 items-center gap-3 border-t px-3 text-[var(--fs-tiny)]" style={{ borderColor: theme.node.stroke, color: theme.node.muted }}>
-                    <span className="hidden sm:inline">{isMarkdown ? "直接编辑 Markdown 源码，保存后画布会按 Markdown 渲染" : "支持标题、列表、引用、链接、代码和颜色格式"}</span>
-                    <span className="ml-auto">Ctrl/⌘S 保存</span>
                 </footer>
             </section>
         </AppModal>
     );
+}
+
+function applyEditorContent(editor: Editor, content: JSONContent) {
+    const next = editor.schema.nodeFromJSON(content);
+    const mapping = canvasRichTextChangeMap(editor.state.doc, next);
+    const from = mapping.map(editor.state.selection.from, 1), to = mapping.map(editor.state.selection.to, 1);
+    editor.chain().setMeta("addToHistory", false).setContent(content, { emitUpdate: false }).setTextSelection({ from, to }).run();
 }
 
 function TextEditorToolbar({ editor }: { editor: Editor | null }) {
@@ -277,7 +313,7 @@ function TextEditorToolbar({ editor }: { editor: Editor | null }) {
             <ToolbarDivider />
             <Tooltip title="文字颜色">
                 <ColorPicker value={String(editor?.getAttributes("textStyle").color || theme.node.text)} onChangeComplete={(color) => editor?.chain().focus().setColor(color.toHexString()).run()}>
-                    <button type="button" className="grid size-8 shrink-0 place-items-center rounded-md text-xs font-bold outline-none hover:bg-black/5 focus-visible:ring-2 dark:hover:bg-white/8" aria-label="文字颜色"><span className="border-b-2 px-0.5" style={{ borderColor: String(editor?.getAttributes("textStyle").color || theme.node.text) }}>A</span></button>
+                    <button type="button" className="grid size-8 shrink-0 place-items-center rounded-md text-xs font-semibold outline-none hover:bg-black/5 focus-visible:ring-2 dark:hover:bg-white/8" aria-label="文字颜色"><span className="border-b-2 px-0.5" style={{ borderColor: String(editor?.getAttributes("textStyle").color || theme.node.text) }}>A</span></button>
                 </ColorPicker>
             </Tooltip>
             <Tooltip title="高亮颜色">
@@ -291,7 +327,7 @@ function TextEditorToolbar({ editor }: { editor: Editor | null }) {
                 menu={{
                     items: [
                         { key: "code", icon: <Code2 className="size-3.5" />, label: "行内代码" },
-                        { key: "codeBlock", icon: <span className="text-[var(--fs-tiny)] font-bold">{"<>"}</span>, label: "代码块" },
+                        { key: "codeBlock", icon: <span className="text-[var(--fs-tiny)] font-semibold">{"<>"}</span>, label: "代码块" },
                         { key: "rule", icon: <Minus className="size-3.5" />, label: "插入分隔线" },
                         { type: "divider" },
                         { key: "clear", icon: <Eraser className="size-3.5" />, label: "清除格式" },

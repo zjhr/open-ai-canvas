@@ -1,4 +1,4 @@
-import { AudioLines, Check, Film, Flame, Image, MessageSquareText, Network, Settings2, Sparkles } from "lucide-react";
+import { AudioLines, Check, Film, Flame, Image, MessageSquareText, Network, Settings2, Aperture } from "lucide-react";
 import { Button, Modal } from "antd";
 import { useEffect, useState, type ReactNode } from "react";
 
@@ -25,7 +25,7 @@ type PickerDensity = "comfortable" | "compact";
 
 export function CapabilityCardPicker({ value, onChange, density = "comfortable" }: { value?: ModelCapabilityChoice; onChange?: (value: ModelCapabilityChoice) => void; density?: PickerDensity }) {
     return (
-        <div className={cn("grid grid-cols-2 gap-2 sm:grid-cols-4", density === "compact" && "gap-1.5")} role="radiogroup" aria-label="模型能力">
+        <div className={cn("grid grid-cols-2 gap-2 sm:grid-cols-4", density === "compact" && "gap-2")} role="radiogroup" aria-label="模型能力">
             {capabilityChoices.map((item) => {
                 const selected = value === item.value;
                 return (
@@ -36,7 +36,7 @@ export function CapabilityCardPicker({ value, onChange, density = "comfortable" 
                         aria-checked={selected}
                         className={cn(
                             "relative flex min-w-0 flex-col rounded-md border text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40",
-                            density === "compact" ? "min-h-16 p-2" : "min-h-24 p-2.5",
+                            density === "compact" ? "min-h-16 p-2" : "min-h-24 p-2",
                             selected ? "border-foreground/70 bg-foreground/[.04]" : "border-border/75 bg-background hover:border-foreground/25 hover:bg-muted/30",
                         )}
                         onClick={() => onChange?.(item.value)}
@@ -72,7 +72,7 @@ export function ProtocolCardPicker({
 }) {
     const availableProtocols = protocols.filter((item) => item.capability === capability && item.enabled !== false);
     return (
-        <div className={cn("grid grid-cols-1 gap-2 sm:grid-cols-2", density === "compact" && "gap-1.5 xl:grid-cols-3")} role="radiogroup" aria-label="模型请求协议">
+        <div className={cn("grid grid-cols-1 gap-2 sm:grid-cols-2", density === "compact" && "gap-2 xl:grid-cols-3")} role="radiogroup" aria-label="模型请求协议">
             {availableProtocols.map((protocol) => {
                 const selected = value === protocol.value;
                 return (
@@ -83,12 +83,12 @@ export function ProtocolCardPicker({
                         aria-checked={selected}
                         className={cn(
                             "relative flex min-w-0 flex-col rounded-md border text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40",
-                            density === "compact" ? "min-h-16 p-2" : "min-h-24 p-2.5",
+                            density === "compact" ? "min-h-16 p-2" : "min-h-24 p-2",
                             selected ? "border-foreground/70 bg-foreground/[.04]" : "border-border/75 bg-background hover:border-foreground/25 hover:bg-muted/30",
                         )}
                         onClick={() => onChange?.(protocol.value)}
                     >
-                        <div className={cn("flex min-w-0 items-start", density === "compact" ? "gap-1.5 pr-4" : "gap-2.5 pr-6")}>
+                        <div className={cn("flex min-w-0 items-start", density === "compact" ? "gap-2 pr-4" : "gap-2 pr-6")}>
                             <ProtocolBrandMark protocol={protocol} compact={density === "compact"} />
                             <div className="min-w-0 flex-1">
                                 <div className={cn("model-protocol-card-title truncate font-semibold", density === "compact" ? "text-xs" : "text-sm")}>{protocol.label}</div>
@@ -187,7 +187,7 @@ function ProtocolBrandMark({ protocol, compact = false }: { protocol: ModelProto
     if (vendor.includes("jimeng") || vendor.includes("即梦"))
         return (
             <span className={cn("grid shrink-0 place-items-center rounded-md bg-muted text-foreground/65", iconSize)}>
-                <Sparkles className={compact ? "size-3" : "size-4"} />
+                <Aperture className={compact ? "size-3" : "size-4"} />
             </span>
         );
     if (vendor.includes("volcengine") || vendor.includes("火山方舟"))

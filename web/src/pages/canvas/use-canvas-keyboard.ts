@@ -13,7 +13,7 @@ type UseCanvasKeyboardOptions = {
     setShortcutRequestNonce: Dispatch<SetStateAction<number>>;
     setInfoNodeId: Dispatch<SetStateAction<string | null>>;
     setCropNodeId: Dispatch<SetStateAction<string | null>>;
-    setMaskEditNodeId: Dispatch<SetStateAction<string | null>>;
+    setRegionEditNodeId: Dispatch<SetStateAction<string | null>>;
     setAnnotationNodeId: Dispatch<SetStateAction<string | null>>;
     saveCanvasProject: (options?: { requireRemote?: boolean }) => unknown;
     zoomToActualSize: () => void;
@@ -60,7 +60,7 @@ export function useCanvasKeyboard({
     setShortcutRequestNonce,
     setInfoNodeId,
     setCropNodeId,
-    setMaskEditNodeId,
+    setRegionEditNodeId,
     setAnnotationNodeId,
     saveCanvasProject,
     zoomToActualSize,
@@ -131,7 +131,7 @@ export function useCanvasKeyboard({
             if (isCanvasControlTarget && !(isModifierShortcut && !event.altKey && (key === "c" || key === "v"))) return;
             if (event.altKey && !isModifierShortcut && key === "l") {
                 event.preventDefault();
-                if (!event.repeat && selectedNodeIdsRef.current.size > 1) beginBatchConnection();
+                if (!event.repeat && selectedNodeIdsRef.current.size > 0) beginBatchConnection();
                 return;
             }
             if (event.key === "?" && !isModifierShortcut && !event.altKey) {
@@ -176,9 +176,12 @@ export function useCanvasKeyboard({
                 if (shouldPreferCopiedNodes()) {
                     event.preventDefault();
                     if (pasteCopiedNodes()) return;
-                    void navigator.clipboard?.readText?.().then((text) => {
-                        if (restoreCopiedNodesFromText(text)) pasteCopiedNodes();
-                    }).catch(() => undefined);
+                    void navigator.clipboard
+                        ?.readText?.()
+                        .then((text) => {
+                            if (restoreCopiedNodesFromText(text)) pasteCopiedNodes();
+                        })
+                        .catch(() => undefined);
                 }
                 return;
             }
@@ -197,7 +200,7 @@ export function useCanvasKeyboard({
                 deselectCanvas();
                 setInfoNodeId(null);
                 setCropNodeId(null);
-                setMaskEditNodeId(null);
+                setRegionEditNodeId(null);
                 setAnnotationNodeId(null);
             }
         };
@@ -222,5 +225,40 @@ export function useCanvasKeyboard({
             window.removeEventListener("keydown", handleKeyDown, true);
             window.removeEventListener("paste", handlePaste, true);
         };
-    }, [enabled, beginBatchConnection, cancelSelectionBox, copySelectedNodes, deleteConnection, deleteNodes, deselectCanvas, exitFocusMode, fitCanvasContent, fitCanvasSelection, focusMode, nodesRef, onOpenSearch, pasteCopiedNodes, pasteSystemClipboard, redoCanvas, restoreCopiedNodesFromText, saveCanvasProject, selectedConnectionId, selectedNodeIdsRef, setAnnotationNodeId, setContextMenu, setCropNodeId, setInfoNodeId, setMaskEditNodeId, setSelectedConnectionId, setSelectedNodeIds, setShortcutRequestNonce, shouldPreferCopiedNodes, toggleFocusMode, undoCanvas, zoomCanvasIn, zoomCanvasOut, zoomToActualSize]);
+    }, [
+        enabled,
+        beginBatchConnection,
+        cancelSelectionBox,
+        copySelectedNodes,
+        deleteConnection,
+        deleteNodes,
+        deselectCanvas,
+        exitFocusMode,
+        fitCanvasContent,
+        fitCanvasSelection,
+        focusMode,
+        nodesRef,
+        onOpenSearch,
+        pasteCopiedNodes,
+        pasteSystemClipboard,
+        redoCanvas,
+        restoreCopiedNodesFromText,
+        saveCanvasProject,
+        selectedConnectionId,
+        selectedNodeIdsRef,
+        setAnnotationNodeId,
+        setContextMenu,
+        setCropNodeId,
+        setInfoNodeId,
+        setRegionEditNodeId,
+        setSelectedConnectionId,
+        setSelectedNodeIds,
+        setShortcutRequestNonce,
+        shouldPreferCopiedNodes,
+        toggleFocusMode,
+        undoCanvas,
+        zoomCanvasIn,
+        zoomCanvasOut,
+        zoomToActualSize,
+    ]);
 }

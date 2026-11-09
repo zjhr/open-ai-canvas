@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"yingce/backend/internal/model"
+	"yingce/backend/internal/protocol"
 )
 
 type taskBillingRepositoryStub struct {
@@ -131,6 +132,27 @@ func TestTaskBillingCoordinatorTruncatesFailureText(t *testing.T) {
 	}
 }
 
+func TestTaskBillingCoordinatorHidesUpstreamAddressInReason(t *testing.T) {
+	repo := &taskBillingRepositoryStub{}
+	billing := newTaskBillingCoordinator(repo)
+	reason := `Post "https://www.kccai.ai/v1/images/generations": http2: server sent GOAWAY and closed the connection`
+
+	if err := billing.RefundBilling("order-1", reason); err != nil {
+		t.Fatalf("RefundBilling() error = %v", err)
+	}
+	if err := billing.MarkBillingUncertain("order-1", reason); err != nil {
+		t.Fatalf("MarkBillingUncertain() error = %v", err)
+	}
+	for name, got := range map[string]string{"refund": repo.refundCalls[0], "uncertain": repo.uncertainCalls[0]} {
+		if strings.Contains(got, "kccai.ai") {
+			t.Fatalf("%s reason leaked upstream host: %q", name, got)
+		}
+		if !strings.Contains(got, upstreamAddressLinkPlaceholder) {
+			t.Fatalf("%s reason should mark the hidden link: %q", name, got)
+		}
+	}
+}
+
 func TestTaskBillingCoordinatorFailureReviewPolicy(t *testing.T) {
 	tests := []struct {
 		name string
@@ -144,6 +166,8 @@ func TestTaskBillingCoordinatorFailureReviewPolicy(t *testing.T) {
 		{name: "successful billable call", stub: taskBillingRepositoryStub{order: &model.BillingOrder{Status: model.BillingStatusRunning}, hasSuccessfulCall: true}, err: errors.New("provider rejected"), want: true},
 		{name: "normal failed call", stub: taskBillingRepositoryStub{order: &model.BillingOrder{Status: model.BillingStatusRunning}}, err: errors.New("provider rejected"), want: false},
 		{name: "billable call lookup error", stub: taskBillingRepositoryStub{order: &model.BillingOrder{Status: model.BillingStatusRunning}, callErr: errors.New("database unavailable")}, err: errors.New("provider rejected"), want: true},
+		{name: "explicit upstream failure mentioning timeout", stub: taskBillingRepositoryStub{order: &model.BillingOrder{Status: model.BillingStatusRunning}}, err: providerTaskTerminalError{TaskID: "provider-1", Status: protocol.StatusFailed, Message: "upstream generation timeout"}, want: false},
+		{name: "explicit upstream failure with successful billable call", stub: taskBillingRepositoryStub{order: &model.BillingOrder{Status: model.BillingStatusRunning}, hasSuccessfulCall: true}, err: providerTaskTerminalError{TaskID: "provider-1", Status: protocol.StatusFailed, Message: "upstream generation timeout"}, want: true},
 	}
 
 	for _, tt := range tests {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { collectCanvasMediaAssetIds, rebindInconsistentCanvasAssets, repairMissingCanvasAssets, repairMissingCanvasVideoPreviews } from "@/services/canvas-asset-repair";
 import { ApiError } from "@/services/api/request";
@@ -6,6 +6,16 @@ import { useAssetStore, type Asset } from "@/stores/use-asset-store";
 import { useCanvasStore, type CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
 import type { TimelineClip } from "@/types/timeline";
+
+test("场景换图后的旧画布保留资产历史图片引用，不创建重复素材", () => {
+    const image: Asset = { id: "scene", kind: "image", category: "environment", title: "阁楼", coverUrl: "", tags: [], createdAt: "", updatedAt: "", metadata: { projectAssetImageHistory: ["resource:old-image"] }, data: { dataUrl: "/api/resources/new-image/file", storageKey: "resource:new-image", width: 800, height: 600, bytes: 100, mimeType: "image/png" } };
+    useAssetStore.setState({ assets: [image] });
+    const node = { ...videoNode("scene-node", "scene", "resource:old-image"), type: CanvasNodeType.Image };
+    useCanvasStore.setState({ projects: [project("canvas", [node])] });
+    expect(repairMissingCanvasAssets()).toEqual({ createdAssets: 0, updatedProjects: 0 });
+    expect(useCanvasStore.getState().projects[0].nodes[0].metadata?.storageKey).toBe("resource:old-image");
+    expect(useAssetStore.getState().assets).toHaveLength(1);
+});
 
 function videoAsset(id: string, storageKey?: string, url = ""): Asset {
     return {
@@ -52,6 +62,11 @@ function timelineClip(assetId: string | undefined, storageKey: string): Timeline
 }
 
 beforeEach(() => {
+    useCanvasStore.setState({ projects: [] });
+    useAssetStore.setState({ assets: [] });
+});
+// 全局 store 在同一 bun 进程的测试文件间共享；残留画布会被后续文件的同步流程当成待保存数据。
+afterEach(() => {
     useCanvasStore.setState({ projects: [] });
     useAssetStore.setState({ assets: [] });
 });

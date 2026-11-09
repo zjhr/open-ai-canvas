@@ -225,7 +225,8 @@ func applyCloudAgentCanvasPlan(doc map[string]any, ops []agentCanvasOp) ([]cloud
 				return nil, &cloudAgentArgumentError{BadAuthRequest("更新节点必须提供 patch")}
 			}
 			if index < 0 {
-				return nil, BadAuthRequest("只能更新现有且受 Agent 支持的节点")
+				// 节点 ID 不存在同样是模型可自行纠正的参数错误，与连线端点 not_found 一致。
+				return nil, cloudAgentFieldError(fmt.Sprintf("ops[%d].id", opIndex), "not_found", "只能更新现有且受 Agent 支持的节点；该节点不在当前画布，请重新读取画布并使用真实节点 ID")
 			}
 			capability, ok := cloudAgentNodeCapabilityForNode(nodes[index])
 			if !ok || !capability.CanUpdate {
@@ -439,10 +440,31 @@ func cloudAgentCanvasAppliedPreview(preview cloudAgentApprovalPreview) cloudAgen
 	if counts["connect_nodes"] > 0 {
 		parts = append(parts, fmt.Sprintf("建立 %d 条引用连线", counts["connect_nodes"]))
 	}
+	if len(parts) == 0 {
+		for _, item := range preview.Items {
+			if summary := strings.TrimSpace(item.Summary); summary != "" {
+				parts = append(parts, summary)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "已完成请求的画布操作")
+	}
 	applied.Status = "applied"
 	applied.Title = "画布修改已写入"
 	applied.Description = fmt.Sprintf("画布修改已写入：%s。", strings.Join(parts, "，"))
 	return applied
+}
+
+func cloudAgentMediaSubmittedPreview(preview cloudAgentApprovalPreview) cloudAgentApprovalPreview {
+	preview.Status = "submitted"
+	preview.Title = "生成任务已提交"
+	summary := "媒体生成任务"
+	if len(preview.Items) > 0 && strings.TrimSpace(preview.Items[0].Summary) != "" {
+		summary = preview.Items[0].Summary
+	}
+	preview.Description = fmt.Sprintf("生成任务已提交：%s。生成结果尚未完成，完成后会自动回写画布。", summary)
+	return preview
 }
 
 func cloudAgentCanvasApprovalPreview(items []cloudAgentApprovalPreviewItem) cloudAgentApprovalPreview {
@@ -500,6 +522,12 @@ func cloudAgentMediaApprovalPreview(plan *cloudAgentMediaPlan, modelName string)
 	}
 	if args.Quality != "" {
 		details = append(details, "质量："+truncateRunes(args.Quality, 40))
+	}
+	if args.ImageResolution != "" {
+		details = append(details, "分辨率："+truncateRunes(args.ImageResolution, 40))
+	}
+	if args.ConfigurationChange != nil {
+		details = append(details, "规格变更依据："+truncateRunes(args.ConfigurationChange.UserInstruction, 200))
 	}
 	if args.VideoGenerateAudio != nil {
 		value := "关闭"
@@ -565,7 +593,7 @@ func cloudAgentApprovalCallHash(call cloudAgentCall) string {
 	// server revalidates the prepared dependency hash below, which deliberately
 	// ignores layout-only edits such as moving a node.
 	arguments := call.Function.Arguments
-	if call.Function.Name == "generate_media" || call.Function.Name == "image_layer_split" {
+	if cloudAgentMediaTool(call.Function.Name) {
 		var object map[string]any
 		if err := json.Unmarshal([]byte(arguments), &object); err == nil {
 			delete(object, "snapshotHash")

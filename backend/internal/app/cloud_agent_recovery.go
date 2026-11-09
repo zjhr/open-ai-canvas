@@ -35,6 +35,7 @@ func (s *Service) finishCloudAgentCleanup(ctx context.Context, run *model.CloudA
 		run = refreshed
 	}
 	seen := map[string]bool{}
+	awaitingMedia := false
 	for _, id := range []string{run.ID, activeID, mediaID} {
 		if id == "" || seen[id] {
 			continue
@@ -50,6 +51,12 @@ func (s *Service) finishCloudAgentCleanup(ctx context.Context, run *model.CloudA
 		if err != nil {
 			return err
 		}
+		if id == mediaID && s.cloudAgentMediaContinuesAfterStop(run, task) {
+			// 用户停止本轮只停止 Agent 后续步骤。已提交上游的媒体任务可能已经计费，
+			// 取消也拿不回费用，所以保留它并等结果回写画布；调度器会重入这里完成收尾。
+			awaitingMedia = true
+			continue
+		}
 		if task.Status == model.TaskStatusQueued || task.Status == model.TaskStatusRunning {
 			source := model.TaskCancellationParentFailed
 			if run.Status == "cancelled" {
@@ -64,6 +71,44 @@ func (s *Service) finishCloudAgentCleanup(ctx context.Context, run *model.CloudA
 				}
 			}
 		}
+	}
+	if decodeErr == nil && state.MediaBatch != nil {
+		// 批次条目与单个媒体任务同一规则：已进入上游的继续生成并回写，其余在途任务取消。
+		for _, item := range state.MediaBatch.Items {
+			id := item.taskID()
+			if item.Status != cloudAgentMediaBatchItemSubmitted || id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			task, err := s.repo.TaskForUser(run.UserID, id)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if s.cloudAgentMediaContinuesAfterStop(run, task) || cloudAgentTaskTerminal(task.Status) {
+				continue
+			}
+			source := model.TaskCancellationParentFailed
+			if run.Status == "cancelled" {
+				source = model.TaskCancellationParentCancelled
+			}
+			if _, err = s.taskLifecycle().cancelTaskWithIntent(ctx, run.UserID, id, model.TaskCancellationIntent{Source: source}); err != nil {
+				latest, readErr := s.repo.TaskForUser(run.UserID, id)
+				if readErr != nil || !cloudAgentTaskTerminal(latest.Status) {
+					return err
+				}
+			}
+		}
+		if state.MediaBatch.inFlight() > 0 || state.MediaBatch.active() {
+			// 批次执行器把在途条目的最终状态回写画布后，会再次进入这里完成收尾。
+			s.startCloudAgentMediaBatchRunner(run.UserID, run.ID)
+			return nil
+		}
+	}
+	if awaitingMedia {
+		return nil
 	}
 	if mediaID != "" && decodeErr == nil && state.CallIndex < len(state.Calls) {
 		err := s.advanceCloudAgentMedia(run, &state, state.Calls[state.CallIndex])
@@ -120,4 +165,18 @@ func (s *Service) finishCloudAgentCleanup(ctx context.Context, run *model.CloudA
 		}
 		return nil
 	})
+}
+
+// cloudAgentMediaContinuesAfterStop 判断用户停止本轮后媒体任务是否继续生成。
+// 只有用户主动取消（cancelled）且任务已进入上游阶段时保留；失败收尾仍按原规则取消，
+// 尚未提交上游的任务照常取消并退款。
+func (s *Service) cloudAgentMediaContinuesAfterStop(run *model.CloudAgentExecution, task *model.Task) bool {
+	if run == nil || task == nil || run.Status != "cancelled" {
+		return false
+	}
+	if task.Status != model.TaskStatusQueued && task.Status != model.TaskStatusRunning {
+		return false
+	}
+	s.hydrateTaskProviderRequestID(task)
+	return taskUpstreamSubmitted(task)
 }

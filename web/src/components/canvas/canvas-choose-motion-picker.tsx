@@ -1,6 +1,7 @@
 import { useUserStore } from "@/stores/use-user-store";
+import { useTranslation } from "react-i18next";
 import { useEffect, useRef, useState } from "react";
-import { Dropdown } from "antd";
+import { CanvasToolPopover } from "./canvas-tool-popover";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { Camera, LoaderCircle, Wrench, X } from "lucide-react";
 
@@ -34,6 +35,7 @@ export function CanvasChooseMotionPicker({
     /** 关闭已选运镜：从提示词移除 motion 工具标签。 */
     onClear?: () => void;
 }) {
+    const { t } = useTranslation();
     const [internalOpen, setInternalOpen] = useState(false);
     const [searchInput, setSearchInput] = useState("");
     const [searchText, setSearchText] = useState("");
@@ -69,13 +71,13 @@ export function CanvasChooseMotionPicker({
     };
 
     return (
-        <Dropdown
+        <CanvasToolPopover
+            label={t("canvasA.toolPicker.motion.select")}
             open={actualOpen}
             onOpenChange={setOpen}
             trigger={["click"]}
             autoAdjustOverflow
-            menu={{ items: [] }}
-            popupRender={() => (
+            content={
                 <div
                     className="canvas-node-toolbar-menu canvas-node-toolbar-menu-style"
                     data-canvas-no-zoom
@@ -86,7 +88,7 @@ export function CanvasChooseMotionPicker({
                     onKeyDown={(event) => event.stopPropagation()}
                 >
                     <div className="canvas-node-toolbar-menu-stack">
-                        <div className="asset-filters border-b border-border/70 px-2 py-1.5">
+                        <div className="asset-filters border-b border-border/70 px-2 py-2">
                             <div className="asset-filter-row">
                                 <div className="col-feed-tabs shrink-0">
                                     {FEED_TABS.map((tab) => (
@@ -95,50 +97,62 @@ export function CanvasChooseMotionPicker({
                                         </button>
                                     ))}
                                 </div>
-                                <input className="asset-search min-w-0 flex-1" placeholder="搜索名称/标签" value={searchInput} onChange={(event) => setSearchInput(event.target.value)} aria-label="搜索运镜" />
+                                <input
+                                    className="asset-search min-w-0 flex-1"
+                                    placeholder={t("canvasA.toolPicker.searchPlaceholder")}
+                                    value={searchInput}
+                                    onChange={(event) => setSearchInput(event.target.value)}
+                                    aria-label={t("canvasA.toolPicker.motion.search")}
+                                />
                                 {searchInput ? (
-                                    <button type="button" className="grid size-5 shrink-0 place-items-center rounded text-foreground/32 hover:bg-surface-hover hover:text-foreground" onClick={() => setSearchInput("")} aria-label="清空搜索">
+                                    <button
+                                        type="button"
+                                        className="grid size-5 shrink-0 place-items-center rounded text-foreground/32 hover:bg-surface-hover hover:text-foreground"
+                                        onClick={() => setSearchInput("")}
+                                        aria-label={t("canvasA.toolPicker.clearSearch")}
+                                    >
                                         <X className="size-3" />
                                     </button>
                                 ) : null}
                             </div>
-                            <div className="col-tag-filter mt-1.5">
-                                {[{ id: "", label: "全部" }, ...SUB_TAB_TAGS.motion].map((chip) => (
+                            <div className="col-tag-filter mt-2">
+                                {[{ id: "", label: t("canvasA.toolPicker.all") }, ...SUB_TAB_TAGS.motion].map((chip) => (
                                     <button key={chip.id || "all"} type="button" className={`col-tag-chip${tagFilter === chip.id ? " on" : ""}`} aria-pressed={tagFilter === chip.id} onClick={() => setTagFilter(chip.id)}>
                                         {chip.label}
                                     </button>
                                 ))}
                             </div>
                         </div>
-                        <div className="thin-scrollbar grid max-h-80 grid-cols-5 gap-1.5 overflow-y-auto p-2" role="listbox" aria-label="运镜工具">
+                        {/* 窄屏减到 3 列，网格高度随视口收缩，筛选栏始终可见。 */}
+                        <div className="thin-scrollbar grid max-h-[min(20rem,calc(100dvh-14rem))] grid-cols-3 gap-2 overflow-y-auto p-2 min-[520px]:grid-cols-5" role="listbox" aria-label={t("canvasA.toolPicker.motion.list")}>
                             {toolsQuery.isPending ? (
-                                <div className="col-span-5 grid h-24 place-items-center text-foreground/40">
-                                    <LoaderCircle className="size-4 animate-spin" />
+                                <div className="col-span-full grid h-24 place-items-center text-foreground/40">
+                                    <LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" />
                                 </div>
                             ) : toolsQuery.isError ? (
-                                <div className="col-span-5 grid h-24 place-items-center text-xs text-foreground/40">运镜工具加载失败，请稍后重试</div>
+                                <div className="col-span-full grid h-24 place-items-center text-xs text-foreground/40">{t("canvasA.toolPicker.motion.loadFailed")}</div>
                             ) : tools.length === 0 ? (
-                                <div className="col-span-5 grid h-24 place-items-center text-xs text-foreground/40">{searchText ? "没有匹配的运镜" : "暂无运镜工具"}</div>
+                                <div className="col-span-full grid h-24 place-items-center text-xs text-foreground/40">{searchText ? t("canvasA.toolPicker.motion.noMatch") : t("canvasA.toolPicker.motion.empty")}</div>
                             ) : (
                                 tools.map((tool) => <MotionToolCard key={tool.id} tool={tool} selected={activeIdSet.has(tool.id)} onSelect={handleSelect} />)
                             )}
                         </div>
                         {toolsQuery.hasNextPage && (
                             <button type="button" disabled={toolsQuery.isFetchingNextPage} onClick={() => void toolsQuery.fetchNextPage()}>
-                                加载更多
+                                {t("canvasA.toolPicker.loadMore")}
                             </button>
                         )}
                     </div>
                 </div>
-            )}
+            }
         >
             <div
                 role="button"
                 tabIndex={0}
                 className="canvas-node-composer-header-action canvas-node-fixed-chip relative overflow-hidden cursor-pointer"
-                title={resolvedLabel ? `运镜：${resolvedLabel}` : "选择运镜"}
+                title={resolvedLabel ? t("canvasA.toolPicker.motion.withLabel", { label: resolvedLabel }) : t("canvasA.toolPicker.motion.select")}
                 aria-expanded={actualOpen}
-                aria-haspopup="menu"
+                aria-haspopup="dialog"
                 onClick={() => setOpen(true)}
                 onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
@@ -149,11 +163,11 @@ export function CanvasChooseMotionPicker({
                 onPointerDown={(event) => event.stopPropagation()}
             >
                 <Camera className="size-3 shrink-0" />
-                <span className="truncate">{resolvedLabel || "运镜"}</span>
+                <span className="truncate">{resolvedLabel || t("canvasA.toolPicker.motion.short")}</span>
                 {activeIdSet.size > 0 && onClear ? (
                     <button
                         type="button"
-                        aria-label="移除运镜"
+                        aria-label={t("canvasA.toolPicker.motion.remove")}
                         onClick={(event) => {
                             event.stopPropagation();
                             onClear();
@@ -163,7 +177,7 @@ export function CanvasChooseMotionPicker({
                     </button>
                 ) : null}
             </div>
-        </Dropdown>
+        </CanvasToolPopover>
     );
 }
 
@@ -190,7 +204,7 @@ function MotionToolCard({ tool, selected, onSelect }: { tool: ToolSummary; selec
             role="option"
             aria-selected={selected}
             title={tool.desc}
-            className={`group flex flex-col gap-1 rounded-[var(--r-md)] border p-1.5 text-left transition-colors hover:bg-[var(--surface-hover)] focus-visible:ring-2 focus-visible:ring-primary/35 focus-visible:outline-none ${selected ? "border-primary/60 ring-1 ring-primary/40" : "border-transparent"}`}
+            className={`group flex flex-col gap-1 rounded-[var(--r-md)] border p-2 text-left transition-colors hover:bg-[var(--surface-hover)] focus-visible:ring-2 focus-visible:ring-primary/35 focus-visible:outline-none ${selected ? "border-primary/60 ring-1 ring-primary/40" : "border-transparent"}`}
             onClick={() => onSelect(tool)}
             onMouseEnter={() => setHovered(true)}
             onMouseLeave={() => setHovered(false)}
@@ -206,7 +220,7 @@ function MotionToolCard({ tool, selected, onSelect }: { tool: ToolSummary; selec
                     </div>
                 )}
             </div>
-            <span className="truncate text-center text-[11px] font-medium leading-4 text-foreground">{tool.label}</span>
+            <span className="truncate text-center text-[var(--fs-label)] font-medium leading-4 text-foreground">{tool.label}</span>
         </button>
     );
 }

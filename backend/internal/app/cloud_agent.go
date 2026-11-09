@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"gorm.io/gorm"
 	"yingce/backend/internal/kernel"
 	"yingce/backend/internal/model"
+	"yingce/backend/internal/repository"
 )
 
 const cloudAgentOperation = "cloud_agent"
@@ -23,19 +25,21 @@ const cloudAgentOperation = "cloud_agent"
 // turns reference the previous run, not a mutable in-memory conversation. This
 // reuses transactional billing, worker leases, cancellation and text replay.
 type CloudAgentRequest struct {
-	ReasoningMode   string   `json:"reasoningMode,omitempty"`
-	ProfileRevision string   `json:"profileRevision,omitempty"`
-	CanvasID        string   `json:"canvasId"`
-	Prompt          string   `json:"prompt"`
-	Model           string   `json:"model,omitempty"`
-	LogicalModelID  string   `json:"logicalModelId,omitempty"`
-	ChannelID       string   `json:"channelId,omitempty"`
-	ChannelModelKey string   `json:"channelModelKey,omitempty"`
-	PermissionMode  string   `json:"permissionMode"`
-	SkillIDs        []string `json:"skillIds,omitempty"`
-	ContextScope    []string `json:"contextScope"`
-	FocusNodeIDs    []string `json:"focusNodeIds,omitempty"`
-	Budget          struct {
+	ReasoningMode   string `json:"reasoningMode,omitempty"`
+	ProfileRevision string `json:"profileRevision,omitempty"`
+	CanvasID        string `json:"canvasId"`
+	Prompt          string `json:"prompt"`
+	Model           string `json:"model,omitempty"`
+	LogicalModelID  string `json:"logicalModelId,omitempty"`
+	ChannelID       string `json:"channelId,omitempty"`
+	ChannelModelKey string `json:"channelModelKey,omitempty"`
+	PermissionMode  string `json:"permissionMode"`
+	// PinnedSkillIDs 是用户为对话固定或在本条消息里点名的技能；其他已安装技能由 Agent 按目录自动发现。
+	PinnedSkillIDs        []string `json:"pinnedSkillIds,omitempty"`
+	ContextScope          []string `json:"contextScope"`
+	FocusNodeIDs          []string `json:"focusNodeIds,omitempty"`
+	FocusNodeOmittedCount int      `json:"focusNodeOmittedCount,omitempty"`
+	Budget                struct {
 		MaxCredits         float64 `json:"maxCredits"`
 		MaxGenerationTasks int     `json:"maxGenerationTasks,omitempty"`
 		MaxVideoSeconds    int     `json:"maxVideoSeconds,omitempty"`
@@ -48,10 +52,20 @@ type CloudAgentRequest struct {
 	// 必须持久化：工具授权校验每步都从落库状态重建，丢掉这个标记会让模型看得见工具
 	// 却被判为"未获本轮权限授权"。
 	VisionEnabled bool `json:"visionEnabled,omitempty"`
+	// DramaLinked 决定是否暴露短剧工具：服务端在建 run 时按画布是否关联当前用户的短剧作品推导，
+	// 客户端传入值被覆盖；与 VisionEnabled 一样必须持久化，工具授权每步都从落库状态重建。
+	DramaLinked bool `json:"dramaLinked,omitempty"`
+	// SkillsEnabled / MemoryMode 同样由服务端建 run 时推导并持久化：前者表示本轮有可读的已安装技能，
+	// 后者是冻结的长期记忆模式（auto/review/off），决定是否暴露技能读取与记忆写入工具。
+	SkillsEnabled bool   `json:"skillsEnabled,omitempty"`
+	MemoryMode    string `json:"memoryMode,omitempty"`
 }
 
 const cloudAgentMaxStepsLimit = 9999
 const cloudAgentMaxConfirmationRounds = 2
+
+// cloudAgentAskUserMaxFields 让长流程开工前的问卷一次问完，不必拆成多轮确认。
+const cloudAgentAskUserMaxFields = 16
 
 func cloudAgentStepLimit(req CloudAgentRequest) int {
 	if req.Budget.MaxSteps > 0 {
@@ -71,12 +85,18 @@ type cloudAgentState struct {
 	ConfirmationFingerprints       []string                  `json:"confirmationFingerprints,omitempty"`
 	PendingConfirmationFingerprint string                    `json:"pendingConfirmationFingerprint,omitempty"`
 	Skills                         []cloudAgentSkill         `json:"skills,omitempty"`
+	SkillVersions                  map[string]string         `json:"skillVersions,omitempty"`
+	SkillHints                     string                    `json:"skillHints,omitempty"`
+	Memory                         cloudAgentMemorySnapshot  `json:"memory,omitempty"`
 	Profile                        cloudAgentProfileSnapshot `json:"profile"`
 	Policy                         cloudAgentPolicySnapshot  `json:"policy"`
 }
 
 type CloudAgentRun struct {
 	ID             string              `json:"id"`
+	ConversationID string              `json:"conversationId"`
+	UserPrompt     string              `json:"userPrompt"`
+	IdempotencyKey string              `json:"idempotencyKey"`
 	CanvasID       string              `json:"canvasId"`
 	ParentID       string              `json:"parentId,omitempty"`
 	Status         string              `json:"status"`
@@ -108,6 +128,7 @@ type CloudAgentRun struct {
 type CloudAgentRunViewOptions struct {
 	SinceSeq   int
 	EventLimit int
+	FromStart  bool
 }
 
 func validateCloudAgentRequest(req *CloudAgentRequest) error {
@@ -116,10 +137,12 @@ func validateCloudAgentRequest(req *CloudAgentRequest) error {
 	}
 	// IDs and protocol selectors are identifiers, not free-form text. Keep their
 	// validation in one place so byte/rune and Unicode handling cannot drift.
-	if err := validateCloudAgentID(req.CanvasID, "画布 ID", 80); err != nil {
-		return err
+	// 画布可选：不带画布的运行是平台级对话，只开放无画布工具（计划、提问、技能、记忆）。
+	if req.CanvasID != "" {
+		if err := validateCloudAgentID(req.CanvasID, "画布 ID", 80); err != nil {
+			return err
+		}
 	}
-	req.CanvasID = strings.TrimSpace(req.CanvasID)
 	if err := validateCloudAgentPrompt(req.Prompt, 16000); err != nil {
 		return err
 	}
@@ -157,13 +180,16 @@ func validateCloudAgentRequest(req *CloudAgentRequest) error {
 			return err
 		}
 	}
-	if req.ReasoningMode != "" && req.ReasoningMode != "off" && req.ReasoningMode != "auto" && req.ReasoningMode != "deep" {
+	if req.ReasoningMode != "" && !validCloudAgentReasoningMode(req.ReasoningMode) {
 		return BadAuthRequest("无效的 Agent 推理模式")
 	}
 	if req.ProfileRevision != "" {
 		if err := validateCloudAgentID(req.ProfileRevision, "偏好版本", 120); err != nil {
 			return err
 		}
+	}
+	if req.FocusNodeOmittedCount < 0 || req.FocusNodeOmittedCount > 10000 {
+		return BadAuthRequest("画布焦点省略计数无效")
 	}
 	if len(req.FocusNodeIDs) > 8 {
 		return BadAuthRequest("画布焦点节点最多 8 个")
@@ -189,14 +215,22 @@ func validateCloudAgentRequest(req *CloudAgentRequest) error {
 	if req.Budget.MaxGenerationTasks < 0 || req.Budget.MaxVideoSeconds < 0 || req.Budget.MaxSteps < 0 {
 		return BadAuthRequest("生成任务、视频秒数和模型调用步数预算不能为负数")
 	}
+	if len(req.PinnedSkillIDs) > cloudAgentSkillPinnedMax {
+		return BadAuthRequest(fmt.Sprintf("每轮最多固定 %d 个技能", cloudAgentSkillPinnedMax))
+	}
 	seen := map[string]bool{}
-	for i, id := range req.SkillIDs {
+	for i, id := range req.PinnedSkillIDs {
 		id = strings.TrimSpace(id)
 		if err := validateCloudAgentID(id, "技能 ID", 80); err != nil || seen[id] {
 			return BadAuthRequest("技能 ID 无效或重复")
 		}
-		req.SkillIDs[i] = id
+		req.PinnedSkillIDs[i] = id
 		seen[id] = true
+	}
+	switch req.MemoryMode {
+	case "", model.AgentMemoryDocumentModeAuto, model.AgentMemoryDocumentModeReview, model.AgentMemoryDocumentModeOff:
+	default:
+		return BadAuthRequest("长期记忆模式无效")
 	}
 	if req.PermissionMode == "read_only" && (req.Budget.MaxGenerationTasks != 0 || req.Budget.MaxVideoSeconds != 0) {
 		return BadAuthRequest("只读模式不能设置生成预算")
@@ -204,8 +238,8 @@ func validateCloudAgentRequest(req *CloudAgentRequest) error {
 	if len(req.ContextScope) > 1 || (len(req.ContextScope) == 1 && req.ContextScope[0] != "canvas") {
 		return BadAuthRequest("当前仅支持已保存画布摘要，其他上下文尚未开放")
 	}
-	if len(req.ContextScope) == 1 && req.ContextScope[0] == "canvas" {
-		req.ContextScope[0] = "canvas"
+	if req.CanvasID == "" && (len(req.ContextScope) > 0 || len(req.FocusNodeIDs) > 0 || req.FocusNodeOmittedCount > 0) {
+		return BadAuthRequest("未绑定画布的对话不能读取画布上下文或焦点节点")
 	}
 	if math.IsNaN(req.Budget.MaxCredits) || math.IsInf(req.Budget.MaxCredits, 0) || req.Budget.MaxCredits <= 0 || req.Budget.MaxCredits > 1000000 {
 		return BadAuthRequest("本轮积分上限必须大于 0 且不超过 1000000")
@@ -244,7 +278,7 @@ func agentRunOutput(task *model.Task, state cloudAgentState) *CloudAgentRun {
 	if task.Status == model.TaskStatusSucceeded {
 		status = "completed"
 	}
-	return &CloudAgentRun{ID: task.ID, CanvasID: task.ProjectID, ParentID: state.ParentID, Status: status, PermissionMode: state.Request.PermissionMode, Model: task.Model, CreatedAt: task.CreatedAt, UpdatedAt: task.UpdatedAt, Skills: state.Skills}
+	return &CloudAgentRun{ID: task.ID, UserPrompt: state.Request.Prompt, IdempotencyKey: state.Request.IdempotencyKey, CanvasID: task.ProjectID, ParentID: state.ParentID, Status: status, PermissionMode: state.Request.PermissionMode, Model: task.Model, CreatedAt: task.CreatedAt, UpdatedAt: task.UpdatedAt, Skills: state.Skills}
 }
 
 func (s *Service) cloudAgentTask(userID, id string) (*model.Task, cloudAgentState, error) {
@@ -287,7 +321,7 @@ func (s *Service) cloudAgentTask(userID, id string) (*model.Task, cloudAgentStat
 	if task.ID != cloudAgentID(userID, state.Request.IdempotencyKey) || task.ProjectID != state.Request.CanvasID {
 		return nil, input.Agent, kernel.NotFound("Agent 运行不存在")
 	}
-	input.Agent = cloudAgentState{Version: 1, Request: state.Request, ParentID: state.ParentID, Fingerprint: state.Fingerprint, CreativeAnchor: state.CreativeAnchor, ConfirmationRounds: state.ConfirmationRounds, ConfirmationFingerprints: append([]string(nil), state.ConfirmationFingerprints...), PendingConfirmationFingerprint: state.PendingConfirmationFingerprint, Skills: state.Skills, Profile: state.Profile, Policy: state.Policy}
+	input.Agent = cloudAgentState{Version: 1, Request: state.Request, ParentID: state.ParentID, Fingerprint: state.Fingerprint, CreativeAnchor: state.CreativeAnchor, ConfirmationRounds: state.ConfirmationRounds, ConfirmationFingerprints: append([]string(nil), state.ConfirmationFingerprints...), PendingConfirmationFingerprint: state.PendingConfirmationFingerprint, Skills: state.Skills, SkillVersions: state.SkillVersions, SkillHints: state.SkillHints, Memory: state.Memory, Profile: state.Profile, Policy: state.Policy}
 	return task, input.Agent, nil
 }
 
@@ -346,12 +380,17 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 	if userID == "" {
 		return nil, kernel.Unauthorized("请先登录")
 	}
-	canvas, err := s.repo.CanvasProjectForUser(userID, req.CanvasID)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, kernel.NotFound("画布不存在或尚未保存到服务端，请先完成画布同步")
+	// 画布是可选绑定：有画布时必须属于当前用户且已保存；无画布时是平台级对话。
+	var canvas *model.CanvasProject
+	if req.CanvasID != "" {
+		var err error
+		canvas, err = s.repo.CanvasProjectForUser(userID, req.CanvasID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, kernel.NotFound("画布不存在或尚未保存到服务端，请先完成画布同步")
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 	// Resolve and freeze the effective preference document before idempotency
 	// lookup. A retry without an explicit revision must still refer to the same
@@ -365,6 +404,8 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 		return nil, creationConflict("Agent 偏好已变化，请重新读取后提交")
 	}
 	req.ProfileRevision = profile.Revision
+	// 下面这些字段由服务端推导，客户端传入值不参与幂等指纹。
+	req.VisionEnabled, req.DramaLinked, req.SkillsEnabled, req.MemoryMode = false, false, false, ""
 	id := cloudAgentID(userID, req.IdempotencyKey)
 	fingerprint := cloudAgentFingerprint(req, parentID)
 	if existing, state, lookupErr := s.cloudAgentTask(userID, id); lookupErr == nil {
@@ -387,14 +428,15 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 	var inheritedPlan []cloudAgentPlanItem
 	inheritedConfirmationRounds := 0
 	var inheritedConfirmationFingerprints []string
+	parentStatus := ""
 	if parentID != "" {
 		parent, _, parentErr := s.cloudAgentTask(userID, parentID)
 		if parentErr != nil {
 			return nil, parentErr
 		}
-		if parent.ProjectID != req.CanvasID {
-			return nil, kernel.Forbidden("不能跨画布追加 Agent 消息")
-		}
+		// 同一段对话可以跟随页面切换画布绑定（首页 → 画布 → 离开画布）。
+		// 归属已由 cloudAgentTask 按 userID 校验；换绑后旧画布的节点事实不再可用。
+		scopeChanged := parent.ProjectID != req.CanvasID
 		superseded := s.cloudAgentParentCanBeSuperseded(userID, parentID)
 		// 续轮收束要读上一轮**全部**事件（运行详情默认只返回尾部一窗）：长会话一旦被截断，
 		// 新轮就看不到上一轮改过哪些节点、提交过哪些任务，表现为"忘了自己做过什么"。
@@ -418,6 +460,7 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 		if err != nil {
 			return nil, WrapAppError(409, "上一轮 Agent 历史记录不完整，无法继续对话；请新建对话", err)
 		}
+		parentStatus = parentExecution.Status
 		inheritedPlan = parentState.Plan
 		if parentRun.Status == "completed" && parentState.PendingConfirmationFingerprint != "" {
 			inheritedConfirmationRounds = parentState.ConfirmationRounds
@@ -425,7 +468,9 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 		}
 		// 视觉事实跨轮继承：这一轮已经看过的画面与模型自己写下的观察随锚点带过来，
 		// 否则新轮会把看过的图重新标成"没有视觉识别证据"并再花一次视觉 token。
-		creativeAnchor = parentState.CreativeAnchor
+		if !scopeChanged {
+			creativeAnchor = parentState.CreativeAnchor
+		}
 		history = parentState.TextHistory
 		if history == nil {
 			history = cloudAgentLegacyHistory(parentState.Canonical.Messages, parent.Prompt)
@@ -442,6 +487,9 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 		if strings.TrimSpace(context) != "" {
 			history = append(history, providerTextMessage{Role: "user", Content: context, AgentContextSource: "continuation"})
 		}
+		if scopeChanged {
+			history = append(history, providerTextMessage{Role: "user", Content: cloudAgentScopeChangeNotice(parent.ProjectID, req.CanvasID), AgentContextSource: "continuation"})
+		}
 	}
 	history = trimCloudAgentTextHistory(history, cloudAgentHistoryKeepRounds, cloudAgentHistoryMaxBytes)
 	encodedHistory, err := json.Marshal(history)
@@ -455,20 +503,33 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 	if creativeAnchor.Version > 0 {
 		inheritedAnchor = &creativeAnchor
 	}
-	creativeAnchor, err = cloudAgentCreativeAnchorForCanvas(s.repo, userID, canvas, req.Prompt, inheritedAnchor)
+	if canvas != nil {
+		creativeAnchor, err = cloudAgentCreativeAnchorForCanvas(s.repo, userID, canvas, req.Prompt, inheritedAnchor)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		creativeAnchor = cloudAgentCreativeAnchor{Version: 2, UserPrompt: req.Prompt}
+	}
+	// 技能范围（已安装且允许自动使用 + 本轮固定）与记忆快照都在建 run 时冻结：目录进 system，
+	// 固定技能提示和记忆作为有来源的数据消息在每次模型请求前重新插入。
+	skillPool, err := s.cloudAgentBuildSkillPool(userID, req.Prompt, req.PinnedSkillIDs, s.cloudAgentContextBudgetForRequest(req))
 	if err != nil {
 		return nil, err
 	}
-	skillSnapshots, err := s.cloudAgentSkills(userID, req.SkillIDs)
+	memory, err := s.cloudAgentMemorySnapshotForRun(userID, req.Prompt)
 	if err != nil {
 		return nil, err
 	}
 	// 看图能力取决于本轮渠道模型自己的合同（text.references.maxImages），在建 run 时定格并
 	// 持久化：工具授权每步都从落库状态重建，运行期间不再变化，客户端传入值被忽略。
 	req.VisionEnabled = s.cloudAgentVisionEnabled(req)
+	req.DramaLinked = len(req.ContextScope) != 0 && dramaLinkedCanvas(s.repo, canvas)
+	req.SkillsEnabled = len(skillPool.Versions) > 0
+	req.MemoryMode = memory.Mode
 	canvasSummary := ""
 	if len(req.ContextScope) != 0 {
-		canvasSummary, err = cloudAgentCanvasSummary(canvas, req.FocusNodeIDs...)
+		canvasSummary, err = cloudAgentCanvasSummaryWithOmitted(canvas, req.FocusNodeOmittedCount, req.FocusNodeIDs...)
 		if err != nil {
 			return nil, err
 		}
@@ -479,11 +540,11 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 	if err != nil {
 		return nil, err
 	}
-	system, policy, err := compileCloudAgentPolicies(req, appearance.Canvas.AgentName, skillSnapshots, "", profile, creativeAnchor)
+	system, policy, err := compileCloudAgentPolicies(req, appearance.Canvas.AgentName, &skillPool.Catalog, "", profile, creativeAnchor)
 	if err != nil {
 		return nil, err
 	}
-	state := cloudAgentState{Version: 1, Request: req, ParentID: parentID, Fingerprint: fingerprint, CreativeAnchor: creativeAnchor, Plan: inheritedPlan, ConfirmationRounds: inheritedConfirmationRounds, ConfirmationFingerprints: inheritedConfirmationFingerprints, Skills: skillSnapshots, Profile: profile, Policy: policy}
+	state := cloudAgentState{Version: 1, Request: req, ParentID: parentID, Fingerprint: fingerprint, CreativeAnchor: creativeAnchor, Plan: inheritedPlan, ConfirmationRounds: inheritedConfirmationRounds, ConfirmationFingerprints: inheritedConfirmationFingerprints, Skills: skillPool.Pinned, SkillVersions: skillPool.Versions, SkillHints: skillPool.Hints, Memory: memory, Profile: profile, Policy: policy}
 	canonical := cloudAgentCanonicalFor(system, history, req.Prompt, req, len(profile.Layers) > 0)
 	// Keep the catalog out of TextHistory (which defines conversation turns),
 	// while exposing it as a fresh data message for this run immediately before
@@ -497,16 +558,19 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 		last := canonical.Messages[len(canonical.Messages)-1]
 		canonical.Messages = append(append([]map[string]any{}, canonical.Messages[:len(canonical.Messages)-1]...), catalog, last)
 	}
-	s.attachCloudAgentLessons(&canonical, userID, req.Prompt)
 	canonical.PromptCacheKey = cloudAgentPromptCacheKeyForRequest(req.CanvasID, cloudAgentPromptCacheIdentity(req, policy), canonical.SystemPrompt, canonical.Tools)
 	attachCloudAgentPlan(&canonical, inheritedPlan)
-	input := map[string]any{"mode": "text", "prompt": req.Prompt, "textHistory": history, "textOptions": map[string]any{"stream": true, "thinking": cloudAgentReasoningEnabled(policy.ReasoningMode)}, "cloudAgent": state,
+	input := map[string]any{"mode": "text", "prompt": req.Prompt, "textHistory": history, "textOptions": map[string]any{"stream": true, "thinkingLevel": cloudAgentThinkingLevel(policy.ReasoningMode, false)}, "cloudAgent": state,
 		"agentRequests": map[string]any{"canonical": canonical},
 		"config":        map[string]any{"channelId": req.ChannelID, "channelModelKey": req.ChannelModelKey, "model": firstNonEmpty(req.ChannelModelKey, req.Model), "systemPrompt": system}}
 	input["piSessionJSONL"] = ""
 	if parentID != "" {
 		if session, sessionErr := s.repo.CloudAgentPiSession(userID, parentID); sessionErr == nil {
-			input["piSessionJSONL"] = session.SessionJSONL
+			inherited := cloudAgentInheritablePiSession(parentStatus, session.SessionJSONL)
+			if inherited == "" && session.SessionJSONL != "" {
+				slog.Info("agent continuation starts a fresh runtime session", "parent", parentID, "parentStatus", parentStatus)
+			}
+			input["piSessionJSONL"] = inherited
 		}
 	}
 	task, err := s.CreateTask(userID, CreateTaskRequest{ProjectID: req.CanvasID, Type: "canvas_text", Operation: cloudAgentOperation, Prompt: req.Prompt, Model: req.Model, LogicalModelID: req.LogicalModelID, Input: input,
@@ -523,6 +587,14 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 				s.startCloudAgentPi(userID, existing.ID)
 			}
 			return run, runErr
+		}
+		var busy *repository.CanvasAgentBusyError
+		if errors.As(err, &busy) {
+			return nil, &AppError{Status: 409, Code: 409, Reason: "canvas_agent_busy", Message: err.Error(),
+				Details: map[string]any{"canvasId": req.CanvasID, "agent": busy.Activity}}
+		}
+		if errors.Is(err, repository.ErrCloudAgentStaleParent) {
+			return nil, &AppError{Status: 409, Code: 409, Reason: "agent_conversation_stale_parent", Message: err.Error()}
 		}
 		return nil, err
 	}
@@ -610,6 +682,10 @@ const (
 )
 
 func cloudAgentCanvasSummary(canvas *model.CanvasProject, focusNodeIDs ...string) (string, error) {
+	return cloudAgentCanvasSummaryWithOmitted(canvas, 0, focusNodeIDs...)
+}
+
+func cloudAgentCanvasSummaryWithOmitted(canvas *model.CanvasProject, omittedFocusCount int, focusNodeIDs ...string) (string, error) {
 	var payload struct {
 		Nodes []struct {
 			ID       string `json:"id"`
@@ -618,6 +694,10 @@ func cloudAgentCanvasSummary(canvas *model.CanvasProject, focusNodeIDs ...string
 			Metadata struct {
 				WorkflowKind     string `json:"workflowKind"`
 				CharacterAssetID string `json:"characterAssetId"`
+				Content          string `json:"content"`
+				Prompt           string `json:"prompt"`
+				Status           string `json:"status"`
+				TaskStatus       string `json:"taskStatus"`
 			} `json:"metadata"`
 		} `json:"nodes"`
 		Connections []struct {
@@ -669,6 +749,10 @@ func cloudAgentCanvasSummary(canvas *model.CanvasProject, focusNodeIDs ...string
 		Metadata struct {
 			WorkflowKind     string `json:"workflowKind"`
 			CharacterAssetID string `json:"characterAssetId"`
+			Content          string `json:"content"`
+			Prompt           string `json:"prompt"`
+			Status           string `json:"status"`
+			TaskStatus       string `json:"taskStatus"`
 		} `json:"metadata"`
 	}, 0, len(payload.Nodes))
 	if len(focus) > 0 {
@@ -696,6 +780,17 @@ func cloudAgentCanvasSummary(canvas *model.CanvasProject, focusNodeIDs ...string
 		if node.Type == "text" && node.Metadata.WorkflowKind == "character" {
 			item["kind"] = "character"
 		}
+		if selectedFocus[node.ID] {
+			if preview := firstNonEmpty(node.Metadata.Content, node.Metadata.Prompt); preview != "" {
+				item["preview"] = truncateRunes(preview, 240)
+			}
+			if node.Metadata.Status != "" {
+				item["status"] = truncateRunes(node.Metadata.Status, 32)
+			}
+			if node.Metadata.TaskStatus != "" {
+				item["taskStatus"] = truncateRunes(node.Metadata.TaskStatus, 32)
+			}
+		}
 		if _, known := canvasCapabilityRegistry.ResolveNode(node.Type, node.Metadata.WorkflowKind); !known {
 			item["agentSupported"] = false
 		}
@@ -722,7 +817,12 @@ func cloudAgentCanvasSummary(canvas *model.CanvasProject, focusNodeIDs ...string
 				neighborCount++
 			}
 		}
-		summary["selection"] = map[string]any{"focusNodeIds": selected, "includedNeighbors": neighborCount, "nextReadDepth": 1}
+		selection := map[string]any{"focusNodeIds": selected, "includedNeighbors": neighborCount, "nextReadDepth": 1}
+		if omittedFocusCount > 0 {
+			selection["omittedFocusCount"] = omittedFocusCount
+			selection["note"] = fmt.Sprintf("前端实际还选中 %d 个节点未附带；当前只包含 focusNodeIds 中的焦点。", omittedFocusCount)
+		}
+		summary["selection"] = selection
 	} else if omitted := len(payload.Nodes) - len(nodes); omitted > 0 {
 		summary["omittedNodes"] = omitted
 	}
@@ -731,4 +831,20 @@ func cloudAgentCanvasSummary(canvas *model.CanvasProject, focusNodeIDs ...string
 		return "", err
 	}
 	return string(data), nil
+}
+
+// cloudAgentScopeChangeNotice 告诉模型本轮的画布绑定已变化。它是服务端事实，不是指令：
+// 上一轮读到的节点 ID、快照哈希都属于旧画布，不能在新范围内复用。
+func cloudAgentScopeChangeNotice(previousCanvasID, currentCanvasID string) string {
+	frame := map[string]any{"source": "server", "kind": "scope_change", "previousCanvasBound": previousCanvasID != "", "currentCanvasBound": currentCanvasID != ""}
+	switch {
+	case currentCanvasID == "":
+		frame["note"] = "用户已离开画布，本轮没有绑定画布：画布读写与生成工具不可用；之前提到的节点 ID、snapshotHash 都已失效。"
+	case previousCanvasID == "":
+		frame["note"] = "用户已进入一个画布，本轮绑定该画布：需要画布事实时先读取画布，不要沿用对话中的假设。"
+	default:
+		frame["note"] = "用户已切换到另一个画布：之前的节点 ID、snapshotHash 属于旧画布，均已失效，先读取当前画布。"
+	}
+	body, _ := json.Marshal(frame)
+	return cloudAgentRuntimeContextMarker + string(body)
 }

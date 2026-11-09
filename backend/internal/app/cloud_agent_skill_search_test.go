@@ -18,7 +18,7 @@ func skillSearchTestSkills() []cloudAgentSkill {
 }
 
 func TestCloudAgentPolicyRegistersSkillSearchAlongsideReadFile(t *testing.T) {
-	req := CloudAgentRequest{SkillIDs: []string{"s1"}}
+	req := CloudAgentRequest{SkillsEnabled: true}
 	names := map[string]bool{}
 	for _, tool := range cloudAgentTools(req) {
 		fn, ok := tool["function"].(map[string]any)
@@ -82,7 +82,7 @@ func TestCloudAgentSkillSearchWithoutKeywordListsIndex(t *testing.T) {
 	}
 }
 
-func TestCloudAgentSkillSearchClampsLimitAndHandlesNoHit(t *testing.T) {
+func TestCloudAgentSkillSearchClampsLimitAndDegradesNoHit(t *testing.T) {
 	skills := skillSearchTestSkills()
 	result, err := cloudAgentSearchSkills(skills, "钩子", 99)
 	if err != nil {
@@ -91,12 +91,25 @@ func TestCloudAgentSkillSearchClampsLimitAndHandlesNoHit(t *testing.T) {
 	if len(result["matches"].([]map[string]any)) != 1 {
 		t.Fatalf("expected single hit for 钩子, got %v", result["matches"])
 	}
-	result, err = cloudAgentSearchSkills(skills, "量子纠缠炒菜", 0)
+	limited, err := cloudAgentSearchSkills(skills, "当", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result["matches"].([]map[string]any)) != 0 {
-		t.Fatalf("expected no matches, got %v", result["matches"])
+	if len(limited["matches"].([]map[string]any)) != 1 || limited["total"].(int) != 3 {
+		t.Fatalf("total must count all matches before limit, got %#v", limited)
+	}
+	result, err = cloudAgentSearchSkills(skills, "量子纠缠炒菜", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 零命中降级：返回已启用技能索引而不是空列表——「没搜到」不该被模型
+	// 解读成「没有适用技能」后直接放弃技能裸做任务。
+	degraded := result["matches"].([]map[string]any)
+	if len(degraded) != 1 {
+		t.Fatalf("zero-hit query must return one indexed skill at limit 1, got %v", result["matches"])
+	}
+	if result["total"].(int) != 3 {
+		t.Fatalf("expected total 3 on degraded index, got %v", result["total"])
 	}
 	if guidance, _ := result["guidance"].(string); !strings.Contains(guidance, "skill_read_file") {
 		t.Fatalf("no-hit guidance must point at skill_read_file: %q", guidance)
@@ -111,7 +124,7 @@ func TestCloudAgentSkillSearchEmptySkillsReturnsGuidance(t *testing.T) {
 	if len(result["matches"].([]map[string]any)) != 0 {
 		t.Fatal("expected empty matches without skills")
 	}
-	if guidance, _ := result["guidance"].(string); !strings.Contains(guidance, "没有已启用") {
+	if guidance, _ := result["guidance"].(string); !strings.Contains(guidance, "没有可用的已安装技能") || !strings.Contains(guidance, "skill_market_search") {
 		t.Fatalf("guidance mismatch: %q", guidance)
 	}
 }
@@ -120,11 +133,27 @@ func TestCloudAgentSkillSearchToleratesStraySkillIDArgument(t *testing.T) {
 	// 实测回归：step-5 首次调用时按 skill_read_file 的参数习惯顺手带上 skillId，
 	// 被 decodeCloudAgentJSONObject（DisallowUnknownFields）拒绝 → tool_failed，
 	// 检索一次都没成功。这里走完整的工具分发路径，确保解码层真的容忍该字段。
-	state := &cloudAgentRuntime{Skills: skillSearchTestSkills()}
+	s, db, _, _ := creationTestService(t)
+	if sqlDB, err := db.DB(); err == nil {
+		t.Cleanup(func() { _ = sqlDB.Close() })
+	}
+	ids := map[string]string{}
+	for _, skill := range skillSearchTestSkills() {
+		created, err := s.CreateSkill("u1", SkillMutationRequest{SkillName: skill.Name, Description: skill.Description, Instruction: "# " + skill.Name + "\n\n步骤", Tag: "drama", IsPrivate: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[skill.ID] = created.SkillID
+	}
+	pool, err := s.cloudAgentBuildSkillPool("u1", "", nil, defaultCloudAgentContextBudget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &cloudAgentRuntime{SkillVersions: pool.Versions}
 	call := cloudAgentCall{ID: "c1"}
 	call.Function.Name = "skill_search"
-	call.Function.Arguments = `{"keyword":"反转 钩子 结构 便利店","skillId":"s1"}`
-	result, err := cloudAgentReadTool(nil, "u1", state, call)
+	call.Function.Arguments = `{"keyword":"反转 钩子 结构 便利店","skillId":"` + ids["s1"] + `"}`
+	result, err := cloudAgentReadTool(nil, "u1", state, call, s)
 	if err != nil {
 		t.Fatalf("stray skillId must be tolerated: %v", err)
 	}
@@ -136,9 +165,9 @@ func TestCloudAgentSkillSearchToleratesStraySkillIDArgument(t *testing.T) {
 	if len(matches) == 0 {
 		t.Fatal("stray skillId argument must not break the search")
 	}
-	// 该字段仅接收不生效：检索范围恒为本轮全部已启用技能，
+	// 该字段仅接收不生效：检索范围恒为本轮全部可用技能，
 	// 传了 s1 也必须能命中 name/description 在 s2 上的结果。
-	if matches[0]["skillId"] != "s2" {
+	if matches[0]["skillId"] != ids["s2"] {
 		t.Fatalf("skillId argument must not narrow the search scope, got %v", matches[0]["skillId"])
 	}
 }
@@ -287,5 +316,42 @@ func TestCloudAgentSkillSearchTokensKeepsSingleCJKRune(t *testing.T) {
 	skill := cloudAgentSkill{ID: "x1", Name: "comedy-beat-lab", Description: "专门讲「梗」的密度、预期违背与排布节奏"}
 	if score, _ := cloudAgentSkillMatch(skill, []string{"梗"}); score == 0 {
 		t.Fatal("单个汉字 token 应该能命中描述")
+	}
+}
+
+func TestCloudAgentSkillSearchTokensExpandHanBigrams(t *testing.T) {
+	// 中文自然语句没有分隔符时整句是一个 token，整串 Contains 必然落空；
+	// 展开重叠 2-gram 后任一片段命中即可参与排序。整串 token 保留在最前，
+	// 整串命中时全部 gram 命中，得分自然更高。
+	got := cloudAgentSkillSearchTokens("给这个短剧设计反转结尾")
+	want := []string{"给这个短剧设计反转结尾", "给这", "这个", "个短", "短剧", "剧设", "设计", "计反", "反转", "转结", "结尾"}
+	if len(got) != len(want) {
+		t.Fatalf("切词结果 %v，期望 %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("切词结果 %v，期望 %v", got, want)
+		}
+	}
+	// 纯 ASCII token 不展开 gram，保持整串匹配。
+	if got := cloudAgentSkillSearchTokens("hook-paywall"); len(got) != 1 || got[0] != "hook-paywall" {
+		t.Fatalf("ASCII token 不应展开 gram，得到 %v", got)
+	}
+}
+
+func TestCloudAgentSkillSearchMatchesNaturalPhraseViaGrams(t *testing.T) {
+	// 回归：模型把自然语句整句当关键词时，旧逻辑整串 Contains 落空 →
+	// 「没有命中」→ 模型得出「没有适用技能」并放弃技能裸做任务。
+	// 2-gram 展开后整句也必须命中描述含「短剧」「反转」的 s2。
+	result, err := cloudAgentSearchSkills(skillSearchTestSkills(), "给这个短剧设计一个反转结尾", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := result["matches"].([]map[string]any)
+	if len(matches) == 0 {
+		t.Fatal("natural phrase must not produce an empty result")
+	}
+	if matches[0]["skillId"] != "s2" {
+		t.Fatalf("expected shortform-drama-playbook first, got %v", matches[0]["skillId"])
 	}
 }

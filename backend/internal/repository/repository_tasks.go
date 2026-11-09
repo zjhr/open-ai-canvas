@@ -24,6 +24,13 @@ func (r *Repository) Task(id string) (*model.Task, error) {
 	return &task, nil
 }
 
+// TaskStatus 避免等待循环反复读取大输入、文本草稿和结果正文。
+func (r *Repository) TaskStatus(id string) (model.TaskStatus, error) {
+	var task model.Task
+	err := r.db.Select("status").First(&task, "id = ?", id).Error
+	return task.Status, err
+}
+
 func (r *Repository) TaskForUser(userID string, id string) (*model.Task, error) {
 	var task model.Task
 	if err := r.db.First(&task, "id = ? AND user_id = ?", id, userID).Error; err != nil {
@@ -74,9 +81,10 @@ func (r *Repository) ClaimNextTask(owner string, leaseDuration time.Duration) (*
 		}
 		updated := claim.
 			Updates(map[string]any{
-				"status":           model.TaskStatusRunning,
-				"stage":            "后端接管任务",
-				"progress":         15,
+				"status": model.TaskStatusRunning,
+				// 回查已被上游接收的任务时保留原进度（如“候车 · 前面 N 条”），避免每轮领取时文案来回跳。
+				"stage":            gorm.Expr("CASE WHEN provider_request_id <> '' THEN stage ELSE ? END", "后端接管任务"),
+				"progress":         gorm.Expr("CASE WHEN provider_request_id <> '' THEN progress ELSE ? END", 15),
 				"attempts":         gorm.Expr("attempts + ?", 1),
 				"started_at":       gorm.Expr("COALESCE(started_at, ?)", now),
 				"lease_owner":      owner,
@@ -212,7 +220,9 @@ func (r *Repository) SaveTaskCompletion(task *model.Task, expected model.TaskSta
 // Registration and terminal success commit together; a failed asset write leaves
 // the task recoverable and never exposes a false success to the canvas.
 func (r *Repository) SaveTaskCompletionWithRegistration(task *model.Task, expected model.TaskStatus, results []model.Result, register func(*Repository) error) error {
-	return r.db.Transaction(func(tx *gorm.DB) error {
+	return r.Transaction(func(repo *Repository) error {
+		tx := repo.db
+		storedResultJSON := task.ResultJSON
 		updated := taskLeaseWriter(tx.Model(&model.Task{}), task.LeaseOwner).
 			Where("id = ? AND status = ?", task.ID, expected).
 			Select("*").Omit("id", "created_at").Updates(task)
@@ -228,7 +238,13 @@ func (r *Repository) SaveTaskCompletionWithRegistration(task *model.Task, expect
 			}
 		}
 		if register != nil {
-			return register(New(tx))
+			if err := register(repo); err != nil {
+				return err
+			}
+			// 版本化资产绑定可能补充结果状态；与任务终态在同一事务保存。
+			if task.ResultJSON != storedResultJSON {
+				return tx.Model(&model.Task{}).Where("id = ?", task.ID).Update("result_json", task.ResultJSON).Error
+			}
 		}
 		return nil
 	})

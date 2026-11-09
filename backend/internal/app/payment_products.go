@@ -1,4 +1,4 @@
-// 充值商品：前台可购买的积分档位与管理端增改。
+// 充值商品：前台可购买的积分档位、存储空间档位与管理端增改。
 
 package app
 
@@ -14,14 +14,28 @@ func (s *Service) TopupProducts(actor *model.User) ([]model.TopupProduct, error)
 	if actor == nil {
 		return nil, Unauthorized("请先登录")
 	}
-	if err := s.RequireFeature(FeatureCredits); err != nil {
+	creditsEnabled, err := s.FeatureEnabled(FeatureCredits)
+	if err != nil {
 		return nil, err
 	}
 	products, err := s.repo.TopupProducts(false)
 	if err != nil {
 		return nil, err
 	}
-	return decorateTopupProducts(products, time.Now()), nil
+	// 积分功能关闭时只隐藏积分商品，存储空间商品照常售卖。
+	visible := make([]model.TopupProduct, 0, len(products))
+	for _, product := range products {
+		if topupProductKind(product.Kind) == model.TopupProductKindCredits && !creditsEnabled {
+			continue
+		}
+		visible = append(visible, product)
+	}
+	settings, err := s.paymentSettings()
+	if err != nil {
+		return nil, err
+	}
+	sortTopupProductsByCurrency(visible, settings.DefaultCurrency)
+	return decorateTopupProducts(visible, time.Now()), nil
 }
 
 func (s *Service) AdminTopupProducts(actor *model.User) ([]model.TopupProduct, error) {
@@ -38,6 +52,7 @@ func (s *Service) AdminTopupProducts(actor *model.User) ([]model.TopupProduct, e
 func decorateTopupProducts(products []model.TopupProduct, now time.Time) []model.TopupProduct {
 	for index := range products {
 		product := &products[index]
+		product.Kind = topupProductKind(product.Kind)
 		if product.SaleStrategy == "" {
 			product.SaleStrategy = model.TopupSaleStrategyUnlimited
 		}
@@ -66,6 +81,13 @@ func (s *Service) CreateTopupProduct(actor *model.User, request TopupProductRequ
 	if err := s.RequireAdmin(actor); err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(request.Currency) == "" {
+		settings, settingsErr := s.paymentSettings()
+		if settingsErr != nil {
+			return nil, settingsErr
+		}
+		request.Currency = settings.DefaultCurrency
+	}
 	product, err := topupProductFromRequest(newID(), actor.ID, request, 0, 0)
 	if err != nil {
 		return nil, err
@@ -73,7 +95,7 @@ func (s *Service) CreateTopupProduct(actor *model.User, request TopupProductRequ
 	if err := s.repo.CreateTopupProduct(product); err != nil {
 		return nil, err
 	}
-	if err := s.appendAdminAudit(actor, "topup_product.create", "topup_product", product.ID, "创建积分充值商品", map[string]any{"amountFen": product.AmountFen, "creditsMicrocredits": product.CreditsMicrocredits, "saleStrategy": product.SaleStrategy}); err != nil {
+	if err := s.appendAdminAudit(actor, "topup_product.create", "topup_product", product.ID, "创建充值商品", map[string]any{"kind": product.Kind, "amountFen": product.AmountFen, "currency": product.Currency, "creditsMicrocredits": product.CreditsMicrocredits, "storageBytes": product.StorageBytes, "storageDurationDays": product.StorageDurationDays, "saleStrategy": product.SaleStrategy}); err != nil {
 		return nil, err
 	}
 	return product, nil
@@ -87,6 +109,13 @@ func (s *Service) UpdateTopupProduct(actor *model.User, id string, request Topup
 	var product *model.TopupProduct
 	// 已售数量必须在锁住商品行之后计算，否则会覆盖并发下单扣减或关单退回的库存。
 	err := s.repo.UpdateTopupProduct(id, func(existing *model.TopupProduct) (*model.TopupProduct, error) {
+		// 类型决定发放的权益，已上架商品不允许改类型，避免历史订单与后台列表含义错位。
+		if topupProductKind(request.Kind) != topupProductKind(existing.Kind) {
+			return nil, BadAuthRequest("商品类型创建后不能修改，请新建商品")
+		}
+		if strings.TrimSpace(request.Currency) == "" {
+			request.Currency = firstNonEmpty(existing.Currency, model.PriceCurrencyCNY)
+		}
 		consumed := existing.StockTotal - existing.StockRemaining
 		if existing.SaleStrategy != model.TopupSaleStrategyInventory {
 			consumed = 0
@@ -101,7 +130,7 @@ func (s *Service) UpdateTopupProduct(actor *model.User, id string, request Topup
 	if err != nil {
 		return nil, err
 	}
-	if err := s.appendAdminAudit(actor, "topup_product.update", "topup_product", product.ID, "更新积分充值商品", map[string]any{"enabled": product.Enabled, "saleStrategy": product.SaleStrategy}); err != nil {
+	if err := s.appendAdminAudit(actor, "topup_product.update", "topup_product", product.ID, "更新充值商品", map[string]any{"kind": product.Kind, "enabled": product.Enabled, "saleStrategy": product.SaleStrategy}); err != nil {
 		return nil, err
 	}
 	return s.repo.TopupProduct(product.ID)
@@ -116,11 +145,33 @@ func topupProductFromRequest(id, actorID string, request TopupProductRequest, st
 	if name == "" || len([]rune(name)) > 120 {
 		return nil, BadAuthRequest("充值商品名称不能为空且不能超过 120 个字符")
 	}
-	if request.AmountFen <= 0 || request.AmountFen > 100_000_000 {
-		return nil, BadAuthRequest("充值金额必须为 1 分至 100 万元")
+	currency, err := normalizePaymentCurrency(request.Currency)
+	if err != nil {
+		return nil, err
 	}
-	if request.CreditsMicrocredits <= 0 || request.CreditsMicrocredits > maxTopupCreditsMicrocredits {
-		return nil, BadAuthRequest("充值积分必须为 0.000001 至 10 亿积分")
+	// AmountFen 是货币最小单位（分 / 美分），两种货币上限都是 100 万主单位。
+	if request.AmountFen <= 0 || request.AmountFen > 100_000_000 {
+		return nil, BadAuthRequest("充值金额必须为 0.01 至 1,000,000 " + currency)
+	}
+	kind := topupProductKind(request.Kind)
+	if request.Kind != "" && request.Kind != model.TopupProductKindCredits && request.Kind != model.TopupProductKindStorage {
+		return nil, BadAuthRequest("商品类型无效")
+	}
+	switch kind {
+	case model.TopupProductKindStorage:
+		if request.CreditsMicrocredits != 0 {
+			return nil, BadAuthRequest("存储空间商品不能同时发放积分")
+		}
+		if err := validStorageGrantSize(request.StorageBytes, request.StorageDurationDays); err != nil {
+			return nil, err
+		}
+	default:
+		if request.StorageBytes != 0 || request.StorageDurationDays != 0 {
+			return nil, BadAuthRequest("积分商品不能设置存储空间")
+		}
+		if request.CreditsMicrocredits <= 0 || request.CreditsMicrocredits > maxTopupCreditsMicrocredits {
+			return nil, BadAuthRequest("充值积分必须为 0.000001 至 10 亿积分")
+		}
 	}
 	strategy := request.SaleStrategy
 	if strategy == "" {
@@ -150,7 +201,8 @@ func topupProductFromRequest(id, actorID string, request TopupProductRequest, st
 	}
 	return &model.TopupProduct{
 		ID: id, Name: name, Description: truncateRunes(strings.TrimSpace(request.Description), 500),
-		AmountFen: request.AmountFen, CreditsMicrocredits: request.CreditsMicrocredits,
+		Kind: kind, AmountFen: request.AmountFen, Currency: currency, CreditsMicrocredits: request.CreditsMicrocredits,
+		StorageBytes: request.StorageBytes, StorageDurationDays: request.StorageDurationDays,
 		Enabled: request.Enabled, SortOrder: request.SortOrder, SaleStrategy: strategy,
 		PeriodDays: request.PeriodDays, PeriodPurchaseLimit: request.PeriodPurchaseLimit,
 		StockTotal: request.StockTotal, StockRemaining: stockRemaining,

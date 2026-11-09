@@ -82,6 +82,17 @@ func (r *Repository) ChannelModelByID(channelID string, id string) (*model.Chann
 	return &item, nil
 }
 
+// SetChannelModelEnabled 只更新启停与更新时间，不触碰价格档和价格版本。
+func (r *Repository) SetChannelModelEnabled(channelID string, id string, enabled bool) error {
+	result := r.db.Model(&model.ChannelModel{}).Where("id = ? AND channel_id = ?", id, channelID).Updates(map[string]any{"enabled": enabled, "updated_at": time.Now()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
 func (r *Repository) ChannelModelByKey(channelID string, modelKey string) (*model.ChannelModel, error) {
 	var item model.ChannelModel
 	if err := r.db.First(&item, "channel_id = ? AND model_key = ? AND enabled = ?", channelID, modelKey, true).Error; err != nil {
@@ -195,7 +206,8 @@ func (r *Repository) attachChannelModelPriceTiers(items []*model.ChannelModel) e
 				ProviderModelKey: item.ProviderModelKey, BillingMode: item.BillingMode,
 				UnitPriceMicrocredits: item.UnitPriceMicrocredits, InputTokenPriceMicrocredits: item.InputTokenPriceMicrocredits,
 				OutputTokenPriceMicrocredits: item.OutputTokenPriceMicrocredits, CachedTokenPriceMicrocredits: item.CachedTokenPriceMicrocredits,
-				PriceConfigured: item.PriceConfigured, Enabled: item.Enabled, PriceVersion: item.PriceVersion,
+				CacheWriteTokenPriceMicrocredits: item.CacheWriteTokenPriceMicrocredits,
+				PriceConfigured:                  item.PriceConfigured, Enabled: item.Enabled, PriceVersion: item.PriceVersion,
 			}}
 		}
 	}

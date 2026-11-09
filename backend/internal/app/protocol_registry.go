@@ -19,6 +19,7 @@ type PluginProviderCatalogItem struct {
 	Vendor            string                      `json:"vendor"`
 	Categories        []protocol.Capability       `json:"categories"`
 	Scopes            []protocol.Surface          `json:"scopes"`
+	Kind              protocol.ProviderKind       `json:"kind,omitempty"`
 	Create            string                      `json:"create,omitempty"`
 	Poll              string                      `json:"poll,omitempty"`
 	ContentType       string                      `json:"contentType,omitempty"`
@@ -26,7 +27,10 @@ type PluginProviderCatalogItem struct {
 	Enabled           bool                        `json:"enabled"`
 	UnavailableReason string                      `json:"unavailableReason,omitempty"`
 	Parameters        []protocol.Parameter        `json:"parameters,omitempty"`
+	ImageParameters   []protocol.ImageParameter   `json:"imageParameters,omitempty"`
 	Workflows         []protocol.ManifestWorkflow `json:"workflows,omitempty"`
+	TextWire          string                      `json:"textWire,omitempty"`
+	RequiresSecretKey bool                        `json:"requiresSecretKey,omitempty"`
 }
 
 // PluginProviderCatalog projects provider and workflow contributions from the
@@ -42,12 +46,17 @@ func (s *Service) PluginProviderCatalog(scope, capability string, includeUnavail
 			}
 			item := PluginProviderCatalogItem{ID: provider.ID, Version: plugin.Manifest.Version, Name: provider.Label, Vendor: plugin.Manifest.Author, Categories: provider.Capabilities, Scopes: provider.Scopes, BaseURL: provider.BaseURL, Enabled: plugin.Status == "enabled", UnavailableReason: plugin.Error, Parameters: provider.Parameters, Workflows: workflowsForProvider(plugin.Manifest.Contributes.Workflows, provider.ID)}
 			item.Create, item.Poll, item.ContentType = operationSummary(provider.Create), operationSummaryPtr(provider.Poll), provider.Create.ContentType
+			item.ImageParameters = provider.ImageParameters
+			item.Kind = provider.Kind
 			// The registry metadata is the canonical provider projection. This keeps
 			// host-backed dispatch paths out of every user-facing catalog consumer.
 			if adapter, ok := canonicalProviderAdapter(s.protocolRegistry(), provider.ID); ok {
 				metadata := adapter.Metadata()
 				item.Create, item.Poll, item.ContentType = metadata.Create, metadata.Poll, metadata.ContentType
+				item.TextWire = metadata.TextWire
 			}
+			// 是否需要第二把密钥只看插件 auth 声明（只下发布尔值，不下发字段名或密钥）。
+			item.RequiresSecretKey = protocolAuthUsesSecretKey(provider.Auth)
 			if includeUnavailable || item.Enabled {
 				items = append(items, item)
 			}
@@ -180,6 +189,7 @@ func (s *Service) InstallPlugin(data []byte, fileName string) (PluginView, error
 	}
 	plugin, err := s.pluginRuntime.install(data, fileName)
 	if err == nil {
+		s.invalidateRouteCatalog()
 		s.refreshPaymentRegistry()
 	}
 	return plugin, err
@@ -241,6 +251,7 @@ func (s *Service) SetPluginEnabled(id string, enabled bool) (PluginView, error) 
 	}
 	plugin, err := s.pluginRuntime.setEnabled(id, enabled)
 	if err == nil {
+		s.invalidateRouteCatalog()
 		s.refreshPaymentRegistry()
 	}
 	return plugin, err
@@ -255,6 +266,7 @@ func (s *Service) UninstallPlugin(id string) error {
 	}
 	err := s.pluginRuntime.uninstall(id)
 	if err == nil {
+		s.invalidateRouteCatalog()
 		s.refreshPaymentRegistry()
 	}
 	return err

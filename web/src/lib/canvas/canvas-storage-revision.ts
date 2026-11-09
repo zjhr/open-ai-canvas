@@ -136,9 +136,10 @@ function mergeRecord(base: Record<string, unknown>, local: Record<string, unknow
     const merged: Record<string, unknown> = {};
     for (const key of new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(durable)])) {
         if (excluded.has(key)) continue;
-        const baseHas = Object.prototype.hasOwnProperty.call(base, key);
-        const localHas = Object.prototype.hasOwnProperty.call(local, key);
-        const durableHas = Object.prototype.hasOwnProperty.call(durable, key);
+        // JSON 会省略 undefined 字段；内存快照必须按相同的字段存在语义合并。
+        const baseHas = Object.prototype.hasOwnProperty.call(base, key) && base[key] !== undefined;
+        const localHas = Object.prototype.hasOwnProperty.call(local, key) && local[key] !== undefined;
+        const durableHas = Object.prototype.hasOwnProperty.call(durable, key) && durable[key] !== undefined;
         if (!localHas && baseHas) {
             if (durableHas && !deepEqual(durable[key], base[key])) {
                 onConflict?.();
@@ -238,7 +239,8 @@ function mergeEntities<T extends { id: string }>(input: {
         if (!local || (base && deepEqual(base, local))) continue;
 
         if (!durable) {
-            if (base || (input.tombstones[id] ?? 0) > input.baseRevision) {
+            // base 中存在只能证明本地此前读过它；跨写入者删除由更新的墓碑证明。
+            if ((input.tombstones[id] ?? 0) > input.baseRevision) {
                 // A local recreation is still user work. Record the concurrent
                 // deletion, but keep the node and clear the stale tombstone so a
                 // later rebase cannot suppress the same ID forever.

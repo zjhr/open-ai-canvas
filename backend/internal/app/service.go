@@ -13,11 +13,14 @@ import (
 
 	"yingce/backend/internal/auth"
 	"yingce/backend/internal/canvas"
+	"yingce/backend/internal/inspirations"
 	"yingce/backend/internal/kernel"
 	"yingce/backend/internal/model"
 	"yingce/backend/internal/payment"
 	"yingce/backend/internal/platform"
+	"yingce/backend/internal/poselibrary"
 	"yingce/backend/internal/prompts"
+	"yingce/backend/internal/providercatalog"
 	"yingce/backend/internal/repository"
 	"yingce/backend/internal/skills"
 	"yingce/backend/internal/sms"
@@ -32,6 +35,7 @@ type Service struct {
 	registrationMu           sync.Mutex
 	emailCodeMu              sync.Mutex
 	redeemBatchMu            sync.Mutex
+	billingAutoRefund        billingAutoRefundScan
 	storageMu                sync.Mutex
 	storageTestMu            sync.Mutex
 	workerRuntimeMu          sync.Mutex
@@ -45,6 +49,8 @@ type Service struct {
 	characterTaskMu          sync.Mutex
 	activeCancels            map[string]context.CancelFunc
 	pendingStorage           map[string]int64
+	storageStatusMu          sync.Mutex
+	storageStatusCache       map[string]storageStatusEntry
 	coordinator              *platform.Coordinator
 	platform                 *platform.Service
 	taskBillingCoordinator   *taskBillingCoordinator
@@ -83,7 +89,10 @@ type Service struct {
 	auth                     *auth.Service
 	sms                      *sms.Service
 	canvas                   *canvas.Service
+	canvasRealtime           *canvas.RealtimeHub
 	workbench                *workbench.Service
+	poseLibrary              *poselibrary.Service
+	inspirationFeed          *inspirations.Service
 	piRunnerMu               sync.Mutex
 	piRunnerWg               sync.WaitGroup
 	piRunners                map[string]context.CancelFunc
@@ -94,10 +103,30 @@ type Service struct {
 	// legacyCloudAgentRootTask is enabled only by tests that exercise the pre-Pi
 	// model-worker path. Runtime availability must not change root task semantics.
 	legacyCloudAgentRootTask bool
+	// cloudAgentModelRetryBase 是模型步骤重试的指数退避基数；零值为 1 秒，只有测试会调小。
+	cloudAgentModelRetryBase time.Duration
 	approvedMediaMu          sync.Mutex
 	approvedMediaWg          sync.WaitGroup
 	approvedMediaWaiters     map[string]context.CancelFunc
 	approvedMediaClosed      bool
+	approvalFollowUpMu       sync.Mutex
+	approvalFollowUpWg       sync.WaitGroup
+	approvalFollowUps        map[string]struct{} // 正在执行批准后收尾的审批（runID:approvalID），见 cloud_agent_approval_followup.go
+	approvalFollowUpClosed   bool
+	providerCatalogOnce      sync.Once
+	providerCatalog          *providercatalog.Source
+	userGroups               userGroupState
+	modelAvailabilityMu      sync.RWMutex
+	modelAvailabilityCache   map[publicModelAvailabilityKey]*PublicModelAvailability
+	modelAvailabilityAt      time.Time
+	adminModelHealthMu       sync.Mutex
+	adminModelHealthCache    *AdminChannelModelHealthReport
+	// dramaTaskHook 只在测试中替换短剧调度的任务提交，生产路径始终走 CreateTask 准入。
+	dramaTailFrameHook func(userID, resourceID string) (string, error)
+	dramaTaskHook      func(userID string, req CreateTaskRequest, timeline *renderProject) (*model.Task, error)
+	// dramaTails 跟踪调度循环之外的尾帧抽取；dramaBackgroundRunner 为空时用后台 worker，测试替换为同步执行。
+	dramaTails            dramaTailWorker
+	dramaBackgroundRunner func(fn func()) bool
 }
 
 const taskWorkerConcurrency = 3
@@ -135,6 +164,8 @@ func New(repo *repository.Repository, dataDir string) *Service {
 
 func newService(repo *repository.Repository, dataDir string) *Service {
 	coordinator, err := platform.NewCoordinator(repo.Dialect())
+	canvasRealtime := canvas.NewRealtimeHub(coordinator.Redis())
+	repo = repo.WithCanvasChangeNotifier(canvasRealtime.Changed)
 	pluginRuntime, pluginRuntimeErr := newPluginRuntime(dataDir)
 	paymentRegistry, _ := payment.NewRegistry()
 	if pluginRuntime != nil {
@@ -155,7 +186,10 @@ func newService(repo *repository.Repository, dataDir string) *Service {
 	service.sms = service.newSMSDomain()
 	service.auth.SetSMSDelivery(service.sms)
 	service.canvas = canvas.New(service.repo, canvasHost{svc: service})
+	service.canvasRealtime = canvasRealtime
 	service.workbench = workbench.New(service.repo, workbenchAdminGate{svc: service}, workbenchAdminGate{svc: service})
+	service.poseLibrary = poselibrary.New(service.repo, service.dataDir, poseLibraryAdminGate{svc: service})
+	service.inspirationFeed = inspirations.New(service.repo, inspirationFeedAdminGate{svc: service}, service.inspirationFeedLock, service.runWorkerLoop)
 	service.platform = platform.New(service.repo, coordinator, platformHost{svc: service})
 	return service
 }
@@ -176,8 +210,15 @@ func (s *Service) StartWorker() {
 	}
 	s.taskWorker().start(ctx)
 	s.startResourceDeletionWorker(ctx)
+	s.startResourceOffloadWorker()
 	s.startSkillSyncWorker(ctx)
+	s.startEcommerceSkillSyncWorker(ctx)
 	s.startPaymentWorker(ctx)
+	s.startBillingAutoRefundWorker()
+	s.startArkPortraitWorker()
+	s.startDramaScheduler()
+	s.startInspirationFeedWorker()
+	s.startConsumptionReportWorker()
 	go s.syncAgentSessionLimit()
 	s.runWorkerLoop(func(ctx context.Context) {
 		ticker := time.NewTicker(3 * time.Second)

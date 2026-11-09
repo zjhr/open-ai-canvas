@@ -1,4 +1,5 @@
-import { Alert, App, Button, Form, Input, InputNumber, Modal, Segmented, Switch, Table, Tag } from "antd";
+import { Alert, App, Button, Form, Input, InputNumber, Segmented, Switch, Table, Tag } from "antd";
+import { AdminModal } from "@/pages/admin/ui/overlays";
 import type { FormInstance } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Archive, FlaskConical, GitBranch, Layers3, Pencil, Plus, Search } from "lucide-react";
@@ -174,7 +175,8 @@ export default function LogicalModelsPage() {
             message.error("请至少添加一条供应线路");
             return;
         }
-        const sourceError = capabilitySourceError(values.capability, modelSourceSpecs, values.capabilitySpec);
+        const currentSpec = normalizeCapabilitySpecForSources(values.capabilitySpec, modelSourceSpecs) || values.capabilitySpec;
+        const sourceError = capabilitySourceError(values.capability, modelSourceSpecs, currentSpec);
         if (values.enabled && sourceError) {
             setEditorTab("capabilities");
             message.error(sourceError);
@@ -272,18 +274,18 @@ export default function LogicalModelsPage() {
         { title: "状态", width: 130, render: (_, item) => logicalModelStatusTag(item) },
         {
             title: "操作",
-            width: 230,
+            width: 300,
             align: "right",
             render: (_, item) => (
                 <AdminRowActions
                     primary={{ label: "编辑", icon: <Pencil className="size-3.5" />, onClick: () => openModel(item) }}
-                    visibleActionCount={1}
+                    visibleActionCount={3}
                     actions={[
-                        { key: "simulate", label: "模拟供应线路匹配", icon: <FlaskConical className="size-3.5" />, onClick: () => openSimulation(item) },
+                        { key: "simulate", label: "模拟线路", icon: <FlaskConical className="size-3.5" />, onClick: () => openSimulation(item) },
                         { key: "toggle", label: item.enabled ? "停用" : "启用", onClick: () => void toggleModel(item) },
                         {
                             key: "archive",
-                            label: "归档模型",
+                            label: "归档",
                             icon: <Archive className="size-3.5" />,
                             danger: true,
                             disabled: deletingModelId === item.id,
@@ -339,7 +341,7 @@ export default function LogicalModelsPage() {
                     setKeyword("");
                     setPage(1);
                 }}
-                table={{ className: "admin-logical-model-table", rowKey: "id", size: "small", loading, pagination: false, columns: modelColumns, dataSource: paginatedModels, scroll: { x: 980 } }}
+                table={{ className: "admin-logical-model-table", rowKey: "id", size: "small", loading, pagination: false, columns: modelColumns, dataSource: paginatedModels, scroll: { x: 1050 } }}
                 empty={<AdminTableEmpty filtered={Boolean(deferredKeyword)} title="暂无模型" />}
                 footer={
                     <PaginationBar
@@ -356,7 +358,7 @@ export default function LogicalModelsPage() {
             />
 
             <ModelEditorModal
-                admin
+                shell={AdminModal}
                 open={editingModel !== undefined}
                 busy={saving}
                 title={editingModel ? "编辑前台模型" : "新增前台模型"}
@@ -490,11 +492,10 @@ export default function LogicalModelsPage() {
                 )}
             </ModelEditorModal>
 
-            <Modal
+            <AdminModal
                 title={simulatingModel ? `供应线路匹配模拟 - ${simulatingModel.name}` : "供应线路匹配模拟"}
                 open={Boolean(simulatingModel)}
                 className="workspace-modal workspace-modal-wide admin-simulation-modal"
-                rootClassName="admin-modal-root"
                 centered
                 destroyOnHidden
                 onCancel={() => setSimulatingModel(undefined)}
@@ -542,7 +543,7 @@ export default function LogicalModelsPage() {
                         ) : null}
                     </div>
                 ) : null}
-            </Modal>
+            </AdminModal>
         </AdminPageFrame>
     );
 }
@@ -550,7 +551,7 @@ export default function LogicalModelsPage() {
 function EditorSection({ icon, title, description, children }: { icon?: ReactNode; title: string; description?: string; children: ReactNode }) {
     return (
         <section className="model-editor-section">
-            <div className="mb-4 flex items-center gap-2.5">
+            <div className="mb-4 flex items-center gap-2">
                 {icon ? <span className="grid size-7 shrink-0 place-items-center rounded-md bg-muted/50 text-foreground/55">{icon}</span> : null}
                 <div>
                     <h2 className="text-[var(--fs-body)] font-semibold">{title}</h2>
@@ -639,7 +640,9 @@ function RouteFields({
                                                             .map((item) => (item ? capabilitySpecFromChannelModel(item) : undefined))
                                                             .filter((item): item is CapabilitySpec => Boolean(item));
                                                         form.setFieldValue("routes", nextRoutes);
-                                                        if (!hasCapabilityRules(form.getFieldValue("capabilitySpec"))) form.setFieldValue("capabilitySpec", mergeCapabilitySpecs(capability, specs));
+                                                        const current = form.getFieldValue("capabilitySpec");
+                                                        if (capability === "image" || !hasCapabilityRules(current))
+                                                            form.setFieldValue("capabilitySpec", capability === "image" && hasCapabilityRules(current) ? normalizeCapabilitySpecForSources(current, specs) : mergeCapabilitySpecs(capability, specs));
                                                     }}
                                                 />
                                             </Form.Item>

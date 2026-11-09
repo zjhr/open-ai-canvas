@@ -13,11 +13,21 @@ export type SkinButtonFill = {
     foreground: string;
 };
 
-export const DEFAULT_BUTTON_GRADIENT: SkinButtonFill = {
-    mode: "gradient", angle: 115,
-    start: "#6554df", end: "#386fbc",
-    hoverStart: "#5744cf", hoverEnd: "#356bbb",
-    activeStart: "#4938b8", activeEnd: "#2c5da5", foreground: "#ffffff",
+// 主按钮默认取皮肤主操作色的纯色墨（docs/ui-design-system.md §3.0）。渐变色值只在管理员
+// 把自定义皮肤切到“渐变”后才生效，默认给同色系的上亮下暗，不再预置紫蓝渐变。
+export const DEFAULT_BUTTON_FILLS: Record<SkinThemeMode, SkinButtonFill> = {
+    light: {
+        mode: "solid", angle: 180,
+        start: "#3f3f46", end: "#18181b",
+        hoverStart: "#52525b", hoverEnd: "#27272a",
+        activeStart: "#27272a", activeEnd: "#09090b", foreground: "#fafafa",
+    },
+    dark: {
+        mode: "solid", angle: 180,
+        start: "#ffffff", end: "#e4e4e7",
+        hoverStart: "#ffffff", hoverEnd: "#f4f4f5",
+        activeStart: "#e4e4e7", activeEnd: "#d4d4d8", foreground: "#18181b",
+    },
 };
 
 export const SKIN_BUTTON_COLOR_FIELDS = [
@@ -398,7 +408,7 @@ export const DEFAULT_CLASSIC_SKIN: SkinDefinition = {
             authAccent: "#93c5fd",
             authMuted: "#8a8b91",
         },
-        buttons: { light: { ...DEFAULT_BUTTON_GRADIENT }, dark: { ...DEFAULT_BUTTON_GRADIENT } },
+        buttons: { light: { ...DEFAULT_BUTTON_FILLS.light }, dark: { ...DEFAULT_BUTTON_FILLS.dark } },
         components: {
             buttonRadius: 6,
             inputRadius: 6,
@@ -534,8 +544,8 @@ export function normalizeSkinDefinition(value: unknown, fallback: SkinDefinition
         description: typeof candidate.description === "string" ? candidate.description.trim().slice(0, 100) : fallback.description,
         locked: id === "classic",
         tokens: { light, dark, components: { ...modes.components }, buttons: {
-            light: normalizeButtonFill(modes.buttons?.light, id),
-            dark: normalizeButtonFill(modes.buttons?.dark, id),
+            light: normalizeButtonFill(modes.buttons?.light, "light"),
+            dark: normalizeButtonFill(modes.buttons?.dark, "dark"),
         } },
     };
 }
@@ -690,11 +700,12 @@ export function applySkinTheme(skinValue: unknown, mode: SkinThemeMode, targetDo
     const skin = normalizeSkinDefinition(skinValue);
     const root = targetDocument.documentElement;
     for (const property of MANAGED_VARIABLES) root.style.removeProperty(property);
+    // 经典皮肤的全部 token（包括主按钮）都由 globals.css 定义；只有自定义皮肤写入行内变量，
+    // 这样首屏 JS 执行前主按钮也有颜色，旧后端返回的历史填充也不会改变经典外观。
     if (skin.id !== "classic") {
-        const values = skinCSSVariables(skin, mode);
+        const values = { ...skinCSSVariables(skin, mode), ...skinButtonCSSVariables(skin, mode) };
         for (const [property, value] of Object.entries(values)) root.style.setProperty(property, value);
     }
-    for (const [property, value] of Object.entries(skinButtonCSSVariables(skin, mode))) root.style.setProperty(property, value);
     root.dataset.skin = skin.id;
 }
 
@@ -705,12 +716,12 @@ export function isSkinButtonFill(value: unknown): value is SkinButtonFill {
         && SKIN_BUTTON_COLOR_FIELDS.every(({ key }) => typeof fill[key] === "string" && HEX_COLOR.test(fill[key]));
 }
 
-function normalizeButtonFill(value: unknown, skinID: string): SkinButtonFill {
-    return isSkinButtonFill(value) ? { ...value } : { ...DEFAULT_BUTTON_GRADIENT, mode: skinID === "classic" ? "gradient" : "solid" };
+function normalizeButtonFill(value: unknown, mode: SkinThemeMode): SkinButtonFill {
+    return isSkinButtonFill(value) ? { ...value } : { ...DEFAULT_BUTTON_FILLS[mode] };
 }
 
 export function getSkinButtonAppearance(skin: SkinDefinition, mode: SkinThemeMode) {
-    const fill = normalizeButtonFill(skin.tokens.buttons?.[mode], skin.id);
+    const fill = normalizeButtonFill(skin.tokens.buttons?.[mode], mode);
     const color = skin.tokens[mode];
     const gradient = (start: string, end: string) => `linear-gradient(${fill.angle}deg, ${start}, ${end})`;
     return fill.mode === "gradient" ? {
@@ -826,14 +837,15 @@ export function skinCSSVariables(skin: SkinDefinition, mode: SkinThemeMode): Rec
 
 function skinShadowVariables(style: SkinShadowStyle, mode: SkinThemeMode) {
     if (style === "none") return { "--elevation-card": "none", "--elevation-card-hover": "none", "--elevation-overlay": "none", "--theme-admin-card-shadow": "none" };
+    // 每档阴影两层：贴边、清晰的小阴影交代边缘，大而淡的阴影交代悬浮高度。
     if (style === "strong") {
         return mode === "dark"
-            ? { "--elevation-card": "0 5px 16px #00000080", "--elevation-card-hover": "0 18px 44px #000000a6", "--elevation-overlay": "0 30px 90px #000000c2", "--theme-admin-card-shadow": "0 5px 16px #00000070" }
-            : { "--elevation-card": "0 5px 16px #0f172a29", "--elevation-card-hover": "0 18px 44px #0f172a3d", "--elevation-overlay": "0 30px 90px #0f172a52", "--theme-admin-card-shadow": "0 5px 16px #11182724" };
+            ? { "--elevation-card": "0 1px 2px #00000080, 0 6px 16px #00000066", "--elevation-card-hover": "0 1px 3px #00000080, 0 18px 44px #0000008c", "--elevation-overlay": "0 2px 6px #00000080, 0 30px 90px #000000a6", "--theme-admin-card-shadow": "0 1px 2px #00000070, 0 6px 16px #00000052" }
+            : { "--elevation-card": "0 1px 2px #0f172a1f, 0 6px 16px #0f172a1f", "--elevation-card-hover": "0 1px 3px #0f172a24, 0 18px 44px #0f172a33", "--elevation-overlay": "0 2px 6px #0f172a29, 0 30px 90px #0f172a42", "--theme-admin-card-shadow": "0 1px 2px #1118271f, 0 6px 16px #1118271a" };
     }
     return mode === "dark"
-        ? { "--elevation-card": "0 2px 7px #00000061", "--elevation-card-hover": "0 12px 30px #0000007a", "--elevation-overlay": "0 26px 72px #0000009e", "--theme-admin-card-shadow": "0 2px 7px #00000052" }
-        : { "--elevation-card": "0 2px 7px #0f172a14", "--elevation-card-hover": "0 12px 30px #0f172a24", "--elevation-overlay": "0 26px 72px #0f172a33", "--theme-admin-card-shadow": "0 2px 7px #1118270f" };
+        ? { "--elevation-card": "0 1px 2px #00000052, 0 4px 12px #00000047", "--elevation-card-hover": "0 1px 3px #00000061, 0 12px 30px #00000066", "--elevation-overlay": "0 2px 6px #00000066, 0 26px 72px #00000085", "--theme-admin-card-shadow": "0 1px 2px #00000047, 0 4px 12px #0000003d" }
+        : { "--elevation-card": "0 1px 2px #0f172a14, 0 4px 12px #0f172a0d", "--elevation-card-hover": "0 1px 3px #0f172a1a, 0 12px 30px #0f172a1f", "--elevation-overlay": "0 2px 6px #0f172a1a, 0 26px 72px #0f172a2b", "--theme-admin-card-shadow": "0 1px 2px #1118270f, 0 4px 12px #1118270a" };
 }
 
 function cloneSkinTokens(tokens: SkinTokens): SkinTokens {

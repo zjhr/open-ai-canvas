@@ -1,32 +1,14 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"yingce/backend/internal/model"
 	"yingce/backend/internal/repository"
 )
-
-type AccountFileStorageUsage struct {
-	UsedBytes  int64 `json:"usedBytes"`
-	TotalBytes int64 `json:"totalBytes"`
-}
-
-func (s *Service) AccountFileStorageUsage(userID string) (*AccountFileStorageUsage, error) {
-	policy, err := s.RuntimePolicy()
-	if err != nil {
-		return nil, err
-	}
-	usedBytes, err := s.repo.UserStoredFileBytes(userID)
-	if err != nil {
-		return nil, err
-	}
-	return &AccountFileStorageUsage{
-		UsedBytes:  usedBytes,
-		TotalBytes: gigabytes(policy.Resource.StoredFileGB),
-	}, nil
-}
 
 func structuredBytes(usage repository.UserStorageUsage) int64 {
 	return usage.AssetBytes + usage.CanvasBytes
@@ -157,10 +139,31 @@ func (s *Service) saveTaskCompletionWithinStorageQuota(task *model.Task, resultJ
 	completed.InputJSON = publicInputJSON
 	completed.CompletedAt = ptr(time.Now())
 	var register func(*repository.Repository) error
-	if task.MediaRecoveryJSON != "" {
+	visualImage := strings.Contains(task.InputJSON, "project_asset_image")
+	if task.MediaRecoveryJSON != "" || visualImage {
 		completed.MediaStage = "completed"
 		register = func(repo *repository.Repository) error {
 			writer := &Service{repo: repo, dataDir: s.dataDir}
+			if visualImage {
+				var result map[string]interface{}
+				if err := json.Unmarshal(resultJSON, &result); err != nil {
+					return err
+				}
+				if _, err := writer.finalizeProjectAssetImageTask(*task, result); err != nil {
+					return err
+				}
+				encoded, err := json.Marshal(result)
+				if err != nil {
+					return err
+				}
+				if err := validateTaskDataGrowthQuotaWithPolicy(usage, taskDelta+int64(len(encoded)-len(resultJSON)), policy.Resource); err != nil {
+					return err
+				}
+				completed.ResultJSON = string(encoded)
+			}
+			if task.MediaRecoveryJSON == "" {
+				return nil
+			}
 			if err := writer.RegisterTaskOutputFromTask(completed); err != nil {
 				return err
 			}

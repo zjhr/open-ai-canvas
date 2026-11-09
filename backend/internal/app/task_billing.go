@@ -80,14 +80,14 @@ func (c *taskBillingCoordinator) RefundBilling(orderID string, errorText string)
 	if orderID == "" {
 		return nil
 	}
-	return c.repo.RefundBillingOrder(orderID, truncateRunes(errorText, 1000))
+	return c.repo.RefundBillingOrder(orderID, truncateRunes(redactUpstreamAddress(errorText), 1000))
 }
 
 func (c *taskBillingCoordinator) MarkBillingUncertain(orderID string, errorText string) error {
 	if orderID == "" {
 		return nil
 	}
-	return c.repo.MarkBillingUncertain(orderID, truncateRunes(errorText, 1000))
+	return c.repo.MarkBillingUncertain(orderID, truncateRunes(redactUpstreamAddress(errorText), 1000))
 }
 
 // CheckRetryEligibility 收敛失败/取消任务重试前的计费状态校验。
@@ -115,7 +115,10 @@ func (c *taskBillingCoordinator) BillingFailureRequiresReview(orderID string, ta
 	if orderID == "" {
 		return false
 	}
-	if billingFailureUncertain(err) {
+	// 上游已明确返回失败终态时，原因里的 timeout、524 等字样是上游自述，不代表本地连接中断；
+	// 是否仍有成功的计费调用照常由下面的订单和调用日志检查决定。
+	var terminal providerTaskTerminalError
+	if !errors.As(err, &terminal) && billingFailureUncertain(err) {
 		return true
 	}
 	order, orderErr := c.repo.BillingOrder(orderID)

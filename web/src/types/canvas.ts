@@ -8,6 +8,8 @@ import type { CameraControlOptions } from "@/lib/canvas/camera-prompt-library";
 import type { SrtEntry, SubtitleHighlight, SubtitleStyle } from "@/types/timeline";
 import type { GenerationSpec } from "@/lib/canvas/generation-contract.generated";
 import type { GenerationTask } from "@/services/api/task-center";
+import type { ReferenceImage } from "@/types/image";
+import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
 export type Position = {
     x: number;
@@ -19,6 +21,8 @@ export type ViewportTransform = {
     y: number;
     k: number;
 };
+
+export type CanvasFrameColor = "blue" | "green" | "violet" | "amber" | "rose" | "teal" | "slate";
 
 export enum CanvasNodeType {
     Image = "image",
@@ -63,7 +67,7 @@ export type CanvasGenerationBatchStatus = "queued" | "running" | "partial_failed
 export type CanvasGenerationBatchItemStatus = "waiting" | "submitting" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type CanvasImageGenerationType = "generation" | "edit";
 export type CanvasWorkflowKind = "free" | "script" | "story_input" | "character" | "scene" | "storyboard" | "shot" | "final" | "styleboard" | "reference_set" | "reference_video" | "action_board";
-export type CanvasVideoEditOperation = "text_to_video" | "image_to_video" | "reference_to_video" | "extend" | "inpaint" | "replace_element" | "camera_motion" | "style_transfer" | "audio_to_video" | "compare_versions" | "concat";
+export type CanvasVideoEditOperation = "text_to_video" | "image_to_video" | "reference_to_video" | "extend" | "inpaint" | "replace_element" | "camera_motion" | "style_transfer" | "audio_to_video" | "compare_versions" | "concat" | "enhance";
 export type CanvasSkillCategory = "writing" | "storyboard" | "image" | "video" | "utility";
 export type CanvasSkillOutputMode = "text" | "json" | "image_prompt" | "workflow";
 export type StoryboardColumn =
@@ -149,6 +153,26 @@ export type StoryboardData = {
     referenceNodeIds: string[];
 };
 
+/** 批量创作入队时的输入，保留资源版本；队列重试继续使用同一份输入。 */
+export type CanvasBatchInputSnapshot = {
+    version: 1;
+    prompt: string;
+    context: {
+        prompt: string;
+        referenceImages: ReferenceImage[];
+        referenceVideos: ReferenceVideo[];
+        referenceAudios: ReferenceAudio[];
+        referenceImageSlots: Array<{ nodeId: string; kind: "image" | "character"; imageId?: string }>;
+        characterReferences: Array<{ nodeId: string; assetId: string; requestedVersionId?: string }>;
+        resolvedCharacterVersions: Array<{ assetId: string; versionId: string }>;
+        resolvedCharacterVoices: Array<{ assetId: string; versionId: string; characterName: string; voiceKey: string; sampleResourceId?: string; language?: string; voiceAge?: string; timbre?: string; deliveryInstructions?: string; instructions: string }>;
+        textCount: number;
+        imageCount: number;
+        videoCount: number;
+        audioCount: number;
+    };
+};
+
 export type CanvasGenerationBatchItem = {
     id: string;
     rowId: string;
@@ -158,6 +182,7 @@ export type CanvasGenerationBatchItem = {
     retryCount: number;
     errorDetails?: string;
     costUncertain?: boolean;
+    inputSnapshot?: CanvasBatchInputSnapshot;
 };
 
 export type CanvasGenerationBatch = {
@@ -177,10 +202,15 @@ export type CanvasBatchRow = {
     id: string;
     enabled: boolean;
     inputNodeIds: string[];
+    /** Stable column IDs explicitly edited by the user, including deliberately empty cells. */
+    referenceOverrides?: string[];
     /** Text nodes selected for this row; their contents are appended to prompt. */
     textNodeIds?: string[];
     prompt: string;
     outputNodeId?: string;
+    /** Fingerprint of the inputs used when this row was last queued. */
+    generatedInputSignature?: string;
+    inputChanged?: boolean;
     /** AI-generated cell content keyed by column id (for aiGenerated tables). */
     cells?: Record<string, string>;
 };
@@ -206,6 +236,10 @@ export type CanvasBatchTableData = {
     rows: CanvasBatchRow[];
     /** When true, columns are AI-generated with dynamic headers. */
     aiGenerated?: boolean;
+    /** Cell overrides coexist with live column connections. */
+    referenceMode?: "cells";
+    /** 上次已应用的列输入顺序；行插入、删除及重开不重复分配引用。 */
+    referenceColumnInputs?: Record<string, string[]>;
 };
 
 export type CanvasSkillSnapshot = {
@@ -220,9 +254,42 @@ export type CanvasSkillSnapshot = {
     tags: string[];
 };
 
+/** 媒体字段沿用 metadata 原字段名，资源引用扫描和本地缓存清理可直接识别 storageKey/content。 */
+export type CanvasMediaVersionMedia = Pick<
+    CanvasNodeMetadata,
+    "content" | "storageKey" | "previewContent" | "mimeType" | "bytes" | "durationMs" | "hasAudio" | "waveform" | "waveformVersion" | "naturalWidth" | "naturalHeight" | "videoPreview" | "imageRotation" | "assetId"
+>;
+
+export type CanvasMediaVersionGeneration = Pick<CanvasNodeMetadata, "prompt" | "model" | "producedModel" | "size" | "quality" | "seconds" | "references" | "taskId" | "taskDurationMs">;
+
+export type CanvasMediaVersion = {
+    id: string;
+    /** 展示为 V1、V2…，按创建顺序递增。 */
+    number: number;
+    createdAt: string;
+    source: "generate" | "upload";
+    media: CanvasMediaVersionMedia;
+    generation?: CanvasMediaVersionGeneration;
+};
+
+/**
+ * 从短剧投送到精修画布的对象：设定参考图（cast）、剧情段（segment，挂在段框与段视频上）、成片（final）。
+ * 采用到短剧、侧栏定位和“短剧侧已更新”提示都依赖它；画布只保存绑定与投送时的快照，短剧数据以服务端为准。
+ */
+export type CanvasDramaRef = {
+    projectId: string;
+    kind: "cast" | "segment" | "final";
+    id: string;
+    episodeId?: string;
+    segmentIndex?: number;
+    /** 投送或最近一次同步时短剧侧的当前资源；短剧现状与它不同且与节点媒体也不同，说明短剧侧已更新。 */
+    baseResourceId?: string;
+};
+
 export type CanvasNodeMetadata = {
     /** Credential-free editable generation contract; submitted recipes live with tasks. */
     generationSpec?: GenerationSpec;
+    dramaRef?: CanvasDramaRef;
     /** Namespaced extension ownership for nodes contributed by a unified plugin. */
     pluginId?: string;
     pluginNodeId?: string;
@@ -247,6 +314,12 @@ export type CanvasNodeMetadata = {
           };
     content?: string;
     previewContent?: string;
+    /** Original file and immutable pixel-corrected variants; references share the current content/storageKey. */
+    imageRotation?: {
+        quarterTurns: 0 | 1 | 2 | 3;
+        original: { content: string; storageKey?: string; width: number; height: number; bytes?: number; mimeType?: string };
+        variants?: Partial<Record<1 | 2 | 3, { content: string; storageKey: string; width: number; height: number; bytes: number; mimeType: string }>>;
+    };
     videoPreview?: {
         content: string;
         storageKey?: string;
@@ -287,7 +360,11 @@ export type CanvasNodeMetadata = {
     /** 当前画布节点覆盖的工作流动态字段，键为 source:* 或 field:nodeId:fieldName。 */
     workflowParameters?: Record<string, unknown>;
     size?: string;
+    /** 图片尺寸来源：user 为用户在图像设置中选择；default / reference 为模型默认值或参考图比例填入，图生图时继续跟随参考图。缺省且已有 size 按用户选择处理。 */
+    imageSizeSource?: "user" | "default" | "reference";
     quality?: string;
+    imageResolution?: string;
+    imageParameters?: string;
     transparentBackground?: string;
     count?: number;
     textCount?: number;
@@ -376,6 +453,9 @@ export type CanvasNodeMetadata = {
     mimeType?: string;
     bytes?: number;
     durationMs?: number;
+    /** Normalized waveform peak samples (0..1) for audio visualization. */
+    waveform?: number[];
+    waveformVersion?: number;
     /** Whether the video file contains an audio track when this is known. */
     hasAudio?: boolean;
     assetId?: string;
@@ -454,6 +534,15 @@ export type CanvasNodeMetadata = {
         effectKey?: string;
     };
     sessionId?: string;
+    /** 视频画质增强任务参数；重试按这里重建请求，而不是沿用源节点的生成配置。 */
+    videoEnhance?: {
+        sourceNodeId: string;
+        model: string;
+        resolution: string;
+        fps?: number;
+        bitrateLevel?: "low" | "medium" | "high";
+        bitrate?: number;
+    };
     videoEditOperation?: CanvasVideoEditOperation;
     arkPrivateAssetUpload?: string;
     videoCameraMoveId?: string;
@@ -465,12 +554,18 @@ export type CanvasNodeMetadata = {
     versionOfNodeId?: string;
     versionLabel?: string;
     versionPrimary?: boolean;
+    /** 节点内媒体版本历史；切换版本只替换媒体字段，节点 ID 与连线保持不变。 */
+    mediaVersions?: CanvasMediaVersion[];
+    currentMediaVersionId?: string;
     copiedFromNodeId?: string;
+    /** Explicit editing copy; subsequent orientation tools modify this node in place. */
+    imageEditSourceNodeId?: string;
     generationResultPlacement?: "replace-node" | "new-version";
     previsSceneId?: string;
     previsShotId?: string;
     previsPreviewNodeId?: string;
     previsDepthNodeId?: string;
+    previsDepthVideoNodeId?: string;
     previsNormalNodeId?: string;
     previsClayVideoNodeId?: string;
     subtitleEntries?: SrtEntry[];
@@ -487,6 +582,8 @@ export type CanvasNodeMetadata = {
     mediaConversion?: MediaConversionNodeState;
     /** 用户手动拉伸过尺寸；图片按真实比例自动适配时避让它。 */
     manualSize?: boolean;
+    /** 用户手动改过节点名称；原位重新生成时保留，不再换成提示词摘要。 */
+    manualTitle?: boolean;
     storyboard?: StoryboardData;
     storyboardShotDuration?: StoryboardShotDuration;
     storyboardShotCount?: StoryboardShotCount;
@@ -498,10 +595,16 @@ export type CanvasNodeMetadata = {
     batchRowId?: string;
     batchOperation?: CanvasBatchOperation;
     batchInputNodeIds?: string[];
+    /** 本次批量生成准备时的输入签名；不代表旧缩略图已采用这些输入。 */
+    batchInputSignature?: string;
+    /** 只有成功媒体写入后才记录，等待或失败时保持空缺。 */
+    batchResultInputSignature?: string;
     frame?: {
         collapsed: boolean;
         expandedWidth: number;
         expandedHeight: number;
+        /** 语义色名（如 Agent 搭看板时按幕着色），具体颜色由主题样式映射。 */
+        color?: CanvasFrameColor;
     };
     folder?: {
         style: CanvasFolderStyle;

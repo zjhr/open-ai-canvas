@@ -27,6 +27,26 @@ func (r *Repository) HistoricalSystemChannelReferences() ([]model.ModelChannel, 
 	return channels, err
 }
 
+// CatalogProviderChannelCounts 统计每个目录服务商已接入的系统渠道数量。
+func (r *Repository) CatalogProviderChannelCounts() (map[string]int64, error) {
+	var rows []struct {
+		CatalogProviderID string
+		Count             int64
+	}
+	if err := r.db.Model(&model.ModelChannel{}).
+		Select("catalog_provider_id, count(*) as count").
+		Where("scope = ? AND catalog_provider_id <> ''", model.ChannelScopeSystem).
+		Group("catalog_provider_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		result[row.CatalogProviderID] = row.Count
+	}
+	return result, nil
+}
+
 func (r *Repository) AdminSystemChannels(keyword string, status string, limit int, offset int) ([]model.ModelChannel, int64, error) {
 	var channels []model.ModelChannel
 	var total int64
@@ -127,6 +147,13 @@ func (r *Repository) SystemSettingOptional(key string) (*model.SystemSetting, er
 
 func (r *Repository) SaveSystemSetting(setting *model.SystemSetting) error {
 	return r.db.Save(setting).Error
+}
+
+func (r *Repository) SystemSettingsWithPrefix(prefix string, limit int) ([]model.SystemSetting, error) {
+	var settings []model.SystemSetting
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	err := r.db.Where(`key LIKE ? ESCAPE '\'`, escaped+"%").Order("updated_at desc").Limit(limit).Find(&settings).Error
+	return settings, err
 }
 
 func (r *Repository) SaveSystemSettings(settings ...*model.SystemSetting) error {

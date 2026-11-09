@@ -71,6 +71,9 @@ func (w *taskLifecycleCoordinator) retryTask(userID string, id string) (*model.T
 	if err := json.Unmarshal([]byte(decryptedInput), &billingInput); err != nil {
 		return nil, err
 	}
+	if err := s.requireTaskGenerationFeatures(userID, task.ProjectID, task.Type, task.Operation, task.WorkbenchKind, billingInput); err != nil {
+		return nil, err
+	}
 	if err := s.prepareLogicalTaskRetry(task, billingInput); err != nil {
 		return nil, err
 	}
@@ -88,7 +91,10 @@ func (w *taskLifecycleCoordinator) retryTask(userID string, id string) (*model.T
 	if err := s.ensureTaskProjectActive(userID, task.ProjectID); err != nil {
 		return nil, err
 	}
-	task, err = s.repo.RetryTaskWithBilling(userID, task, billingOrder, policy.Task.ActiveTaskLimit)
+	task, err = s.repo.RetryTaskWithBilling(userID, task, billingOrder, policy.Task.ActiveTaskLimit, authorizeRetryBillingRelease)
+	if errors.Is(err, repository.ErrTaskBillingReview) {
+		return nil, BadAuthRequest("上一次调用费用仍在核对中，处理完成前不能重复提交")
+	}
 	if errors.Is(err, repository.ErrInsufficientCredits) {
 		return nil, BadAuthRequest("积分不足，请先使用兑换码充值")
 	}
@@ -103,6 +109,34 @@ func (w *taskLifecycleCoordinator) retryTask(userID string, id string) (*model.T
 	}
 	_ = s.log(userID, task.ID, "info", "任务已重新入队", "")
 	return taskForOutput(*task), nil
+}
+
+// 只使用锁定的旧执行证据授权释放；缺少诊断或上游状态不明不能推断为未提交。
+func authorizeRetryBillingRelease(repo *repository.Repository, task *model.Task, order *model.BillingOrder) error {
+	diagnostic := taskExecutionDiagnostic(task)
+	if task.MediaRecoveryJSON != "" || task.ResultJSON != "" || task.TextDraft != "" ||
+		task.ProviderCancelStatus == model.ProviderCancelStatusRequested || task.ProviderCancelStatus == model.ProviderCancelStatusUncertain ||
+		(diagnostic != nil && (diagnostic.Code == "result_persistence_failed" || diagnostic.RetryClass == "recover_result")) {
+		return repository.ErrTaskBillingReview
+	}
+	hasSuccessfulCall, err := repo.BillingOrderHasSuccessfulBillableCall(order.ID)
+	if err != nil {
+		return err
+	}
+	if hasSuccessfulCall {
+		return repository.ErrTaskBillingReview
+	}
+	if diagnostic != nil && !diagnostic.TaskSubmitted && diagnostic.SubmissionOutcome == "not_submitted" && task.ProviderRequestID == "" && order.ProviderRequestID == "" {
+		return nil
+	}
+	terminalFailure, err := repo.BillingOrderHasTerminalFailure(order.ID)
+	if err != nil {
+		return err
+	}
+	if !terminalFailure {
+		return repository.ErrTaskBillingReview
+	}
+	return nil
 }
 
 func (w *taskLifecycleCoordinator) cancelTask(ctx context.Context, userID string, id string) (*model.Task, error) {
@@ -133,7 +167,7 @@ func (w *taskLifecycleCoordinator) cancelTaskWithIntent(_ context.Context, userI
 	// 用户一旦看到任务进入上游提交/生成阶段，即使 request ID 尚未来得及写回，
 	// 也必须按“可能已经产生上游费用”处理。父任务失败和 worker context 属于
 	// 内部协调，仍需继续走下面的上游取消/对账流程，不能被这条 UI 规则截断。
-	if intent.Source == model.TaskCancellationUserRequest && (strings.TrimSpace(task.ProviderRequestID) != "" || task.MediaStage != "" || !taskStageAllowsUserCancellation(task.Status, task.Stage)) {
+	if intent.Source == model.TaskCancellationUserRequest && taskUpstreamSubmitted(task) {
 		return nil, BadAuthRequest("第三方请求已提交，任务不可取消")
 	}
 	originalStatus := task.Status
@@ -208,6 +242,12 @@ func (w *taskLifecycleCoordinator) cancelTaskWithIntent(_ context.Context, userI
 	}
 
 	return taskForOutput(*task), nil
+}
+
+// taskUpstreamSubmitted 表示任务已进入上游提交/生成阶段，可能已经产生上游费用。
+// 调用方应先 hydrateTaskProviderRequestID，避免 request ID 尚未写回时误判。
+func taskUpstreamSubmitted(task *model.Task) bool {
+	return strings.TrimSpace(task.ProviderRequestID) != "" || task.MediaStage != "" || !taskStageAllowsUserCancellation(task.Status, task.Stage)
 }
 
 func taskStageAllowsUserCancellation(status model.TaskStatus, stage string) bool {

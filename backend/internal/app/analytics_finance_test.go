@@ -115,6 +115,17 @@ func TestAdminAnalyticsFinanceUsesSettledSnapshotsAndDeduplicates(t *testing.T) 
 	if finance.SettledOrders != 4 || finance.CostedOrders != 3 || finance.RevenueMicrocredits != 1_400_000 || finance.CostMicrocredits != 600_000 || finance.ProfitMicrocredits != nil || finance.ProfitMargin != nil {
 		t.Fatalf("partial finance = %+v", finance)
 	}
+	// 请求指标只计 create：6 个订单首条 + retry、wrong-user、old-channel；轮询、下载等辅助阶段不计入。
+	if result.KPI.UpstreamRequests != 9 {
+		t.Fatalf("upstream requests = %d, want 9", result.KPI.UpstreamRequests)
+	}
+	var consumed int64
+	for _, point := range result.Trend {
+		consumed += point.ConsumedMicrocredits
+	}
+	if consumed != finance.RevenueMicrocredits {
+		t.Fatalf("trend consumed = %d, want %d", consumed, finance.RevenueMicrocredits)
+	}
 	for _, row := range result.Models {
 		f := row.Finance
 		switch row.Model {
@@ -209,7 +220,7 @@ func TestAdminReferencesIncludeExistingDisplayNameGroups(t *testing.T) {
 			groups[name]++
 		}
 	}
-	if len(groups) != 3 || groups["Shared"] != 1 || groups["Other"] != 1 || groups["d"] != 1 {
+	if len(groups) != 2 || groups["Shared"] != 1 || groups["Other"] != 1 {
 		t.Fatalf("groups = %#v", groups)
 	}
 }

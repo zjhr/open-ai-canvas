@@ -146,9 +146,10 @@ func (s *Service) comparePaymentReconciliation(ctx context.Context, provider pay
 			return nil, 0, 0, 0, err
 		}
 		item.PaymentOrderID = order.ID
-		if record.AmountFen != order.AmountFen || record.Currency != order.Currency {
+		// 渠道账单记录的是实收金额，按订单的实收快照比对。
+		if record.AmountFen != order.ChargeAmountFen || record.Currency != order.ChargeCurrency {
 			item.Result = model.PaymentReconciliationAmountMismatch
-			item.Detail = fmt.Sprintf("渠道金额 %d %s，本地金额 %d %s", record.AmountFen, record.Currency, order.AmountFen, order.Currency)
+			item.Detail = fmt.Sprintf("渠道金额 %d %s，本地实收金额 %d %s", record.AmountFen, record.Currency, order.ChargeAmountFen, order.ChargeCurrency)
 			items = append(items, item)
 			failed++
 			continue
@@ -187,9 +188,9 @@ func (s *Service) comparePaymentReconciliation(ctx context.Context, provider pay
 			failed++
 			continue
 		}
-		if confirmed.AmountFen != order.AmountFen || confirmed.Currency != order.Currency {
+		if confirmed.AmountFen != order.ChargeAmountFen || confirmed.Currency != order.ChargeCurrency {
 			item.Result = model.PaymentReconciliationAmountMismatch
-			item.Detail = fmt.Sprintf("签名查单金额 %d %s，本地金额 %d %s", confirmed.AmountFen, confirmed.Currency, order.AmountFen, order.Currency)
+			item.Detail = fmt.Sprintf("签名查单金额 %d %s，本地实收金额 %d %s", confirmed.AmountFen, confirmed.Currency, order.ChargeAmountFen, order.ChargeCurrency)
 			items = append(items, item)
 			failed++
 			continue
@@ -208,17 +209,21 @@ func (s *Service) comparePaymentReconciliation(ctx context.Context, provider pay
 		if paidAt.IsZero() {
 			paidAt = billDate.Add(12 * time.Hour)
 		}
-		_, _, creditErr := s.repo.CompletePaymentOrder(run.ProviderID, merchantOrderNo, repository.PaymentEvidence{
+		recoveredOrder, granted, creditErr := s.repo.CompletePaymentOrder(run.ProviderID, merchantOrderNo, repository.PaymentEvidence{
 			ProviderTradeNo: confirmed.ProviderTradeNo, ProviderStatus: confirmed.ProviderStatus,
 			AmountFen: confirmed.AmountFen, Currency: confirmed.Currency, PaidAt: paidAt,
 		})
 		if creditErr != nil {
 			item.Result = model.PaymentReconciliationCreditFailed
-			item.Detail = "渠道账单确认已支付，但自动补发积分失败：" + safePaymentError(creditErr)
+			item.Detail = "渠道账单确认已支付，但自动补发权益失败：" + safePaymentError(creditErr)
 			items = append(items, item)
 			failed++
 			continue
 		}
+		if granted {
+			s.afterStorageOrderGranted(recoveredOrder)
+		}
+		s.grantReferralCommission(recoveredOrder)
 		item.Result = model.PaymentReconciliationRecovered
 		item.Resolved = true
 		item.Detail = "已根据渠道账单自动补发积分"
@@ -236,7 +241,7 @@ func (s *Service) comparePaymentReconciliation(ctx context.Context, provider pay
 		items = append(items, model.PaymentReconciliationItem{
 			ID: newID(), RunID: run.ID, ProviderID: run.ProviderID, PaymentOrderID: order.ID,
 			MerchantOrderNo: order.MerchantOrderNo, ProviderTradeNo: tradeNo,
-			AmountFen: order.AmountFen, Currency: order.Currency,
+			AmountFen: order.ChargeAmountFen, Currency: order.ChargeCurrency,
 			Result: model.PaymentReconciliationProviderRecordMissing,
 			Detail: "本地订单已入账，但渠道成功交易账单中未找到对应记录", CreatedAt: time.Now(),
 		})

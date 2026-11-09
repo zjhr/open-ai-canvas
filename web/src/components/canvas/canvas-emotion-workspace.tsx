@@ -2,6 +2,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { LoaderCircle, ScanFace, SquareDashedMousePointer, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { CanvasNodeEmotionPanel, type CanvasEmotionCharacter, type CanvasImageEmotionPayload } from "@/components/canvas/canvas-node-emotion-panel";
 import { CanvasNodePanelOverlay } from "@/components/canvas/canvas-workspace-overlays";
@@ -27,6 +28,7 @@ type CanvasEmotionWorkspaceProps = {
 };
 
 export function CanvasEmotionWorkspace({ node, viewport, containerRef, dragOffset, isDragging = false, onClose, onConfirm }: CanvasEmotionWorkspaceProps) {
+    const { t } = useTranslation();
     const dataUrl = node.metadata?.content || "";
     const [status, setStatus] = useState<WorkspaceStatus>("detecting");
     const [faces, setFaces] = useState<CanvasFaceBox[]>([]);
@@ -55,15 +57,15 @@ export function CanvasEmotionWorkspace({ node, viewport, containerRef, dragOffse
                     return;
                 }
                 setStatus("error");
-                setError("未识别到清晰人脸，请手动框选");
+                setError(t("canvasA.emotion.noFace"));
             })
             .catch((reason) => {
                 if (reason instanceof DOMException && reason.name === "AbortError") return;
                 setStatus("error");
-                setError(reason instanceof Error ? `${reason.message}，请手动框选` : "人脸识别失败，请手动框选");
+                setError(reason instanceof Error ? t("canvasA.emotion.detectFailedWithReason", { reason: reason.message }) : t("canvasA.emotion.detectFailed"));
             });
         return () => controller.abort();
-    }, [dataUrl]);
+    }, [dataUrl, t]);
 
     const selectFace = (face: CanvasFaceBox) => {
         const existing = characters.find((character) => sameFace(character.faceBox, face));
@@ -73,7 +75,7 @@ export function CanvasEmotionWorkspace({ node, viewport, containerRef, dragOffse
             return;
         }
         const index = characters.length + 1;
-        const character = { id: `character-${face.id}`, name: node.metadata?.characterName && !characters.length ? node.metadata.characterName : `角色${index}`, faceBox: face };
+        const character = { id: `character-${face.id}`, name: node.metadata?.characterName && !characters.length ? node.metadata.characterName : t("canvasA.emotion.defaultCharacter", { index }), faceBox: face };
         setCharacters((current) => [...current, character]);
         setActiveCharacterId(character.id);
         setStatus("editing");
@@ -107,7 +109,7 @@ export function CanvasEmotionWorkspace({ node, viewport, containerRef, dragOffse
             });
         } catch (reason) {
             setStatus("editing");
-            setError(reason instanceof Error ? reason.message : "生成前处理失败");
+            setError(reason instanceof Error ? reason.message : t("canvasA.emotion.prepareFailed"));
         }
     };
 
@@ -193,6 +195,7 @@ function FaceSelectionOverlay({
     onManualComplete: (box: CanvasFaceBox) => void;
     onFaceSelect: (box: CanvasFaceBox) => void;
 }) {
+    const { t } = useTranslation();
     const theme = canvasThemes[useActiveTheme()];
     const overlayRef = useRef<HTMLDivElement>(null);
     const dragStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -287,7 +290,7 @@ function FaceSelectionOverlay({
                     <motion.button
                         key={face.id}
                         type="button"
-                        aria-label={selected ? `选择${selected.name}` : "选择此人脸"}
+                        aria-label={selected ? t("canvasA.emotion.selectNamed", { name: selected.name }) : t("canvasA.emotion.selectFace")}
                         className={`absolute rounded-[var(--r-md)] border-2 ${interactive ? "pointer-events-auto" : "pointer-events-none"}`}
                         style={{
                             left: `${(face.x / imageWidth) * 100}%`,
@@ -308,7 +311,7 @@ function FaceSelectionOverlay({
                     >
                         {selected ? (
                             <span
-                                className="absolute -top-2.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full px-1.5 py-0.5 text-[var(--fs-micro)] font-semibold"
+                                className="absolute -top-2.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full px-2 py-0.5 text-[var(--fs-micro)] font-semibold"
                                 style={{ background: active ? theme.accent.primary : "rgba(20,20,22,.82)", color: active ? theme.accent.onPrimary : "#ffffff" }}
                             >
                                 {selected.name}
@@ -352,12 +355,14 @@ function SelectionToolbar({
     onManualSelect: () => void;
     onClose: () => void;
 }) {
+    const { t } = useTranslation();
     const theme = canvasThemes[useActiveTheme()];
     const reducedMotion = useReducedMotion();
     const toolbarRef = useRef<HTMLDivElement>(null);
     useScreenAnchor(toolbarRef, node, viewport, containerRef, (next, container) => toolbarScreenRect(node, next, container, toolbarRef.current));
     if (status === "editing" || status === "generating") return null;
-    const label = status === "detecting" ? "正在识别人脸" : status === "manual" ? "拖动鼠标框选需要调节的人脸" : status === "selecting" ? `识别到 ${faceCount} 张人脸，请选择人物` : error || "请选择人物";
+    const label =
+        status === "detecting" ? t("canvasA.emotion.detecting") : status === "manual" ? t("canvasA.emotion.manualHint") : status === "selecting" ? t("canvasA.emotion.facesFound", { count: faceCount }) : error || t("canvasA.emotion.choosePerson");
     return (
         <SpotlightSurface
             ref={toolbarRef}
@@ -371,7 +376,7 @@ function SelectionToolbar({
             onPointerDown={(event) => event.stopPropagation()}
         >
             <div className="flex size-full items-center">
-                <button type="button" aria-label="关闭情绪调节" className="grid size-8 shrink-0 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/10" onClick={onClose}>
+                <button type="button" aria-label={t("canvasA.emotion.close")} className="grid size-8 shrink-0 place-items-center rounded-full hover:bg-black/5 dark:hover:bg-white/10" onClick={onClose}>
                     <X className="size-4" />
                 </button>
                 <span className="mx-2 h-5 w-px" style={{ background: theme.toolbar.border }} />
@@ -380,13 +385,9 @@ function SelectionToolbar({
                 </span>
                 <span className="min-w-0 flex-1 truncate px-2 text-[var(--fs-label)] font-medium leading-none">{label}</span>
                 {status !== "detecting" ? (
-                    <button
-                        type="button"
-                        className="flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--dock-item-radius)] px-2 text-[var(--fs-label)] font-medium leading-none transition hover:bg-black/5 dark:hover:bg-white/10"
-                        onClick={onManualSelect}
-                    >
+                    <button type="button" className="flex h-8 shrink-0 items-center gap-2 rounded-[var(--dock-item-radius)] px-2 text-[var(--fs-label)] font-medium leading-none transition hover:bg-black/5 dark:hover:bg-white/10" onClick={onManualSelect}>
                         <SquareDashedMousePointer className="size-3.5" />
-                        手动框选
+                        {t("canvasA.emotion.manualSelect")}
                     </button>
                 ) : null}
             </div>

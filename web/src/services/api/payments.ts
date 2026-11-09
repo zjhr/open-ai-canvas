@@ -10,16 +10,35 @@ export type PaymentProvider = {
     pluginEnabled: boolean;
     configured: boolean;
     closeAfterMinutes: number;
+    /** 渠道实际收款货币；商品货币不同时后端按汇率换算实收金额。仅用户端列表返回。 */
+    settlementCurrency?: PaymentCurrency;
+    /** 渠道内已启用的支付方式（如易支付的支付宝、微信支付）；为空表示不需要选择。 */
+    methods?: PaymentMethod[];
+};
+
+export type PaymentMethod = {
+    id: string;
+    name: string;
+    /** 品牌图标键，例如 brand:alipay。 */
+    icon?: string;
 };
 
 export type TopupSaleStrategy = "unlimited" | "periodic" | "inventory" | "timed";
+
+/** credits 发放积分；storage 扩容账号文件容量，storageDurationDays 为 0 表示永久。 */
+export type TopupProductKind = "credits" | "storage";
 
 export type TopupProduct = {
     id: string;
     name: string;
     description?: string;
+    kind: TopupProductKind;
+    /** 售价，单位是 currency 的最小单位（分 / 美分）。 */
     amountFen: number;
+    currency: PaymentCurrency;
     creditsMicrocredits: number;
+    storageBytes: number;
+    storageDurationDays: number;
     enabled: boolean;
     sortOrder: number;
     saleStrategy: TopupSaleStrategy;
@@ -45,10 +64,19 @@ export type PaymentOrder = {
     merchantOrderNo: string;
     productId: string;
     productName: string;
+    productKind: TopupProductKind;
     providerId: string;
+    paymentMethod?: string;
+    /** 商品售价快照。 */
     amountFen: number;
     currency: "CNY" | string;
+    /** 向渠道实际收取的金额与货币；跨币种时由 exchangeRate（1 USD 兑换的 CNY）换算。 */
+    chargeAmountFen: number;
+    chargeCurrency: string;
+    exchangeRate?: string;
     creditsMicrocredits: number;
+    storageBytes?: number;
+    storageDurationDays?: number;
     status: PaymentOrderStatus;
     providerStatus?: string;
     providerTradeNo?: string;
@@ -68,12 +96,14 @@ export type PaymentOrder = {
 
 export type PaymentConfigField = {
     name: string;
-    type: "string" | "password" | "textarea" | "url" | string;
+    type: "string" | "password" | "textarea" | "url" | "multiselect" | string;
     label?: string;
     required?: boolean;
     secret?: boolean;
     default?: unknown;
     description?: string;
+    /** 可选值：string 字段渲染为单选，multiselect 字段渲染为可输入自定义值的多选（逗号分隔保存）。 */
+    values?: string[];
 };
 
 export type AdminPaymentProvider = PaymentProvider & {
@@ -94,7 +124,7 @@ export function listTopupProducts() {
     return http.get<{ products: TopupProduct[] }>("/payments/products");
 }
 
-export function createPaymentOrder(input: { productId: string; providerId: string; idempotencyKey: string }) {
+export function createPaymentOrder(input: { productId: string; providerId: string; method?: string; idempotencyKey: string }) {
     return http.post<{ order: PaymentOrder }>("/payments/orders", input);
 }
 
@@ -122,11 +152,31 @@ export function updateAdminPaymentProvider(id: string, input: { enabled: boolean
     return http.put<{ provider: AdminPaymentProvider }>(`/admin/payments/providers/${encodeURIComponent(id)}/config`, input);
 }
 
+export type PaymentCurrency = "CNY" | "USD";
+/** usdCnyRate 是 1 USD 兑换的 CNY（十进制字符串），为空表示未配置，跨币种渠道不可下单。 */
+export type PaymentSettings = { defaultCurrency: PaymentCurrency; usdCnyRate: string };
+
+export function getPaymentSettings() {
+    return http.get<{ settings: PaymentSettings }>("/payments/settings");
+}
+export function getAdminPaymentSettings() {
+    return http.get<{ settings: PaymentSettings }>("/admin/payments/settings");
+}
+export function updateAdminPaymentSettings(input: PaymentSettings) {
+    return http.put<{ settings: PaymentSettings }>("/admin/payments/settings", input);
+}
+
+/** 按货币格式化最小单位金额：CNY → ¥12.00，USD → $12.00。 */
+export function formatPaymentAmount(amountMinor: number, currency?: string) {
+    const symbol = currency === "USD" ? "$" : "¥";
+    return `${symbol}${(amountMinor / 100).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 export function listAdminTopupProducts() {
     return http.get<{ products: TopupProduct[] }>("/admin/payments/products");
 }
 
-export type TopupProductInput = Pick<TopupProduct, "name" | "amountFen" | "creditsMicrocredits" | "enabled" | "sortOrder" | "saleStrategy"> & {
+export type TopupProductInput = Pick<TopupProduct, "name" | "kind" | "amountFen" | "currency" | "creditsMicrocredits" | "storageBytes" | "storageDurationDays" | "enabled" | "sortOrder" | "saleStrategy"> & {
     description?: string;
     periodDays?: number;
     periodPurchaseLimit?: number;

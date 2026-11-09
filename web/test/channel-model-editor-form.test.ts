@@ -18,6 +18,12 @@ const protocols = [definition("disabled-text", "text", false), definition("text"
 const protocolsWithAudio = [...protocols, definition("audio", "audio")];
 
 describe("channel model editor drafts", () => {
+    test("new drafts use 未分类 and imported drafts display the upstream ID without overwriting custom names", () => {
+        expect(initialChannelModelValues(null, protocols).displayName).toBe("未分类");
+        const imported = { modelKey: "product-id", providerModelKey: "upstream-id", displayName: "未分类", channelLabel: "", priceTiers: [] } as unknown as ChannelModel;
+        expect(initialChannelModelValues(imported, protocols)).toMatchObject({ displayName: "未分类", channelLabel: "upstream-id" });
+        expect(initialChannelModelValues({ ...imported, displayName: "product-id", channelLabel: "手动命名" }, protocols)).toMatchObject({ displayName: "product-id", channelLabel: "手动命名" });
+    });
     test("Kemei Seedream selection initializes the image profile and preserves pricing", () => {
         const draft = initialChannelModelValues(null, protocols);
         draft.priceTiers[0].unitPrice = 19;
@@ -223,6 +229,25 @@ describe("pricing write validation", () => {
         }
         expect(() => validateChannelModelPrices({ ...draft, capability: "video", protocol: "volcengine-ark-video", priceTiers: [{ ...defaultPriceTier("advanced"), operation: "image_to_video" }] })).not.toThrow();
         expect(() => validateChannelModelPrices({ ...draft, capability: "video", protocol: "volcengine-ark-video", priceTiers: [{ ...defaultPriceTier("advanced"), resolution: "1080p" }] })).not.toThrow();
+    });
+    test("requires reference video prices only when reference video billing is enabled", () => {
+        const video = { ...draft, capability: "video" as const, protocol: "volcengine-ark-video" };
+        const perSecond = [{ ...defaultPriceTier(), billingMode: "per_second" as const, unitPrice: 1 }];
+        const token = [{ ...defaultPriceTier(), billingMode: "token" as const, outputTokenPrice: 16 }];
+        expect(draft.referenceVideoBilling).toBe(false);
+        expect(() => validateChannelModelPrices({ ...video, priceTiers: perSecond })).not.toThrow();
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: perSecond })).toThrow("带参考视频");
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: token })).toThrow("带参考视频");
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: [{ ...perSecond[0], referenceVideoUnitPrice: 2 }] })).not.toThrow();
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: [{ ...token[0], referenceVideoOutputTokenPrice: 32 }] })).not.toThrow();
+        // 配置了成本价的档也要填写带参考视频成本价；未配置成本时不要求。
+        const pricedPerSecond = { ...perSecond[0], referenceVideoUnitPrice: 2, costConfigured: true, costUnitPrice: 0.5 };
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: [pricedPerSecond] })).toThrow("带参考视频的成本价");
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: [{ ...pricedPerSecond, costReferenceVideoUnitPrice: 0.8 }] })).not.toThrow();
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: false, priceTiers: [pricedPerSecond] })).not.toThrow();
+        // 免费档和非视频模型不要求带参考视频价格。
+        expect(() => validateChannelModelPrices({ ...video, referenceVideoBilling: true, priceTiers: [{ ...defaultPriceTier(), billingMode: "per_second" as const }] })).not.toThrow();
+        expect(() => validateChannelModelPrices({ ...draft, capability: "audio", referenceVideoBilling: true, priceTiers: perSecond })).not.toThrow();
     });
 });
 

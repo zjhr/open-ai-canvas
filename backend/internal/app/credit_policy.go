@@ -28,7 +28,7 @@ type PublicCreditPolicy struct {
 }
 
 func defaultCreditPolicy() CreditPolicy {
-	return CreditPolicy{SignupBonusMicrocredits: 100 * CreditScale, CheckinBonusMicrocredits: 10 * CreditScale, DefaultMultiplierBPS: 10_000, ModelMultiplierBPS: map[string]int64{}}
+	return CreditPolicy{SignupBonusMicrocredits: 0, CheckinBonusMicrocredits: 0, DefaultMultiplierBPS: 10_000, ModelMultiplierBPS: map[string]int64{}}
 }
 
 func validateCreditPolicy(policy CreditPolicy) error {
@@ -49,6 +49,7 @@ func validateCreditPolicy(policy CreditPolicy) error {
 	return nil
 }
 
+// 积分策略直接读取数据库，避免关闭赠送后其他实例继续沿用旧额度。
 func (s *Service) creditPolicy() (CreditPolicy, error) {
 	setting, err := s.repo.SystemSetting(creditPolicySettingKey)
 	if errors.Is(err, gorm.ErrRecordNotFound) {

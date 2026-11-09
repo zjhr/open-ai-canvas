@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"image"
 	"io"
-	"math"
+	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +21,57 @@ import (
 
 const mediaStagingBudget int64 = 512 << 20
 const mediaStagingTTL = 24 * time.Hour
+
+var errMediaStagingFull = errors.New("作品暂存空间不足")
+
+// 单次结果下载的时限：上游慢但一直在传输时允许跑完，长时间收不到任何字节才判定卡住。
+// 原来的固定 3 分钟总时限会让慢速结果服务器上的大图永远下载不完——每次重试都从零开始，
+// 又在差不多同一位置超时。总时限仍有上限，避免一个下载长期占住有限的保存并发槽位。
+var (
+	mediaDownloadMaxDuration  = 15 * time.Minute
+	mediaDownloadStallTimeout = 90 * time.Second
+)
+
+// errMediaDownloadStalled 包装 DeadlineExceeded，保证停滞与总超时一样按可重试的保存失败处理。
+var errMediaDownloadStalled = fmt.Errorf("结果下载长时间没有进度：%w", context.DeadlineExceeded)
+
+// mediaDownloadProgress 每收到一段数据就重置停滞计时。
+type mediaDownloadProgress struct {
+	reader io.Reader
+	stall  *time.Timer
+}
+
+func (p mediaDownloadProgress) Read(buffer []byte) (int, error) {
+	n, err := p.reader.Read(buffer)
+	if n > 0 {
+		p.stall.Reset(mediaDownloadStallTimeout)
+	}
+	return n, err
+}
+
+// mediaDownloadError 把停滞看门狗触发的取消还原成可识别的停滞错误；其他取消（任务租约失效、
+// 服务停止）保持原样，不能被误判成上游问题。
+func mediaDownloadError(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); errors.Is(cause, errMediaDownloadStalled) {
+		return cause
+	}
+	return err
+}
+
+// mediaDownloadLogError 是写进请求明细的脱敏原因：不含地址与签名，只区分卡住、超时与其他失败。
+func mediaDownloadLogError(err error) error {
+	switch {
+	case errors.Is(err, errMediaDownloadStalled):
+		return errors.New("结果下载长时间没有进度")
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.New("结果下载超时")
+	default:
+		return errors.New("结果下载失败")
+	}
+}
+
+// mediaStagingRetainedTTL 是未完成作品检查点仍引用的暂存文件的最长保留时间。
+const mediaStagingRetainedTTL = 7 * 24 * time.Hour
 
 var mediaStagingMu sync.Mutex
 
@@ -40,6 +89,7 @@ func (s *Service) newMediaTemp(limit int64) (*os.File, error) {
 		return nil, err
 	}
 	var used int64
+	var referenced func(string) bool
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "result-") || !entry.Type().IsRegular() {
 			continue
@@ -48,16 +98,26 @@ func (s *Service) newMediaTemp(limit int64) (*os.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		if time.Since(info.ModTime()) > mediaStagingTTL {
-			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-				return nil, err
+		age := time.Since(info.ModTime())
+		if age > mediaStagingTTL {
+			// 保存未完成的任务可能只剩这一份作品（上游地址已过期），在保留期内不清理。
+			if referenced == nil && age <= mediaStagingRetainedTTL {
+				referenced = s.referencedMediaStagingNames()
 			}
-			continue
+			if age > mediaStagingRetainedTTL || !referenced(entry.Name()) {
+				if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+					return nil, err
+				}
+				continue
+			}
 		}
 		used += info.Size()
 	}
-	if limit <= 0 || limit > mediaStagingBudget || used > mediaStagingBudget-limit {
+	if limit <= 0 || limit > mediaStagingBudget {
 		return nil, errors.New("作品暂存空间不足，请稍后重试保存")
+	}
+	if used > mediaStagingBudget-limit {
+		return nil, errMediaStagingFull
 	}
 	file, err := os.CreateTemp(dir, "result-*")
 	if err != nil {
@@ -100,8 +160,12 @@ func (s *Service) downloadTaskMedia(ctx context.Context, config providerConfig, 
 		return "", "", err
 	}
 	limit := min(megabytes(policy.Resource.GeneratedFileMB), mediaStagingBudget)
-	downloadCtx, cancel := context.WithTimeout(withProviderRequestKind(ctx, "download"), 3*time.Minute)
-	defer cancel()
+	deadlineCtx, cancelDeadline := context.WithTimeout(withProviderRequestKind(ctx, "download"), mediaDownloadMaxDuration)
+	defer cancelDeadline()
+	downloadCtx, cancelStalled := context.WithCancelCause(deadlineCtx)
+	defer cancelStalled(nil)
+	stall := time.AfterFunc(mediaDownloadStallTimeout, func() { cancelStalled(errMediaDownloadStalled) })
+	defer stall.Stop()
 	req, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", "", err
@@ -118,7 +182,7 @@ func (s *Service) downloadTaskMedia(ctx context.Context, config providerConfig, 
 		logged.URL = &redactedURL
 		var safeErr error
 		if err != nil {
-			safeErr = errors.New("结果下载失败")
+			safeErr = mediaDownloadLogError(err)
 		}
 		recordProviderRequest(logged, started, statusCode, nil, safeErr)
 	}()
@@ -141,9 +205,10 @@ func (s *Service) downloadTaskMedia(ctx context.Context, config providerConfig, 
 			proxyURL = ch.ProxyURL
 		}
 	}
-	response, err := OutboundHTTPClientWithProxy(3*time.Minute, proxyURL).Do(req)
+	// 客户端总时限与上下文一致；真正决定何时放弃的是停滞看门狗。
+	response, err := OutboundHTTPClientWithProxy(mediaDownloadMaxDuration, proxyURL).Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", mediaDownloadError(downloadCtx, err)
 	}
 	defer response.Body.Close()
 	statusCode = response.StatusCode
@@ -166,9 +231,9 @@ func (s *Service) downloadTaskMedia(ctx context.Context, config providerConfig, 
 			_ = os.Remove(file.Name())
 		}
 	}()
-	size, err := io.Copy(file, io.LimitReader(response.Body, limit+1))
+	size, err := io.Copy(file, io.LimitReader(mediaDownloadProgress{reader: response.Body, stall: stall}, limit+1))
 	if err != nil {
-		return "", "", err
+		return "", "", mediaDownloadError(downloadCtx, err)
 	}
 	if size == 0 || size > limit {
 		return "", "", errors.New("生成文件为空或超过大小限制")
@@ -208,25 +273,27 @@ func mediaUploadKey(taskID string, index int) *string {
 	return &key
 }
 
-func (s *Service) storeTaskMediaFile(task *model.Task, index int, path, mimeType, kind string, existing *model.Resource) (*model.Resource, error) {
+// storeTaskMediaFile 保存一份暂存作品。fallbackCause 非 nil 表示对象存储写入失败、
+// 作品已兜底保存到本地并登记了补传任务。
+func (s *Service) storeTaskMediaFile(task *model.Task, index int, path, mimeType, kind string, existing *model.Resource) (resource *model.Resource, fallbackCause error, err error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("暂存作品不是普通文件")
+		return nil, nil, errors.New("暂存作品不是普通文件")
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 	info, err = file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("暂存作品不是普通文件")
+		return nil, nil, errors.New("暂存作品不是普通文件")
 	}
 	width, height := 0, 0
 	durationMs := int64(0)
@@ -241,22 +308,28 @@ func (s *Service) storeTaskMediaFile(task *model.Task, index int, path, mimeType
 			webp := mimeType == "image/webp" && n >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WEBP"
 			avif := mimeType == "image/avif" && n >= 16 && string(head[4:8]) == "ftyp" && (strings.Contains(string(head[8:]), "avif") || strings.Contains(string(head[8:]), "avis"))
 			if !webp && !avif {
-				return nil, fmt.Errorf("图片内容校验失败：%w", err)
+				return nil, nil, fmt.Errorf("图片内容校验失败：%w", err)
 			}
 		}
 		width, height = config.Width, config.Height
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-	} else if kind == "audio" {
-		// Audio duration is the source of truth for per-second settlement. The
-		// media can still be saved when ffprobe is unavailable; settlement then
-		// moves the order to review instead of silently charging a fake length.
-		durationMs = probeMediaDurationMs(path)
+	} else if kind == "audio" || kind == "video" {
+		// Audio and video-processing duration is the source of truth for per-second
+		// settlement. The media can still be saved when ffprobe is unavailable;
+		// settlement then falls back to provider usage or moves the order to review.
+		// Video width/height come from the same probe; unknown stays 0, never a fake size.
+		if probed, probeErr := probeMediaFile(context.Background(), path); probeErr == nil {
+			durationMs = probed.DurationMs
+			if kind == "video" {
+				width, height = probed.Width, probed.Height
+			}
+		}
 	}
 	day, err := s.reserveGeneratedResourceQuota(task.UserID, info.Size())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	committed := false
 	defer func() {
@@ -264,24 +337,33 @@ func (s *Service) storeTaskMediaFile(task *model.Task, index int, path, mimeType
 			s.releaseUserUploadQuota(task.UserID, day, info.Size())
 		}
 	}()
-	var resource *model.Resource
+	writeObject := s.taskMediaObjectWriter(task, path, &fallbackCause)
 	if existing == nil {
-		resource, _, err = s.storeResourceWithWriter(task.UserID, kind, "generated."+extensionFromMimeType(mimeType), mimeType, info.Size(), width, height, durationMs, file, mediaUploadKey(task.ID, index), false, s.storeTaskMediaObject)
+		resource, _, err = s.storeResourceWithWriter(task.UserID, kind, "generated."+extensionFromMimeType(mimeType), mimeType, info.Size(), width, height, durationMs, file, mediaUploadKey(task.ID, index), false, writeObject)
 	} else {
 		// Reuse the same object key after a failed upload; no orphan per retry.
 		resource = existing
 		if resource.UserID != task.UserID || resource.Size != info.Size() || resource.MimeType != mimeType {
-			return nil, errors.New("恢复文件与原始资源不一致")
+			return nil, nil, errors.New("恢复文件与原始资源不一致")
 		}
 		resource.DurationMs = durationMs
-		resource.ETag, err = s.storeTaskMediaObject(resource, "generated."+extensionFromMimeType(mimeType), file)
+		if kind == "video" && width > 0 && height > 0 {
+			resource.Width, resource.Height = width, height
+		}
+		resource.ETag, err = writeObject(resource, "generated."+extensionFromMimeType(mimeType), file)
 		if err == nil {
 			resource.Status, resource.Error, resource.UpdatedAt = model.ResourceStatusReady, "", time.Now()
 			err = s.saveResourceWithinStorageLimit(resource, "")
+		} else {
+			// 保留最近一次的存储错误，管理员排查时不必只看首次失败原因。
+			resource.Status, resource.Error, resource.UpdatedAt = model.ResourceStatusFailed, err.Error(), time.Now()
+			if saveErr := s.repo.SaveResource(resource); saveErr != nil {
+				err = errors.Join(err, fmt.Errorf("记录资源失败状态失败：%w", saveErr))
+			}
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s.commitUserUploadQuota(task.UserID, info.Size())
 	committed = true
@@ -289,38 +371,17 @@ func (s *Service) storeTaskMediaFile(task *model.Task, index int, path, mimeType
 		s.recordActivity(task.UserID, "resource", 1)
 		s.maybeStartPlaybackTranscode(resource)
 	}
-	return resource, nil
+	return resource, fallbackCause, nil
 }
 
-func probeMediaDurationMs(path string) int64 {
-	if strings.TrimSpace(path) == "" {
-		return 0
-	}
-	if _, err := exec.LookPath("ffprobe"); err != nil {
-		return 0
-	}
-	output, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path).Output()
-	if err != nil {
-		return 0
-	}
-	seconds, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
-	if err != nil || seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
-		return 0
-	}
-	return int64(math.Ceil(seconds * 1000))
-}
-
-// Unlike ordinary uploads, generated output preserves an OSS failure for
-// explicit recovery instead of silently changing the storage destination.
-func (s *Service) storeTaskMediaObject(resource *model.Resource, _ string, body io.Reader) (string, error) {
-	if resource.Provider == "local" {
-		return "", writeLocalResourceObject(filepath.Join(s.dataDir, "resources", filepath.FromSlash(resource.ObjectKey)), body)
-	}
+// storeTaskMediaObjectContext 直传对象存储。是否改存本地由 taskMediaObjectWriter
+// 决定：只有平台存储失败才会兜底，并且总会登记补传任务，不会静默改变存储位置。
+func (s *Service) storeTaskMediaObjectContext(ctx context.Context, resource *model.Resource, body io.Reader) (string, error) {
 	setting, err := s.ossSettingForResource(resource.UserID, resource)
 	if err != nil {
 		return "", err
 	}
-	return putOSSObject(s.storageSettingWithRuntimePolicy(setting), resource.ObjectKey, resource.MimeType, resource.Size, body)
+	return putOSSObjectContext(ctx, s.storageSettingWithRuntimePolicy(setting), resource.ObjectKey, resource.MimeType, resource.Size, body)
 }
 
 // Cleanup is best effort only after durable completion. Expired leftovers are
@@ -337,4 +398,33 @@ func (s *Service) cleanupMediaCheckpointFiles(task *model.Task) {
 			}
 		}
 	}
+}
+
+// referencedMediaStagingNames 判断暂存文件是否仍被未完成的作品检查点引用。查询失败时
+// 把所有文件都视为仍被引用：宁可多占暂存空间，也不删掉可能是唯一副本的作品。
+func (s *Service) referencedMediaStagingNames() func(string) bool {
+	names := map[string]bool{}
+	afterID := ""
+	for {
+		tasks, err := s.repo.TasksWithPendingMediaCheckpoint(time.Now().Add(-mediaStagingRetainedTTL), afterID, 500)
+		if err != nil {
+			slog.Warn("media staging reference query failed", "error", err)
+			return func(string) bool { return true }
+		}
+		for index := range tasks {
+			checkpoint, err := s.decodeMediaCheckpoint(&tasks[index])
+			if err == nil {
+				for _, item := range checkpoint.Items {
+					if item.TempName != "" {
+						names[item.TempName] = true
+					}
+				}
+			}
+		}
+		if len(tasks) < 500 {
+			break
+		}
+		afterID = tasks[len(tasks)-1].ID
+	}
+	return func(name string) bool { return names[name] }
 }

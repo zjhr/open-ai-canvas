@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { zhCN as canvasCZh } from "../src/i18n/messages/areas/canvasC/zh-CN";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import localforage from "localforage";
@@ -421,30 +422,25 @@ describe("步骤内容契约", () => {
         expect(new Set(PREVIS_ONBOARDING_STEPS.map((step) => step.id)).size).toBe(PREVIS_ONBOARDING_STEPS.length);
     });
 
-    test("每一步都给出对应一级模式，覆盖摆场、姿态、动画和摄影机", () => {
+    test("每一步都给出对应一级模式：只有走位在动画模式", () => {
         const byId = Object.fromEntries(PREVIS_ONBOARDING_STEPS.map((step) => [step.id, step]));
         expect(byId.actor.mode).toBe("layout");
         expect(byId.move.mode).toBe("layout");
-        expect(byId.pose.mode).toBe("pose");
+        expect(byId.pose.mode).toBe("layout");
         expect(byId.path.mode).toBe("animate");
-        expect(byId.camera.mode).toBe("camera");
-        expect(byId.apply.mode).toBe("camera");
+        expect(byId.camera.mode).toBe("layout");
+        expect(byId.apply.mode).toBe("layout");
         for (const step of PREVIS_ONBOARDING_STEPS) {
-            if (step.mode) expect(["layout", "pose", "animate", "camera"]).toContain(step.mode);
+            if (step.mode) expect(["layout", "animate"]).toContain(step.mode);
         }
     });
 
     test("步骤文案指向真实入口，不把浏览步骤称为任务完成", () => {
         const content = PREVIS_ONBOARDING_STEPS.map((step) => `${step.title} ${step.detail}`).join("\n");
-        for (const label of ["快速添加", "移动工具", "姿态模式", "Transform 关键帧", "CAM", "应用到镜头"]) expect(content).toContain(label);
+        for (const label of ["添加", "移动工具", "姿态", "画走位", "CAM", "回写构图"]) expect(content).toContain(label);
     });
 });
 
-/**
- * 组件契约用源码断言：web 没有 jsdom/testing-library（见 package.json），
- * 这里与 create-library-button.test.ts 同一手法 —— 守住无障碍与 token 边界，
- * 而不是假装渲染过组件。
- */
 describe("引导浮层契约", () => {
     const componentPath = resolve(import.meta.dir, "../src/components/canvas/previs/canvas-previs-onboarding.tsx");
     const source = readFileSync(componentPath, "utf8");
@@ -454,7 +450,8 @@ describe("引导浮层契约", () => {
 
     test("非阻塞浮层：region 语义，不是 dialog，也没有遮罩与焦点陷阱", () => {
         expect(code).toContain("<section");
-        expect(code).toContain('aria-label="预演台上手引导"');
+        expect(code).toContain('aria-label={t("canvasC.previsOnboarding.label")}');
+        expect(canvasCZh.previsOnboarding.label).toBe("预演台上手引导");
         expect(code).not.toContain('role="dialog"');
         expect(code).not.toContain("aria-modal");
         expect(code).not.toContain("Modal");
@@ -465,23 +462,25 @@ describe("引导浮层契约", () => {
         const buttons = code.match(/<button\b/g) || [];
         expect(buttons).toHaveLength(3);
         expect(code.match(/type="button"/g) || []).toHaveLength(3);
-        expect(code).toContain("跳过引导");
-        expect(code).toContain("上一步");
-        expect(code).toContain("下一步");
-        expect(code).toContain("结束引导");
-        expect(code).not.toContain("完成引导");
+        expect(code).toContain('t("canvasC.previsOnboarding.skip")');
+        expect(code).toContain('t("canvasC.previsOnboarding.back")');
+        expect(code).toContain('t("canvasC.previsOnboarding.next")');
+        expect(code).toContain('t("canvasC.previsOnboarding.finish")');
+        expect(canvasCZh.previsOnboarding).toMatchObject({ skip: "跳过引导", back: "上一步", next: "下一步", finish: "结束引导" });
+        expect(JSON.stringify(canvasCZh.previsOnboarding)).not.toContain("完成引导");
         expect(code).toContain("focus-visible:[outline:var(--stroke-2)_solid_var(--control-focus-ring)]");
     });
 
     test("进度既有文本又有播报，装饰性圆点对读屏隐藏", () => {
-        expect(code).toContain("第 ${position} 步 / 共 ${total} 步");
+        expect(code).toContain('t("canvasC.previsOnboarding.progress", { position, total })');
+        expect(canvasCZh.previsOnboarding.progress).toBe("第 {{position}} 步 / 共 {{total}} 步");
         expect(code).toContain('aria-live="polite"');
         expect(code).toContain("aria-hidden");
     });
 
     test("首步禁用上一步，末步把主按钮换成中性的结束文案", () => {
         expect(code).toContain("disabled={busy || isFirst}");
-        expect(code).toContain('{isLast ? "结束引导" : "下一步"}');
+        expect(code).toContain('{isLast ? t("canvasC.previsOnboarding.finish") : t("canvasC.previsOnboarding.next")}');
     });
 
     test("只用既有 token，不写颜色/圆角/字号字面值", () => {

@@ -28,6 +28,8 @@ func (s *Service) storageSettingWithRuntimePolicy(setting ossSettingValue) ossSe
 
 var (
 	putOSSObject                = storage.PutOSSObject
+	putOSSObjectContext         = storage.PutOSSObjectContext
+	classifyStorageError        = storage.ClassifyError
 	getOSSObjectRange           = storage.GetOSSObjectRange
 	getAliyunOSSObjectRange     = storage.GetAliyunOSSObjectRange
 	signedOSSObjectURL          = storage.SignedOSSObjectURL
@@ -54,6 +56,8 @@ var (
 	deleteTencentCOSObject      = storage.DeleteTencentCOSObject
 	deleteQiniuObject           = storage.DeleteQiniuObject
 	validateStorageEndpoint     = storage.ValidateStorageEndpoint
+	validateTOSLocation         = storage.ValidateVolcengineTOSLocation
+	tosRegionFromEndpoint       = storage.VolcengineTOSRegionFromEndpoint
 	standardAWSS3Endpoint       = storage.StandardAWSS3Endpoint
 	publicHTTPSStorageEndpoint  = storage.PublicHTTPSStorageEndpoint
 	newS3Client                 = storage.NewS3Client

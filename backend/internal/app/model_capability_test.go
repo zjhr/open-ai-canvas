@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -139,6 +140,39 @@ func TestDefaultVideoCapabilityUsesProtocolSpecificResolutionTiers(t *testing.T)
 			}
 			if fmt.Sprint(profile.Video.Resolutions) != fmt.Sprint(want) {
 				t.Fatalf("resolutions = %v, want %v", profile.Video.Resolutions, want)
+			}
+		})
+	}
+}
+
+func TestDefaultMiniMaxVideoCapabilitySupportsThirtySecondGeneration(t *testing.T) {
+	for _, protocol := range []string{"minimax-video", "metaso-h3"} {
+		t.Run(protocol, func(t *testing.T) {
+			profile := DefaultModelCapabilityConfigForModel(protocol, "MiniMax-H3").Video
+			if profile == nil || profile.Duration.Default != 5 {
+				t.Fatalf("MiniMax duration profile = %#v", profile)
+			}
+			for _, seconds := range []int{3, 4, 15, 16, 20, 30, 31} {
+				t.Run(fmt.Sprint(seconds), func(t *testing.T) {
+					input := canvasGenerationInput{Mode: "video", Prompt: "a clip", Config: providerConfig{InterfaceType: protocol, Model: "MiniMax-H3", VideoSeconds: fmt.Sprint(seconds), Size: "16:9", VQuality: "768P"}}
+					err := validateVideoTask(profile, input)
+					valid := seconds >= 4 && seconds <= 30
+					if valid && err != nil {
+						t.Fatalf("validateVideoTask(%d seconds): %v", seconds, err)
+					}
+					label := videoDurationAllowedLabel(profile.Duration)
+					if !strings.Contains(label, "4–30 秒") {
+						t.Fatalf("allowed range label = %q", label)
+					}
+					want := fmt.Sprintf("视频时长 %d 秒不在当前模型支持范围内（%s）", seconds, label)
+					if !valid && (err == nil || !strings.Contains(err.Error(), want)) {
+						t.Fatalf("validateVideoTask(%d seconds) error = %v, want %q", seconds, err, want)
+					}
+					var argumentErr *modelCapabilityArgumentError
+					if !valid && (!errors.As(err, &argumentErr) || argumentErr.Field != "durationSeconds" || argumentErr.Issue != "unsupported_value") {
+						t.Fatalf("validateVideoTask(%d seconds) lost the field code: %#v", seconds, err)
+					}
+				})
 			}
 		})
 	}

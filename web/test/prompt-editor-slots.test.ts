@@ -90,7 +90,7 @@ describe("提示词输入框插槽注册表", () => {
         for (const [file, plugin] of [
             ["pages/canvas/project.tsx", "ai-art-critique"],
             ["pages/canvas/project.tsx", "media-conversion"],
-            ["pages/projects/detail/editor.tsx", "editor/editor-shell"],
+            ["pages/projects/detail.tsx", "editor/editor-shell"],
         ] as const) {
             const source = readFileSync(resolve(root, file), "utf8");
             expect(source).not.toContain(`import "@/lib/plugins/builtin/${plugin}";`);

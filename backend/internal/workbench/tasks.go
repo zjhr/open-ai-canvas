@@ -12,17 +12,43 @@ import (
 )
 
 type TaskInput struct {
-	Kind           string          `json:"kind"`
-	ToolID         string          `json:"toolId"`
-	PresetID       string          `json:"presetId,omitempty"`
-	Workbench      *TaskWorkbench  `json:"workbench,omitempty"`
-	Prompt         string          `json:"prompt"`
-	Model          string          `json:"model,omitempty"`
-	LogicalModelID string          `json:"logicalModelId,omitempty"`
-	ChannelID      string          `json:"channelId,omitempty"`
-	ModelChoice    *ModelChoice    `json:"modelChoice,omitempty"`
-	Parameters     map[string]any  `json:"parameters,omitempty"`
-	References     []TaskReference `json:"references,omitempty"`
+	EcommerceProjectID string          `json:"ecommerceProjectId,omitempty"`
+	Kind               string          `json:"kind"`
+	ToolID             string          `json:"toolId"`
+	PresetID           string          `json:"presetId,omitempty"`
+	Workbench          *TaskWorkbench  `json:"workbench,omitempty"`
+	Prompt             string          `json:"prompt"`
+	Model              string          `json:"model,omitempty"`
+	LogicalModelID     string          `json:"logicalModelId,omitempty"`
+	ChannelID          string          `json:"channelId,omitempty"`
+	ModelChoice        *ModelChoice    `json:"modelChoice,omitempty"`
+	Parameters         map[string]any  `json:"parameters,omitempty"`
+	References         []TaskReference `json:"references,omitempty"`
+	Batch              *TaskBatch      `json:"batch,omitempty"`
+}
+
+// TaskBatch 关联同一次提交拆出的多个任务（例如一次生成 3 条视频），
+// 只用于页面分组展示，不参与调度、准入和计费；每个任务仍各自校验与扣费。
+type TaskBatch struct {
+	ID    string `json:"id"`
+	Index int    `json:"index"`
+	Count int    `json:"count"`
+}
+
+// MaxTaskBatchCount 与单任务 count 上限一致，避免一次提交拆出过多任务。
+const MaxTaskBatchCount = 20
+
+// ValidTaskBatch 供写入和读模型共用：分组 ID 只允许 8-64 位字母、数字、- 和 _。
+func ValidTaskBatch(id string, index, count int) bool {
+	if len(id) < 8 || len(id) > 64 || count < 1 || count > MaxTaskBatchCount || index < 0 || index >= count {
+		return false
+	}
+	for _, char := range id {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '-' || char == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 type TaskWorkbench struct {
@@ -101,6 +127,14 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 	if err != nil {
 		return nil, err
 	}
+	var batch map[string]any
+	if req.Batch != nil {
+		batchID := strings.TrimSpace(req.Batch.ID)
+		if !ValidTaskBatch(batchID, req.Batch.Index, req.Batch.Count) {
+			return nil, kernel.BadAuthRequest("批量生成分组字段无效")
+		}
+		batch = map[string]any{"id": batchID, "index": req.Batch.Index, "count": req.Batch.Count}
+	}
 	refs := make([]TaskReference, 0, len(req.References))
 	frameRoles := map[string]bool{}
 	for _, ref := range req.References {
@@ -133,6 +167,19 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 		}
 	}
 	metadata := map[string]any{"source": "workbench", "workbenchKind": req.Kind}
+	operation := "image"
+	if req.Kind == KindVideo {
+		operation = videoOperation(refs)
+		// Provider adapters read the same operation and frame identities as admission.
+		metadata["videoEditOperation"] = operation
+		for _, ref := range refs {
+			if ref.Role == "first_frame" {
+				metadata["videoStartFrameNodeId"] = ref.ResourceID
+			} else if ref.Role == "last_frame" {
+				metadata["videoEndFrameNodeId"] = ref.ResourceID
+			}
+		}
+	}
 	workbenchSnapshot := map[string]any{"kind": req.Kind, "parameters": parameters}
 	snapshotReferences := make([]map[string]any, 0, len(refs))
 	for _, ref := range refs {
@@ -146,6 +193,9 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 		snapshotReferences = append(snapshotReferences, reference)
 	}
 	workbenchSnapshot["references"] = snapshotReferences
+	if batch != nil {
+		workbenchSnapshot["batch"] = batch
+	}
 	if tool != nil {
 		metadata["workbenchToolId"], metadata["workbenchToolName"], metadata["workbenchToolVersion"] = tool.ID, tool.Name, tool.Version
 		workbenchSnapshot["toolId"], workbenchSnapshot["toolName"], workbenchSnapshot["toolVersion"] = tool.ID, tool.Name, tool.Version
@@ -155,7 +205,7 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 	if len(refs) > 0 {
 		imageRefs, videoRefs, audioRefs := []map[string]any{}, []map[string]any{}, []map[string]any{}
 		for _, ref := range refs {
-			value := map[string]any{"resourceId": ref.ResourceID, "storageKey": "resource:" + ref.ResourceID}
+			value := map[string]any{"id": ref.ResourceID, "resourceId": ref.ResourceID, "storageKey": "resource:" + ref.ResourceID}
 			if ref.Role != "" {
 				value["role"] = ref.Role
 			}
@@ -189,12 +239,36 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 		workbenchSnapshot["presetId"], workbenchSnapshot["presetName"], workbenchSnapshot["presetVersion"] = preset.ID, preset.Name, preset.Version
 		workbenchSnapshot["presetPrompt"] = preset.PromptTemplate
 	}
-	return &TaskResolution{TaskType: map[string]string{KindImage: "canvas_image", KindVideo: "canvas_video"}[req.Kind], Operation: map[string]string{KindImage: "image", KindVideo: "video"}[req.Kind], Input: input, Parameters: parameters, Prompt: strings.TrimSpace(req.Prompt), Model: modelName, LogicalModelID: logicalModelID, ChannelID: channelID, Tool: tool, Preset: preset}, nil
+	return &TaskResolution{TaskType: map[string]string{KindImage: "canvas_image", KindVideo: "canvas_video"}[req.Kind], Operation: operation, Input: input, Parameters: parameters, Prompt: strings.TrimSpace(req.Prompt), Model: modelName, LogicalModelID: logicalModelID, ChannelID: channelID, Tool: tool, Preset: preset}, nil
+}
+
+func videoOperation(refs []TaskReference) string {
+	hasFrame, hasAudio := false, false
+	for _, ref := range refs {
+		switch ref.Kind {
+		case "video":
+			return "reference_to_video"
+		case "image":
+			if ref.Role != "first_frame" && ref.Role != "last_frame" {
+				return "reference_to_video"
+			}
+			hasFrame = true
+		case "audio":
+			hasAudio = true
+		}
+	}
+	if hasFrame {
+		return "image_to_video"
+	}
+	if hasAudio {
+		return "audio_to_video"
+	}
+	return "text_to_video"
 }
 
 func normalizeTaskParameters(kind string, params map[string]any) (map[string]any, error) {
 	allowed := map[string]map[string]bool{
-		KindImage: {"size": true, "quality": true, "count": true},
+		KindImage: {"size": true, "quality": true, "imageResolution": true, "count": true},
 		KindVideo: {"seconds": true, "ratio": true, "resolution": true, "generateAudio": true, "watermark": true},
 	}[kind]
 	if allowed == nil {
@@ -206,7 +280,7 @@ func normalizeTaskParameters(kind string, params map[string]any) (map[string]any
 			return nil, kernel.BadAuthRequest("生成参数包含不支持字段: " + key)
 		}
 		switch key {
-		case "size", "quality", "ratio", "resolution":
+		case "size", "quality", "imageResolution", "ratio", "resolution":
 			text, ok := value.(string)
 			text = strings.TrimSpace(text)
 			if !ok || len(text) > 64 || strings.Contains(text, "://") || strings.HasPrefix(strings.ToLower(text), "data:") {

@@ -575,7 +575,7 @@ func TestRunAgentToolTaskOmitsToolChoiceBeforeThinkingRequest(t *testing.T) {
 
 			result, err := runAgentToolTask(context.Background(), canvasGenerationInput{
 				Config:        providerConfig{BaseURL: server.URL, APIKey: "key", Model: "thinking-model"},
-				TextOptions:   canvasTextOptions{Thinking: true},
+				TextOptions:   canvasTextOptions{ThinkingLevel: "medium"},
 				AgentRequests: &agentToolRequests{ChatCompletion: map[string]interface{}{"messages": []interface{}{}, "tool_choice": forcedChoice}},
 			})
 			server.Close()
@@ -648,7 +648,7 @@ func TestRunDeclarativeAgentTaskOmitsToolChoiceBeforeThinkingRequest(t *testing.
 	}
 	result, err := runAgentToolTask(withProtocolRegistry(context.Background(), registry), canvasGenerationInput{
 		Config:      providerConfig{BaseURL: server.URL, APIKey: "key", Model: "thinking-model", InterfaceType: "chat-completion"},
-		TextOptions: canvasTextOptions{Thinking: true},
+		TextOptions: canvasTextOptions{ThinkingLevel: "medium"},
 		AgentRequests: &agentToolRequests{ChatCompletion: map[string]interface{}{
 			"messages": []interface{}{}, "tools": []interface{}{}, "tool_choice": "required",
 		}},
@@ -738,7 +738,7 @@ data: [DONE]
 }
 
 func TestTextThinkingOptionsAndReasoningParsing(t *testing.T) {
-	input := canvasGenerationInput{TextOptions: canvasTextOptions{Thinking: true}}
+	input := canvasGenerationInput{TextOptions: canvasTextOptions{ThinkingLevel: "medium"}}
 	responsesBody := map[string]interface{}{}
 	applyTextThinking(responsesBody, input, "responses")
 	reasoning, _ := responsesBody["reasoning"].(map[string]interface{})
@@ -797,6 +797,9 @@ data: {"type":"response.function_call_arguments.delta","item_id":"fc-stream","de
 event: response.function_call_arguments.done
 data: {"type":"response.function_call_arguments.done","item_id":"fc-stream","arguments":"{\"nodeId\":\"n1\"}"}
 
+event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"function_call","id":"fc-stream","call_id":"call-stream","name":"canvas_get_state","arguments":"{\"nodeId\":\"n1\"}"}]}}
+
 `))
 	parser.flush()
 	result, err := parser.result()
@@ -843,10 +846,76 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
 event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"include\":"}}
 
+event: message_stop
+data: {"type":"message_stop"}
+
 `))
 	parser.flush()
 	if _, err := parser.result(); err == nil || !strings.Contains(err.Error(), "完整 JSON") {
 		t.Fatalf("incomplete tool arguments error = %v", err)
+	}
+}
+
+func TestStreamingAgentParserRejectsTruncatedStreams(t *testing.T) {
+	cases := []struct {
+		name     string
+		protocol string
+		stream   string
+	}{
+		{"chat", "chat-completion", `data: {"choices":[{"delta":{"content":"写到一半"}}]}
+
+`},
+		{"responses", "responses", `event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"写到一半"}
+
+`},
+		{"claude", "claude-api", `event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"写到一半"}}
+
+`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parser := newStreamingAgentParser(tc.protocol, nil)
+			parser.consume("text/event-stream", []byte(tc.stream))
+			parser.flush()
+			if _, err := parser.result(); err == nil || !strings.Contains(err.Error(), "提前中断") {
+				t.Fatalf("truncated stream result error = %v", err)
+			}
+		})
+	}
+}
+
+func TestStreamingAgentParserAcceptsProtocolTerminalMarkers(t *testing.T) {
+	cases := []struct {
+		name     string
+		protocol string
+		stream   string
+	}{
+		{"chat finish_reason", "chat-completion", `data: {"choices":[{"delta":{"content":"完整"},"finish_reason":"stop"}]}
+
+`},
+		{"claude message_delta stop_reason", "claude-api", `event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"完整"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parser := newStreamingAgentParser(tc.protocol, nil)
+			parser.consume("text/event-stream", []byte(tc.stream))
+			parser.flush()
+			result, err := parser.result()
+			if err != nil {
+				t.Fatalf("terminal stream result error = %v", err)
+			}
+			if result["text"] != "完整" {
+				t.Fatalf("text = %v", result["text"])
+			}
+		})
 	}
 }
 
@@ -1360,6 +1429,7 @@ func TestRunOpenAIImageTaskUsesMultipartEditContract(t *testing.T) {
 	defer server.Close()
 
 	profile := DefaultImageCapabilityConfig("openai-image", "gpt-image-2-high")
+	profile.ResponseFormat.Default = "b64_json"
 	result, err := runImageTask(context.Background(), canvasGenerationInput{
 		Mode:            "image",
 		Prompt:          "make the reference clearer",
@@ -1382,12 +1452,14 @@ func TestRunGrokImageTaskUsesJSONEditContract(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		responseFormat bool
+		defaultFormat  string
 		wantFormat     string
 		reply          string
 		wantDataURL    string
 	}{
-		{name: "b64_json", responseFormat: true, wantFormat: "b64_json", reply: `{"data":[{"b64_json":"aGVsbG8="}]}`, wantDataURL: "data:image/png;base64,aGVsbG8="},
+		{name: "b64_json", responseFormat: true, defaultFormat: "b64_json", wantFormat: "b64_json", reply: `{"data":[{"b64_json":"aGVsbG8="}]}`, wantDataURL: "data:image/png;base64,aGVsbG8="},
 		{name: "url", responseFormat: false, wantFormat: "url", reply: `{"data":[{"url":"https://example.com/result.png"}]}`, wantDataURL: "https://example.com/result.png"},
+		{name: "explicit_url", responseFormat: true, defaultFormat: "url", wantFormat: "url", reply: `{"data":[{"url":"https://example.com/result.png"}]}`, wantDataURL: "https://example.com/result.png"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1414,6 +1486,7 @@ func TestRunGrokImageTaskUsesJSONEditContract(t *testing.T) {
 
 			profile := DefaultImageCapabilityConfig("grok-image", "grok-imagine-image-quality")
 			profile.ResponseFormat.Supported = tc.responseFormat
+			profile.ResponseFormat.Default = tc.defaultFormat
 			result, err := runImageTask(context.Background(), canvasGenerationInput{
 				Mode:            "image",
 				Prompt:          "edit the reference",
@@ -2125,6 +2198,50 @@ func TestRunVideoTaskUsesXAIVideoGenerationEndpoint(t *testing.T) {
 		t.Fatalf("video = %#v", result["video"])
 	}
 	want := "POST /v1/videos/generations,GET /v1/videos/video-1,GET /files/video.mp4"
+	if got := strings.Join(paths, ","); got != want {
+		t.Fatalf("paths = %q, want %q", got, want)
+	}
+}
+
+func TestRunVideoTaskXAIVideoNestedVideoURL(t *testing.T) {
+	t.Setenv("CANVAS_ALLOW_PRIVATE_UPSTREAMS", "true")
+	var paths []string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/videos/generations":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"request_id":"video-nested-1"}`))
+		case "GET /v1/videos/video-nested-1":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"done","video":{"duration":15,"url":"` + server.URL + `/files/nested-video.mp4"}}`))
+		case "GET /files/nested-video.mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write([]byte("nested-video-content"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := runVideoTaskForTest(context.Background(), canvasGenerationInput{
+		Prompt: "grok make video",
+		Config: providerConfig{
+			BaseURL:       server.URL + "/v1",
+			APIKey:        "test-key",
+			Model:         "grok-imagine-video-1.5",
+			InterfaceType: "xai-video",
+		},
+	})
+	if err != nil {
+		t.Fatalf("runVideoTask() error = %v", err)
+	}
+	video, ok := result["video"].(map[string]interface{})
+	if !ok || video["dataUrl"] != "data:video/mp4;base64,bmVzdGVkLXZpZGVvLWNvbnRlbnQ=" {
+		t.Fatalf("video = %#v", result["video"])
+	}
+	want := "POST /v1/videos/generations,GET /v1/videos/video-nested-1,GET /files/nested-video.mp4"
 	if got := strings.Join(paths, ","); got != want {
 		t.Fatalf("paths = %q, want %q", got, want)
 	}

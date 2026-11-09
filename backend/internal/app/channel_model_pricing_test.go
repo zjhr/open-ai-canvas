@@ -205,17 +205,45 @@ func TestRepriceTierFieldValidation(t *testing.T) {
 			protocol = model.ChannelInterfaceChatCompletion
 			prices["inputTokenPriceMicrocredits"] = &input
 			prices["cachedTokenPriceMicrocredits"] = &zero
+			prices["cacheWriteTokenPriceMicrocredits"] = &input
 		}
 		if err := applyChannelModelTierPrices(&tier, capability, protocol, prices); err != nil {
 			t.Fatal(err)
 		}
-		if tier.OutputTokenPriceMicrocredits != output || tier.CachedTokenPriceMicrocredits != 0 {
+		wantCacheWrite := int64(0)
+		if capability == "text" {
+			wantCacheWrite = input
+		}
+		if tier.OutputTokenPriceMicrocredits != output || tier.CachedTokenPriceMicrocredits != 0 || tier.CacheWriteTokenPriceMicrocredits != wantCacheWrite {
 			t.Fatalf("tier=%+v", tier)
 		}
 		output = 1_000_000_000_001
 		if err := applyChannelModelTierPrices(&tier, capability, protocol, prices); err == nil {
 			t.Fatal("token price limit missing")
 		}
+	}
+}
+
+func TestNormalizeChannelModelTierSelectorAcceptsLegacyTypoWithoutCollidingWithPixelTier(t *testing.T) {
+	for _, key := range []string{"resoluton"} {
+		t.Run(key, func(t *testing.T) {
+			selector, resolution, videoSeconds, err := normalizeChannelModelTierSelector("image", ChannelModelPriceTierRequest{
+				Selector: map[string]string{key: "2K"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selector["imageResolution"] != "2k" || selector[key] != "" || resolution != "*" || videoSeconds != 0 {
+				t.Fatalf("selector=%v resolution=%q videoSeconds=%d", selector, resolution, videoSeconds)
+			}
+		})
+	}
+}
+
+func TestImageTierSelectorDoesNotOverwriteIndependentResolution(t *testing.T) {
+	selector, _, _, err := normalizeChannelModelTierSelector("image", ChannelModelPriceTierRequest{Selector: map[string]string{"imageResolution": "1k", "resolution": "2k"}})
+	if err != nil || selector["imageResolution"] != "1k" || selector["resolution"] != "2k" {
+		t.Fatalf("selector = %#v, err=%v", selector, err)
 	}
 }
 
@@ -242,7 +270,7 @@ func TestBatchRepricingRollsBackOnConcurrentChange(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := svc.repo.UpdateChannelModelSalePrices("channel", items); !errors.Is(err, repository.ErrChannelModelPriceConflict) {
+			if err := svc.repo.UpdateChannelModelSalePrices(items); !errors.Is(err, repository.ErrChannelModelPriceConflict) {
 				t.Fatalf("error=%v", err)
 			}
 			item, err := svc.repo.ChannelModelByID("channel", "a")
@@ -263,7 +291,7 @@ func TestNormalizeChannelModelTierSelectorAcceptsResolutionTypo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selector["resolution"] != "2k" || selector["resoluton"] != "" || resolution != "*" || videoSeconds != 0 {
+	if selector["imageResolution"] != "2k" || selector["resoluton"] != "" || resolution != "*" || videoSeconds != 0 {
 		t.Fatalf("selector=%v resolution=%q videoSeconds=%d", selector, resolution, videoSeconds)
 	}
 }

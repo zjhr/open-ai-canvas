@@ -3,6 +3,7 @@ import { Tag } from "antd";
 import { Bell } from "lucide-react";
 import { lazy, Suspense, useEffect, useState, type CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 
 import { aceternityMotion } from "@/lib/aceternity-motion";
 import { getAnnouncementFeed, markAnnouncementsRead } from "@/services/api/announcements";
@@ -22,11 +23,13 @@ type SystemAnnouncementCenterProps = {
     style?: CSSProperties;
     showLabel?: boolean;
     labelClassName?: string;
+    /** 兼容旧调用：入口按钮已统一为只变色、不位移不缩放（docs/ui-design-system.md §3.0）。 */
     staticMotion?: boolean;
     autoOpen?: boolean;
 };
 
-export function SystemAnnouncementCenter({ userId, className, style, showLabel = false, labelClassName, staticMotion = false, autoOpen = false }: SystemAnnouncementCenterProps) {
+export function SystemAnnouncementCenter({ userId, className, style, showLabel = false, labelClassName, autoOpen = false }: SystemAnnouncementCenterProps) {
+    const { t } = useTranslation();
     const reducedMotion = useReducedMotion();
     const queryClient = useQueryClient();
     const [open, setOpen] = useState(false);
@@ -44,7 +47,7 @@ export function SystemAnnouncementCenter({ userId, className, style, showLabel =
     });
     const announcements = feedQuery.data?.announcements || [];
     const unreadCount = Math.max(0, feedQuery.data?.unreadCount || 0);
-    const error = feedQuery.error instanceof Error ? feedQuery.error.message : feedQuery.error ? "读取公告失败" : "";
+    const error = feedQuery.error instanceof Error ? feedQuery.error.message : feedQuery.error ? t("account.layout.announcements.loadFailed") : "";
 
     useEffect(() => {
         if (!autoOpen || open || !feedQuery.isSuccess || announcements.length === 0) return;
@@ -80,16 +83,13 @@ export function SystemAnnouncementCenter({ userId, className, style, showLabel =
 
     return (
         <>
-            <motion.button
+            <button
                 type="button"
                 className={className}
                 style={style}
-                whileHover={reducedMotion || staticMotion ? undefined : { y: -1, scale: 1.035 }}
-                whileTap={reducedMotion || staticMotion ? undefined : { scale: 0.94 }}
-                transition={aceternityMotion.spring.dock}
                 onClick={() => void openAnnouncements()}
-                aria-label={unreadCount ? `系统公告，${unreadCount} 条未读` : "系统公告"}
-                title="系统公告"
+                aria-label={unreadCount ? t("account.layout.announcements.unreadLabel", { count: unreadCount }) : t("account.layout.announcements.title")}
+                title={t("account.layout.announcements.title")}
                 data-icon-only={showLabel ? undefined : true}
             >
                 <span className="relative shrink-0">
@@ -110,11 +110,11 @@ export function SystemAnnouncementCenter({ userId, className, style, showLabel =
                 </span>
                 {showLabel ? (
                     <span className={`min-w-0 flex-1 items-center justify-between gap-2 whitespace-nowrap ${labelClassName || ""}`}>
-                        <span>系统公告</span>
-                        <Tag color={unreadCount > 0 ? "gold" : undefined} className="!m-0 !min-w-6 !px-1.5 !text-center !text-[var(--fs-micro)] !font-medium !leading-[18px] tabular-nums">{announcements.length}</Tag>
+                        <span>{t("account.layout.announcements.title")}</span>
+                        <Tag color={unreadCount > 0 ? "gold" : undefined} className="!m-0 !min-w-6 !px-2 !text-center !text-[var(--fs-micro)] !font-medium !leading-[18px] tabular-nums">{announcements.length}</Tag>
                     </span>
                 ) : null}
-            </motion.button>
+            </button>
             {open ? (
                 <Suspense fallback={null}>
                     <AnnouncementTimelineModal

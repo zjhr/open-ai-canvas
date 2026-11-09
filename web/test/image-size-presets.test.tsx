@@ -115,6 +115,12 @@ describe("统一图片分辨率与宽高比", () => {
         expect(changes).toEqual([["size", "16:9"], ["quality", "high"]]);
     });
 
+    test("独立分辨率模型换档时同时提交像素和分辨率", () => {
+        const changes: Array<[string, string]> = [];
+        applyImageSizeSelection((key, value) => changes.push([key, value]), "2048x1152", undefined, "1.5k");
+        expect(changes).toEqual([["size", "2048x1152"], ["imageResolution", "1.5k"]]);
+    });
+
     test("像素协议从旧比例配置切换 4K 后发送真实像素，不回退到 1K", () => {
         const profile = defaultImageCapabilityConfig();
         profile.size = { parameter: "size", values: ["16:9"], default: "16:9", allowCustom: true };
@@ -208,6 +214,8 @@ describe("统一图片分辨率与宽高比", () => {
         expect(picker).not.toMatch(/<button[^>]*>4K/);
         expect(picker).toContain("换算参考");
         profile.size.parameter = "none";
+        expect(renderToStaticMarkup(<ImageSizePicker profile={profile} size="auto" onChange={() => {}} />)).toContain("分辨率");
+        profile.resolution.supported = false;
         expect(renderToStaticMarkup(<ImageSizePicker profile={profile} size="auto" onChange={() => {}} />)).toBe("");
     });
 

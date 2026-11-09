@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 		return nil, err
 	}
 	if capability == "text" || capability == "image" || capability == "video" {
-		if _, err := NormalizeModelCapabilityConfigForModel(capability, string(protocol), providerModelKey, req.CapabilityConfig); err != nil {
+		if _, err := NormalizeModelCapabilityConfigForModel(capability, string(protocol), providerModelKey, req.CapabilityConfig, s.protocolRegistry()); err != nil {
 			return nil, err
 		}
 	}
@@ -46,19 +47,13 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 		"video": "A static gray circle on a white background.",
 		"audio": "Model test.",
 	}[capability]
-	videoSeconds := "6"
-	videoSecondsValue := 6
-	if protocol == model.ChannelInterfaceVolcengineJiMengVideo {
-		videoSeconds = "5"
-		videoSecondsValue = 5
-	}
 	imageSize, imageQuality := "", ""
 	var imageProfile *ImageCapabilityConfig
 	videoRatio, videoResolution := videoTestDefaults(nil)
 	var videoProfile *VideoCapabilityConfig
 	switch capability {
 	case "image":
-		profile, normalizeErr := NormalizeModelCapabilityConfigForModel(capability, string(protocol), providerModelKey, req.CapabilityConfig)
+		profile, normalizeErr := NormalizeModelCapabilityConfigForModel(capability, string(protocol), providerModelKey, req.CapabilityConfig, s.protocolRegistry())
 		if normalizeErr != nil {
 			return nil, normalizeErr
 		}
@@ -67,13 +62,15 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	case "video":
 		// 视频测试必须带上模型能力画像：声明式协议只按画像里的枚举回填分辨率名（如 480 -> 480p），
 		// 没有画像时会把裸数字发给上游，火山方舟等供应商会直接拒绝。
-		profile, normalizeErr := NormalizeModelCapabilityConfigForModel(capability, string(protocol), providerModelKey, req.CapabilityConfig)
+		profile, normalizeErr := NormalizeModelCapabilityConfigForModel(capability, string(protocol), providerModelKey, req.CapabilityConfig, s.protocolRegistry())
 		if normalizeErr != nil {
 			return nil, normalizeErr
 		}
 		videoProfile = profile.Video
 		videoRatio, videoResolution = videoTestDefaults(videoProfile)
 	}
+	videoSecondsValue := videoTestSeconds(videoProfile)
+	videoSeconds := strconv.Itoa(videoSecondsValue)
 	input := canvasGenerationInput{
 		Mode:   capability,
 		Prompt: prompt,
@@ -102,6 +99,15 @@ func (s *Service) TestAdminChannelModel(ctx context.Context, actor *model.User, 
 	}
 	if capability == "image" {
 		input.ImageCapability = imageProfile
+		if imageProfile.Parameters != nil {
+			input.Config.ImageParameters = imageParameterDefaults(imageProfile.Parameters)
+		}
+		if imageProfile.Resolution.Supported {
+			input.Config.ImageResolution = imageProfile.Resolution.Default
+		}
+		if err := applyImageParameterValues(&input.Config, imageProfile); err != nil {
+			return nil, err
+		}
 	}
 	if capability == "video" {
 		input.VideoCapability = videoProfile
@@ -157,6 +163,15 @@ func videoTestDefaults(profile *VideoCapabilityConfig) (string, string) {
 		resolution = "720"
 	}
 	return ratio, resolution
+}
+
+// videoTestSeconds 取模型能力声明的默认时长（保存时已校验它属于时长范围或固定档位），
+// 避免固定 6 秒落在 5/10 秒这类档位之外造成测试假失败；画像缺失时才用 6 秒。
+func videoTestSeconds(profile *VideoCapabilityConfig) int {
+	if profile != nil && profile.Duration.Default > 0 {
+		return profile.Duration.Default
+	}
+	return 6
 }
 
 func imageTestDefaults(profile *ImageCapabilityConfig) (string, string) {

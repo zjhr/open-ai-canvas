@@ -282,7 +282,8 @@ func TestCloudAgentActiveRunWithOlderCapabilityIsTerminatedWithoutResume(t *test
 func TestCloudAgentValidation(t *testing.T) {
 	for _, mutate := range []func(*CloudAgentRequest){
 		func(r *CloudAgentRequest) { r.PermissionMode = "unrestricted" },
-		func(r *CloudAgentRequest) { r.SkillIDs = []string{"skill", "skill"} },
+		func(r *CloudAgentRequest) { r.PinnedSkillIDs = []string{"skill", "skill"} },
+		func(r *CloudAgentRequest) { r.MemoryMode = "always" },
 		func(r *CloudAgentRequest) { r.ContextScope = []string{"resources"} },
 		func(r *CloudAgentRequest) { r.Budget.MaxCredits = 0 },
 		func(r *CloudAgentRequest) { r.Budget.MaxGenerationTasks = 1 },
@@ -304,6 +305,20 @@ func TestCloudAgentValidationNormalizesFocusNodeIDs(t *testing.T) {
 	}
 	if req.FocusNodeIDs[0] != "node-1" {
 		t.Fatalf("focus node ID was validated but not normalized: %#v", req.FocusNodeIDs)
+	}
+
+	req = agentTestRequest()
+	req.FocusNodeOmittedCount = 4
+	if err := validateCloudAgentRequest(&req); err != nil {
+		t.Fatalf("bounded omitted focus count should be accepted: %v", err)
+	}
+	req.FocusNodeOmittedCount = -1
+	if err := validateCloudAgentRequest(&req); err == nil {
+		t.Fatal("negative omitted focus count must be rejected")
+	}
+	req.FocusNodeOmittedCount = 10001
+	if err := validateCloudAgentRequest(&req); err == nil {
+		t.Fatal("unbounded omitted focus count must be rejected")
 	}
 
 	req = agentTestRequest()
@@ -542,7 +557,7 @@ func TestCloudAgentToolLoopPersistsApprovalAndAppliesCanvasWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rootInput canvasGenerationInput
-	if err := json.Unmarshal([]byte(rootTask.InputJSON), &rootInput); err != nil || !rootInput.TextOptions.Thinking {
+	if err := json.Unmarshal([]byte(rootTask.InputJSON), &rootInput); err != nil || rootInput.TextOptions.ThinkingLevel != ThinkingIntentDeep {
 		t.Fatalf("initial task lost thinking option: %v", err)
 	}
 	if err := db.Model(&model.Task{}).Where("id = ?", root.ID).Updates(map[string]any{"status": model.TaskStatusSucceeded, "result_json": string(result), "input_json": publicTaskInputJSON(rootTask.InputJSON)}).Error; err != nil {
@@ -612,7 +627,7 @@ func TestCloudAgentToolLoopPersistsApprovalAndAppliesCanvasWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	var nextInput canvasGenerationInput
-	if err := json.Unmarshal([]byte(nextTask.InputJSON), &nextInput); err != nil || !nextInput.TextOptions.Thinking || nextTask.ID == root.ID {
+	if err := json.Unmarshal([]byte(nextTask.InputJSON), &nextInput); err != nil || nextInput.TextOptions.ThinkingLevel != ThinkingIntentDeep || nextTask.ID == root.ID {
 		t.Fatalf("tool continuation lost thinking option or failed to enqueue: %v", err)
 	}
 }

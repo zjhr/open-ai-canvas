@@ -21,6 +21,7 @@ type CanvasProjectContextMenuProps = {
     onUpload: (nodeId: string | undefined, position: Position) => void;
     onOpenAssets: (position: Position) => void;
     onOpenProjectCharacters: (position: Position) => void;
+    onOpenPoseLibrary?: (position: Position) => void;
     onUndo: () => void;
     onRedo: () => void;
     onPaste: (position: Position) => void;
@@ -31,6 +32,7 @@ type CanvasProjectContextMenuProps = {
     onDeleteConnection: (connectionId: string) => void;
     onSaveAsset: (node: CanvasNodeData) => void;
     onViewMedia: (node: CanvasNodeData) => void;
+    onOpenVersions: (node: CanvasNodeData) => void;
     onEditText: (node: CanvasNodeData) => void;
     onOpenDrawing: (node: CanvasNodeData) => void;
     onGenerateImage: (node: CanvasNodeData) => void;
@@ -43,9 +45,16 @@ type CanvasProjectContextMenuProps = {
     onCopySelection: () => void;
     onDeleteSelection: () => void;
     onSendToAgent: () => void;
+    downloadableSelectionCount: number;
+    onDownloadSelection: () => void;
+    /** 关联短剧时提供：图片与视频节点可采用到短剧。 */
+    onAdoptToDrama?: (node: CanvasNodeData) => void;
+    /** 开放短剧时提供：分镜脚本节点可交给短剧自动制作。 */
+    onCreateDramaFromStoryboard?: (node: CanvasNodeData) => void;
 };
 
 export function CanvasProjectContextMenu({ menu, node, screenToCanvas, ...props }: CanvasProjectContextMenuProps) {
+    const { onAdoptToDrama, onCreateDramaFromStoryboard } = props;
     if (!menu) return null;
     const menuPosition = () => menu.type === "canvas" ? menu.position : screenToCanvas(menu.x, menu.y);
     return (
@@ -70,6 +79,7 @@ export function CanvasProjectContextMenu({ menu, node, screenToCanvas, ...props 
             onUpload={() => props.onUpload(menu.type === "node" ? menu.nodeId : undefined, menuPosition())}
             onOpenAssets={() => props.onOpenAssets(menuPosition())}
             onOpenProjectCharacters={() => props.onOpenProjectCharacters(menuPosition())}
+            onOpenPoseLibrary={props.onOpenPoseLibrary ? () => props.onOpenPoseLibrary?.(menuPosition()) : undefined}
             onUndo={props.onUndo}
             onRedo={props.onRedo}
             onPaste={() => props.onPaste(menuPosition())}
@@ -91,6 +101,9 @@ export function CanvasProjectContextMenu({ menu, node, screenToCanvas, ...props 
             }}
             onViewMedia={() => {
                 if (node) props.onViewMedia(node);
+            }}
+            onOpenVersions={() => {
+                if (node) props.onOpenVersions(node);
             }}
             onEditText={() => {
                 if (node) props.onEditText(node);
@@ -116,6 +129,10 @@ export function CanvasProjectContextMenu({ menu, node, screenToCanvas, ...props 
             onCopySelection={props.onCopySelection}
             onDeleteSelection={props.onDeleteSelection}
             onSendToAgent={props.onSendToAgent}
+            downloadableSelectionCount={props.downloadableSelectionCount}
+            onDownloadSelection={props.onDownloadSelection}
+            onAdoptToDrama={onAdoptToDrama && node && (node.type === CanvasNodeType.Image || node.type === CanvasNodeType.Video) ? () => onAdoptToDrama(node) : undefined}
+            onCreateDramaFromStoryboard={onCreateDramaFromStoryboard && node?.type === CanvasNodeType.Script ? () => onCreateDramaFromStoryboard(node) : undefined}
         />
     );
 }

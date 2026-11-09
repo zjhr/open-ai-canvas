@@ -235,6 +235,8 @@ for (const [id, name, vendor, baseUrl] of [
   ["nvidia-nim-chat", "NVIDIA NIM Chat", "NVIDIA", "https://integrate.api.nvidia.com"],
   ["openrouter-chat", "OpenRouter Chat", "OpenRouter", "https://openrouter.ai/api"],
   ["atlascloud-chat", "Atlas Cloud Chat", "Atlas Cloud", "https://api.atlascloud.ai"],
+  ["cheaperinference-chat", "Cheaper Inference Chat", "Cheaper Inference", "https://api.cheaperinference.com"],
+  ["runcrate-chat", "Runcrate Chat", "Runcrate", "https://api.runcrate.ai"],
   ["litellm-proxy-chat", "LiteLLM Proxy Chat", "LiteLLM", "http://127.0.0.1:4000"],
   ["newapi-chat", "NewAPI Chat", "NewAPI", "http://127.0.0.1:3000"],
   ["vllm-chat", "vLLM OpenAI-Compatible", "vLLM", "http://127.0.0.1:8000"],
@@ -260,24 +262,22 @@ for (const [id, name, vendor, baseUrl] of [
 
 add({
   id: "openai-images", providerId: "openai-image", name: "OpenAI Images", vendor: "OpenAI", capability: "image",
-  baseUrl: "https://api.openai.com", auth: bearer, params: imageParams, requiresPublicMediaUrls: true,
-  notes: "无参考图走 JSON generations；有参考图或蒙版走 JSON edits，并按官方 images 数组传入多张 image_url。quality 的 1k/2k/4k 映射为 OpenAI low/medium/high。",
+  baseUrl: "https://api.openai.com", auth: bearer, params: imageParams,
+  notes: "无参考图走 JSON generations；有参考图或蒙版走 multipart edits（官方与 LiteLLM 等网关的通用格式），单张参考图用 image 字段、多张用 image[]，蒙版用 mask。quality 的 1k/2k/4k 映射为 OpenAI low/medium/high。",
   create: {
     method: "POST",
     path: "/v1/images/generations",
     pathTemplate: conditional(gt(len(ref("request.images")), 0), "/v1/images/edits", "/v1/images/generations"),
     contentType: "application/json",
+    contentTypeTemplate: conditional(gt(len(ref("request.images")), 0), "multipart/form-data", "application/json"),
+    files: [
+      { name: "image", source: conditional(eq(len(filter(ref("request.images"), "media", ne(ref("media.role"), "mask"))), 1), filter(sorted(ref("request.images")), "media", ne(ref("media.role"), "mask"))), filename: "image.png" },
+      { name: "image[]", source: conditional(gt(len(filter(ref("request.images"), "media", ne(ref("media.role"), "mask"))), 1), filter(sorted(ref("request.images")), "media", ne(ref("media.role"), "mask"))) },
+      { name: "mask", source: first(filter(sorted(ref("request.images")), "media", eq(ref("media.role"), "mask"))), filename: "mask.png" }
+    ],
     body: {
       model: ref("request.model"),
       prompt: ref("request.prompt"),
-      images: omit(conditional(gt(len(ref("request.images")), 0), map(
-        filter(sorted(ref("request.images")), "media", ne(ref("media.role"), "mask")),
-        "media",
-        { image_url: ref("media.value") }
-      ))),
-      mask: omit(conditional(gt(len(filter(ref("request.images"), "media", eq(ref("media.role"), "mask"))), 0), {
-        image_url: first(map(filter(sorted(ref("request.images")), "media", eq(ref("media.role"), "mask")), "media", ref("media.value")))
-      })),
       n: omit(conditional(gt(ref("request.imageCount"), 0), ref("request.imageCount"), 1)),
       size: omit(conditional({ $in: [lower(trim(ref("request.aspectRatio"))), ["", "auto"]] }, null, ref("request.aspectRatio"))),
       quality: omit({
@@ -548,6 +548,18 @@ add({
 
 const jimengSizeParts = split(lower(trim(ref("request.aspectRatio"))), "x");
 const jimengHasPixelSize = and(eq(len(jimengSizeParts), 2), gt(toFloat(at(jimengSizeParts, 0)), 0), gt(toFloat(at(jimengSizeParts, 1)), 0));
+// 火山视觉 OpenAPI 的成功码是 code=10000，其余 code 都是业务失败，不能按“非零即失败”的 errorPaths 处理。
+// data.status=done 只表示处理结束，成败仍看 code；not_found / expired 是任务失效的终态。
+const volcVisualBusinessFailed = and(ref("response.code"), ne({ $toString: ref("response.code") }, "10000"));
+const jimengTaskGone = { $in: [lower(ref("response.data.status")), ["not_found", "expired"]] };
+const jimengResponse = (kind, results) => asyncResponse(kind, {
+  taskId: coalesce(ref("response.data.task_id"), ref("response.task_id"), ref("taskId")),
+  status: { $switch: { cases: [{ when: volcVisualBusinessFailed, then: "failed" }, { when: jimengTaskGone, then: "failed" }], default: coalesce(ref("response.data.status"), "pending") } },
+  message: conditional(and({ $not: volcVisualBusinessFailed }, jimengTaskGone), "即梦任务不存在或已过期，请重新生成", coalesce(ref("response.message"), ref("response.error.message"))),
+  [kind + "s"]: results,
+  errorPaths: undefined,
+  messagePaths: ["message"]
+});
 
 add({
   id: "volcengine-jimeng-image", providerId: "volcengine-jimeng-image", name: "Volcengine Jimeng Image", vendor: "Volcengine", capability: "image",
@@ -564,7 +576,7 @@ add({
     req_json: omit(ref("request.providerOptions.volcengine-jimeng-image.req_json"))
   }, { originPath: true, query: { Action: "CVSync2AsyncSubmitTask", Version: "2022-08-31" } }),
   poll: { method: "POST", path: "/", originPath: true, contentType: "application/json", query: { Action: "CVSync2AsyncGetResult", Version: "2022-08-31" }, body: { req_key: ref("request.model"), task_id: ref("taskId"), req_json: "{\"return_url\":true}" } },
-  response: asyncResponse("image", { taskId: coalesce(ref("response.data.task_id"), ref("response.task_id"), ref("taskId")), status: coalesce(ref("response.data.status"), ref("response.status"), "pending"), images: coalesce(ref("response.data.image_urls"), ref("response.data.binary_data_base64")), errorPaths: ["code"], messagePaths: ["message"] })
+  response: jimengResponse("image", coalesce(ref("response.data.image_urls"), ref("response.data.binary_data_base64")))
 });
 
 add({
@@ -674,6 +686,12 @@ add({
   response: asyncResponse("video", { videos: coalesce(ref("response.url"), ref("response.video_url"), ref("response.output.url")), errorPaths: ["error.code"], messagePaths: ["error.message"] })
 });
 
+// NewAPI 任务查询的失败原因在 data.fail_reason（外层 message 为空），兼容直接返回的扁平结构。
+const newAPITaskMessage = coalesce(
+  ref("response.error.message"), ref("response.message"), ref("response.fail_reason"),
+  ref("response.data.fail_reason"), ref("response.data.error.message")
+);
+
 add({
   id: "newapi-media-task-v1", providerId: "newapi-channel-1", name: "NewAPI Media Task Channel 1", vendor: "NewAPI", capability: "video",
   baseUrl: "http://127.0.0.1:3000", auth: bearer, params: videoParams, requiresPublicMediaUrls: true,
@@ -693,7 +711,7 @@ add({
       prompt_extend: coalesce(ref("request.providerOptions.newapi-channel-1.prompt_extend"), false)
     }
   }),
-  poll: { method: "GET", path: "/v1/videos/{{taskId}}" }, response: asyncResponse("video")
+  poll: { method: "GET", path: "/v1/videos/{{taskId}}" }, response: asyncResponse("video", { message: newAPITaskMessage })
 });
 
 add({
@@ -709,7 +727,9 @@ add({
   poll: { method: "GET", path: "/v1/video/generations/{{taskId}}" },
   response: asyncResponse("video", {
     taskId: coalesce(ref("response.data.task_id"), ref("response.data.taskId"), ref("response.task_id"), ref("response.taskId"), ref("response.data.id"), ref("response.id"), ref("taskId")),
+    message: newAPITaskMessage,
     videos: coalesce(
+      map(ref("response.data"), "item", coalesce(ref("item.url"), ref("item.video_url"), ref("item.videoUrl"), ref("item.output_url"), ref("item.outputUrl"))),
       ref("response.data.result_url"), ref("response.data.video_url"), ref("response.data.output_url"), ref("response.data.url"), ref("response.data.metadata.url"),
       ref("response.data.data.video_url"), ref("response.data.data.output_url"), ref("response.data.data.result_url"), ref("response.data.data.url"), ref("response.data.data.metadata.url"),
       ref("response.video_url"), ref("response.videoUrl"), ref("response.result_url"), ref("response.output_url"), ref("response.url"), ref("response.metadata.url"), ref("response.output.url")
@@ -784,7 +804,14 @@ add({
     aspect_ratio: coalesce(ref("request.aspectRatio"), "16:9"), image_url: omit(firstMediaFieldWithRoles("request.images", ["first_frame", ""], "value")),
     seed: omit(ref("request.providerOptions.novita-video.seed")), negative_prompt: omit(ref("request.providerOptions.novita-video.negative_prompt"))
   }),
-  poll: { method: "GET", path: "/v3/async/task-result", query: { task_id: ref("taskId") } }, response: asyncResponse("video")
+  poll: { method: "GET", path: "/v3/async/task-result", query: { task_id: ref("taskId") } },
+  // Novita 统一任务查询把状态和失败原因放在 task.status / task.reason（TASK_STATUS_* 枚举），结果在 videos[].video_url。
+  response: asyncResponse("video", {
+    taskId: coalesce(ref("response.task.task_id"), ref("response.id"), ref("response.task_id"), ref("response.taskId"), ref("response.data.id"), ref("taskId")),
+    status: coalesce(ref("response.task.status"), ref("response.status"), ref("response.state"), ref("response.data.status"), "pending"),
+    message: coalesce(ref("response.task.reason"), ref("response.error.message"), ref("response.message"), ref("response.fail_reason")),
+    videos: coalesce(ref("response.videos"), ref("response.video_url"), ref("response.videoUrl"), ref("response.result_url"), ref("response.url"), ref("response.data.video_url"), ref("response.output.url"))
+  })
 });
 
 add({
@@ -797,7 +824,7 @@ add({
     req_json: omit(ref("request.providerOptions.volcengine-jimeng-video.req_json"))
   }, { originPath: true, query: { Action: "CVSync2AsyncSubmitTask", Version: "2022-08-31" } }),
   poll: { method: "POST", path: "/", originPath: true, contentType: "application/json", query: { Action: "CVSync2AsyncGetResult", Version: "2022-08-31" }, body: { req_key: ref("request.model"), task_id: ref("taskId") } },
-  response: asyncResponse("video", { taskId: coalesce(ref("response.data.task_id"), ref("response.task_id"), ref("taskId")), status: coalesce(ref("response.data.status"), ref("response.status"), "pending"), videos: coalesce(ref("response.data.video_urls"), ref("response.data.video_url")), errorPaths: ["code"], messagePaths: ["message"] })
+  response: jimengResponse("video", coalesce(ref("response.data.video_urls"), ref("response.data.video_url")))
 });
 
 const agnesFrameImages = mediaWithRoles("request.images", ["first_frame", "last_frame"]);
@@ -962,6 +989,81 @@ add({
   response: { status: "succeeded", images: coalesce(ref("response.data"), ref("response.images")), errorPaths: ["error.code"], messagePaths: ["error.message", "message"] }
 });
 
+const minimaxInputs = coalesce({ $concatArrays: [
+  ...[["images", "image"], ["videos", "video"], ["audios", "audio"]].map(([field, kind]) =>
+    map(ref(`request.${field}`), "media", { $merge: [ref("media"), { kind }] })
+  )
+] }, ref("request.inputs"));
+const minimaxMedia = (kind, roles) => filter(minimaxInputs, "media", and(
+  eq(ref("media.kind"), kind), ...(roles ? [{ $in: [ref("media.role"), roles] }] : [])
+));
+const minimaxKeyframes = filter(minimaxInputs, "media", { $in: [ref("media.role"), ["first_frame", "last_frame"]] });
+const minimaxRatio = ref("request.output.aspectRatio");
+
+add({
+  id: "dashscope-minimax-video", providerId: "dashscope-minimax-video", name: "百炼 MiniMax H3 Video", vendor: "Alibaba Cloud", capability: "video",
+  baseUrl: "", auth: bearer, requiresPublicMediaUrls: true,
+  params: [
+    ["model", "string", true, "model", "固定为 MiniMax/MiniMax-H3。"],
+    ["prompt", "string", true, "input.prompt", "中英文提示词，最多 7000 个字符。"],
+    ["images", "media[]", false, "input.media", "显式首帧、尾帧或参考图；支持仅尾帧。"],
+    ["videos", "media[]", false, "input.media[type=feature]", "最多 3 个参考视频。"],
+    ["audios", "media[]", false, "input.media[type=driving_audio]", "最多 3 个参考音频。"],
+    ["duration", "integer", true, "parameters.duration", "4-15 秒整数，不沿用原生 MiniMax 的 30 秒上限。"],
+    ["aspectRatio", "string", false, "parameters.ratio", "文生视频必须指定具体比例；首尾帧恒为 adaptive，多模态默认 adaptive。"],
+    ["resolution", "string", true, "parameters.resolution", "768P 或 2K。"],
+    ["watermark", "boolean", false, "parameters.watermark", "是否添加 AI 生成水印，默认关闭。"]
+  ],
+  validations: [
+    { assert: eq(ref("request.model"), "MiniMax/MiniMax-H3"), message: "百炼 MiniMax 视频仅支持 MiniMax/MiniMax-H3" },
+    { assert: and(gt(len(trim(ref("request.prompt"))), 0), lte(len(ref("request.prompt")), 7000)), message: "百炼 MiniMax 提示词不能为空且不能超过 7000 个字符" },
+    { assert: { $in: [ref("request.output.duration"), Array.from({ length: 12 }, (_, index) => index + 4)] }, message: "百炼 MiniMax duration 必须为 4-15 秒整数" },
+    { assert: { $in: [{ $upper: ref("request.output.resolution") }, ["768P", "2K"]] }, message: "百炼 MiniMax resolution 仅支持 768P 或 2K" },
+    { assert: eq(len(filter(minimaxInputs, "media", { $not: { $or: [
+      and(eq(ref("media.kind"), "image"), { $in: [ref("media.role"), ["", "first_frame", "last_frame", "reference_image", "subject_reference", "style_reference"]] }),
+      and(eq(ref("media.kind"), "video"), { $in: [ref("media.role"), ["", "reference_video"]] }),
+      and(eq(ref("media.kind"), "audio"), { $in: [ref("media.role"), ["", "reference_audio", "reference_voice"]] })
+    ] } })), 0), message: "百炼 MiniMax 媒体类型或角色不受支持" },
+    { assert: eq(len(filter(minimaxInputs, "media", { $not: { $in: [first(split(ref("media.value"), "://")), ["http", "https"]] } })), 0), message: "百炼 MiniMax 媒体必须使用 HTTP 或 HTTPS 公网 URL" },
+    { assert: lte(len(minimaxMedia("image")), 9), message: "百炼 MiniMax 最多支持 9 张参考图片" },
+    { assert: lte(len(minimaxMedia("video")), 3), message: "百炼 MiniMax 最多支持 3 个参考视频" },
+    { assert: lte(len(minimaxMedia("audio")), 3), message: "百炼 MiniMax 最多支持 3 个参考音频" },
+    ...[["first_frame", "首帧"], ["last_frame", "尾帧"]].map(([role, label]) => ({
+      assert: lte(len(minimaxMedia("image", [role])), 1), message: `百炼 MiniMax 最多只能有一个${label}`
+    })),
+    { assert: { $or: [eq(len(minimaxKeyframes), 0), eq(len(minimaxKeyframes), len(minimaxInputs))] }, message: "百炼 MiniMax 首尾帧不能与参考图片、视频或音频混用" },
+    { assert: { $or: [gt(len(minimaxKeyframes), 0), { $in: [coalesce(minimaxRatio, "adaptive"), ["adaptive", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]] }] }, message: "百炼 MiniMax ratio 不受支持" },
+    { assert: { $or: [gt(len(minimaxInputs), 0), { $in: [minimaxRatio, ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]] }] }, message: "百炼 MiniMax 文生视频必须指定具体画幅比例，不能使用 adaptive" }
+  ],
+  create: jsonCreate("/api/v1/services/aigc/video-generation/video-synthesis", {
+    model: ref("request.model"),
+    input: {
+      prompt: ref("request.prompt"),
+      media: omit(map(sorted(minimaxInputs), "media", {
+        type: conditional(eq(ref("media.kind"), "image"),
+          conditional({ $in: [ref("media.role"), ["first_frame", "last_frame"]] }, ref("media.role"), "image_url"),
+          conditional(eq(ref("media.kind"), "video"), "feature", "driving_audio")),
+        url: ref("media.value")
+      }))
+    },
+    parameters: {
+      resolution: { $upper: ref("request.output.resolution") },
+      ratio: conditional(gt(len(minimaxKeyframes), 0), "adaptive", coalesce(minimaxRatio, "adaptive")),
+      duration: ref("request.output.duration"),
+      watermark: coalesce(ref("request.output.watermark"), false)
+    }
+  }, { headers: { "X-DashScope-Async": "enable" }, originPath: true }),
+  poll: { method: "GET", path: "/api/v1/tasks/{{taskId}}", originPath: true },
+  response: {
+    taskId: coalesce(ref("response.output.task_id"), ref("taskId")),
+    status: conditional(eq(ref("response.output.task_status"), "UNKNOWN"), "failed", ref("response.output.task_status")),
+    message: coalesce(ref("response.output.message"), ref("response.message"), conditional(eq(ref("response.output.task_status"), "UNKNOWN"), "百炼 MiniMax 任务不存在或已超过 24 小时查询有效期")),
+    videos: ref("response.output.video_url"), usage: ref("response.usage"),
+    errorPaths: ["code", "output.code"], resultEphemeral: true
+  },
+  notes: `适配阿里云百炼 MiniMax/MiniMax-H3，渠道 Base URL 使用百炼业务空间 Endpoint。\n\n首帧、尾帧各最多 1 张，支持仅尾帧；首尾帧与多模态参考互斥。参考图最多 9 张、每张 30 MB，JPG/JPEG/PNG/WEBP/HEIC/HEIF，宽高 256-5760、宽高比 0.4-2.5。参考视频最多 3 个、每个 50 MB、2-15 秒且总时长不超过 15 秒，MP4/MOV、23.976-60 fps，宽高和比例限制同图片。音频最多 3 个、每个 15 MB、2-15 秒且总时长不超过 15 秒，WAV/MP3。插件校验已提供的角色、数量、URL、提示词和生成规格；媒体编码、尺寸、帧率及参考总时长仍需满足上游限制，不在协议模板内执行媒体探测。\n\n不发送原生 content[]、generate_audio、seed 或 prompt_optimizer，也不开放绕过统一媒体校验的 raw media 扩展。创建任务后仅轮询原 task_id，UNKNOWN 终止为失败；任务查询有效期 24 小时，结果 URL 有效期 30 天，宿主持久化临时结果。usage 保留输入视频、输出视频和图片计数，不把供应商统计直接改写为本地计费规则。\n\n官方接口：[MiniMax 视频生成 API](https://docs.bailian.console.aliyun.com/zh/model-studio/minimax-video-generation-api-reference)。`
+});
+
 const wan3MediaType = coalesce(
   ref("media.role"),
   conditional(eq(ref("media.kind"), "image"), "reference_image", conditional(
@@ -1104,6 +1206,55 @@ add({
       enable_thinking: false,
       negative_prompt: omit(ref("request.providerOptions.dashscope-qwen-image.negative_prompt")),
       seed: omit(ref("request.providerOptions.dashscope-qwen-image.seed")),
+      watermark: omit(ref("request.watermark"))
+    }
+  }, { headers: { "X-DashScope-Async": "enable" }, originPath: true }),
+  poll: { method: "GET", path: "/api/v1/tasks/{{taskId}}", originPath: true },
+  response: asyncResponse("image", {
+    taskId: coalesce(ref("response.output.task_id"), ref("response.task_id"), ref("taskId")),
+    status: coalesce(ref("response.output.task_status"), ref("response.status"), "pending"),
+    message: coalesce(ref("response.output.message"), ref("response.message")),
+    images: map(ref("response.output.choices.0.message.content"), "item", { url: omit(ref("item.image")) }),
+    errorPaths: ["code", "output.code"], messagePaths: ["message", "output.message"]
+  })
+});
+
+// 千问 AI 平台（QianWenAI MAAS）是阿里独立的 MaaS 站点，网关域名是
+// maas.qianwenaiapi.com，与百炼的 dashscope.aliyuncs.com 不是同一入口，因此单列一个插件。
+// 它同样走多模态图像端点 multimodal-generation/generation，报文形状与百炼一致
+// （input.messages[].content[].image + text），但不能复用百炼插件：改 Base URL 后仍指向
+// dashscope.aliyuncs.com，请求会打到没有开通该模型的站点。
+const qianwenaiMaasImageSizes = [
+  ["1:1", "1024*1024"], ["3:4", "960*1280"], ["4:3", "1280*960"], ["2:3", "1024*1536"], ["3:2", "1536*1024"],
+  ["9:16", "864*1536"], ["16:9", "1536*864"],
+  ["1024x1024", "1024*1024"], ["1024x1536", "1024*1536"], ["1536x1024", "1536*1024"],
+  ["1024x1280", "1024*1280"], ["1280x1024", "1280*1024"], ["960x1280", "960*1280"], ["1280x960", "1280*960"]
+];
+
+add({
+  id: "qianwenai-maas-image", providerId: "qianwenai-maas-image", name: "QianWenAI MAAS", vendor: "Alibaba QianWenAI", capability: "image",
+  baseUrl: "https://maas.qianwenaiapi.com", auth: bearer, params: imageParams, requiresPublicMediaUrls: false,
+  notes: "千问 AI 平台（QianWenAI MAAS）多模态图像端点（multimodal-generation 异步任务）。文生图与图生图共用同一入口：不传 image 为文生图，传参考图为图生图。参考图通过 input.messages[].content[].image 传输（优先 Base64 data URL）。size 采用“宽*高”，未登记的档位省略并由模型自动推荐；enable_thinking 固定为 false，因为官方要求非流式调用关闭思考模式。",
+  create: jsonCreate("/api/v1/services/aigc/multimodal-generation/generation", {
+    model: ref("request.model"),
+    input: {
+      messages: [{
+        role: "user",
+        content: {
+          $concatArrays: [
+            map(sorted(ref("request.images")), "media", { image: coalesce(ref("media.dataUrl"), ref("media.url")) }),
+            [{ text: ref("request.prompt") }]
+          ]
+        }
+      }]
+    },
+    parameters: {
+      size: omit({ $switch: { cases: qianwenaiMaasImageSizes.map(([ratio, size]) => ({ when: eq(ref("request.aspectRatio"), ratio), then: size })), default: null } }),
+      n: conditional(gt({ $toInt: ref("request.imageCount") }, 0), { $toInt: ref("request.imageCount") }, 1),
+      prompt_extend: true,
+      enable_thinking: false,
+      negative_prompt: omit(ref("request.providerOptions.qianwenai-maas-image.negative_prompt")),
+      seed: omit(ref("request.providerOptions.qianwenai-maas-image.seed")),
       watermark: omit(ref("request.watermark"))
     }
   }, { headers: { "X-DashScope-Async": "enable" }, originPath: true }),

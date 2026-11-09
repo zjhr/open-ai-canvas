@@ -1,4 +1,4 @@
-import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
+import { fitImageNodeSize, fitNodeSize } from "@/lib/canvas/canvas-node-size";
 import { NODE_DEFAULT_SIZE } from "@/constant/canvas";
 import { CanvasNodeType, type CanvasNodeData, type Position } from "@/types/canvas";
 
@@ -19,6 +19,19 @@ export function uploadPercent(loaded: number, total: number): number | undefined
 }
 export function uploadVeilOpacity(percent = 0) {
     return 1 - Math.min(100, Math.max(0, percent)) / 100 * 0.9;
+}
+
+// 字节传完后服务端仍在保存，清晰图保留一点透明度透出磨砂底图，切换为正式节点后才完全清晰。
+const UPLOAD_PREVIEW_SAVING_CLARITY = 0.88;
+
+/**
+ * 本地预览的清晰度（清晰原图叠在磨砂底图上的不透明度）随真实进度上升：刚上传时整张磨砂，传输完成时接近清晰。
+ * 只调整不透明度而不是 CSS 模糊：模糊滤镜在缩放画布时会逐帧重新栅格化整张原图，拖慢整个画布。
+ */
+export function uploadPreviewClarity(percent?: number) {
+    const progress = Math.min(100, Math.max(0, percent ?? 0)) / 100;
+    // 前段变化慢、后段变快，避免小文件一开始就“跳”到清晰。
+    return Math.round(UPLOAD_PREVIEW_SAVING_CLARITY * progress * progress * 1000) / 1000;
 }
 
 export async function createFileUploadPlaceholder(id: string, file: File, position: Position) {
@@ -72,7 +85,7 @@ export async function readUploadImageSize(file: File): Promise<{ width: number; 
 }
 
 export function createImageUploadPlaceholder(id: string, file: Pick<File, "name" | "size" | "type">, position: Position, naturalSize: { width: number; height: number }): CanvasNodeData {
-    const size = fitNodeSize(naturalSize.width, naturalSize.height);
+    const size = fitImageNodeSize(naturalSize.width, naturalSize.height);
     return {
         id, type: CanvasNodeType.Image, title: file.name,
         position: { x: position.x - size.width / 2, y: position.y - size.height / 2 },

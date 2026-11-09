@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { createImageUploadPlaceholder, createFileUploadPlaceholder, interruptFileUpload, readUploadImageSize, uploadNodeType, uploadPercent, uploadVeilOpacity } from "../src/lib/canvas/canvas-file-upload";
+import { createImageUploadPlaceholder, createFileUploadPlaceholder, interruptFileUpload, readUploadImageSize, uploadNodeType, uploadPercent, uploadPreviewClarity, uploadVeilOpacity } from "../src/lib/canvas/canvas-file-upload";
 import { CanvasNodeType } from "../src/types/canvas";
 import { isCanvasImageSourceNode } from "../src/lib/canvas/canvas-image-source";
 import { CanvasFileUploadContent } from "../src/components/canvas/canvas-file-upload-content";
@@ -11,7 +11,7 @@ import { canvasThemes } from "../src/lib/canvas-theme";
 
 const file = { name: "photo.png", size: 1234, type: "image/png" };
 const placeholder = () => createImageUploadPlaceholder("upload", file, { x: 100, y: 200 }, { width: 1920, height: 1080 });
-const read = (path: string) => readFileSync(resolve(import.meta.dir, "../src", path), "utf8");
+const read = (path: string) => readFileSync(resolve(import.meta.dir, "../src", path), "utf8").replace(/\r\n/g, "\n");
 
 describe("图片上传占位", () => {
     for (const [width, height] of [[1920, 1080], [900, 1600], [800, 800], [4000, 500]]) {
@@ -104,6 +104,12 @@ test("真实进度与遮罩浓度反向关联，不生成未知进度", () => {
     expect(uploadVeilOpacity(0)).toBe(1);
     expect(uploadVeilOpacity(50)).toBeCloseTo(0.55);
     expect(uploadVeilOpacity(100)).toBeCloseTo(0.1);
+    // 清晰原图随进度淡入：起点完全磨砂，前段慢后段快，传完仍保留一点磨砂等待保存。
+    expect(uploadPreviewClarity(undefined)).toBe(0);
+    expect(uploadPreviewClarity(0)).toBe(0);
+    expect(uploadPreviewClarity(50)).toBeLessThan(0.3);
+    expect(uploadPreviewClarity(100)).toBeCloseTo(0.88);
+    expect(uploadPreviewClarity(150)).toBeCloseTo(0.88);
 });
 
 test("统一识别图片、视频、音频、纯文本文件，不误收 PDF 或 Word", () => {

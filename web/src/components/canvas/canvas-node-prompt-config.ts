@@ -6,6 +6,7 @@ import { type AiConfig, defaultConfig } from "@/stores/use-config-store";
 import { type ModelRequirements, resolveCompatibleModel, resolveModelGenerationDefaults } from "@/lib/model-selection";
 import { canonicalGenerationMetadata } from "@/lib/canvas/generation-contract";
 import { resolveCanvasGenerationModel } from "@/lib/canvas/canvas-project-generation";
+import { withReferenceImageSize, type ImageDimensions } from "@/lib/canvas/canvas-reference-image-size";
 import { normalizeVideoDuration, normalizeVideoResolution } from "@/lib/video-generation-options";
 import type { CanvasAudioSettingKey } from "./canvas-audio-settings-popover";
 import type { CanvasNodeGenerationMode } from "./canvas-node-prompt-panel";
@@ -21,11 +22,13 @@ export function defaultMode(type: CanvasNodeData["type"]): CanvasNodeGenerationM
     return type === CanvasNodeType.Text || type === CanvasNodeType.Skill ? "text" : type === CanvasNodeType.Video ? "video" : type === CanvasNodeType.Audio ? "audio" : "image";
 }
 
-export function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode: CanvasNodeGenerationMode, requirements: ModelRequirements): AiConfig {
+export function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode: CanvasNodeGenerationMode, requirements: ModelRequirements, referenceImage?: ImageDimensions): AiConfig {
     node = { ...node, metadata: canonicalGenerationMetadata(node, mode) };
     const defaultModel = mode === "image" ? globalConfig.imageModel : mode === "video" ? globalConfig.videoModel : mode === "audio" ? globalConfig.audioModel : globalConfig.textModel;
     const fallbackModel = mode === "image" ? defaultConfig.imageModel : mode === "video" ? defaultConfig.videoModel : mode === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
     const preferredModel = resolveCanvasGenerationModel(globalConfig, node.metadata?.model, mode) || resolveCanvasGenerationModel(globalConfig, defaultModel, mode) || fallbackModel;
+    // 与 buildGenerationConfig 使用同一规则，面板显示的尺寸就是提交的尺寸。
+    if (mode === "image") node = withReferenceImageSize(globalConfig, node, preferredModel, referenceImage);
     const model = resolveCompatibleModel(globalConfig, preferredModel, mode === "image" ? { ...requirements, imageSize: node.metadata?.size || globalConfig.size || defaultConfig.size } : requirements) || preferredModel;
     const defaults = resolveModelGenerationDefaults(
         globalConfig,
@@ -34,6 +37,8 @@ export function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mo
         mode === "image"
             ? {
                   size: node.metadata?.size,
+                  imageResolution: node.metadata?.imageResolution,
+                  imageParameters: node.metadata?.imageParameters,
                   quality: node.metadata?.quality,
                   transparentBackground: node.metadata?.transparentBackground,
                   videoWatermark: node.metadata?.watermark,
@@ -48,6 +53,8 @@ export function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mo
               },
         {
             size: globalConfig.size || defaultConfig.size,
+            imageResolution: globalConfig.imageResolution || defaultConfig.imageResolution,
+            imageParameters: globalConfig.imageParameters ?? "{}",
             quality: globalConfig.quality || defaultConfig.quality,
             transparentBackground: globalConfig.transparentBackground || defaultConfig.transparentBackground,
             count: String(globalConfig.canvasImageCount || globalConfig.count || defaultConfig.count),
@@ -61,13 +68,15 @@ export function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mo
         ...globalConfig,
         model,
         quality: defaults.quality ?? globalConfig.quality ?? defaultConfig.quality,
+        imageResolution: defaults.imageResolution ?? globalConfig.imageResolution ?? defaultConfig.imageResolution,
+        imageParameters: defaults.imageParameters ?? globalConfig.imageParameters ?? "{}",
         size: defaults.size ?? globalConfig.size ?? defaultConfig.size,
         transparentBackground: defaults.transparentBackground ?? "false",
         videoSeconds: defaults.videoSeconds ?? normalizeVideoDuration(globalConfig.videoSeconds ?? defaultConfig.videoSeconds),
         vquality: defaults.vquality ?? normalizeVideoResolution(globalConfig.vquality || defaultConfig.vquality),
         videoGenerateAudio: defaults.videoGenerateAudio ?? globalConfig.videoGenerateAudio ?? defaultConfig.videoGenerateAudio,
         videoWatermark: defaults.videoWatermark ?? globalConfig.videoWatermark ?? defaultConfig.videoWatermark,
-        audioVoice: node.metadata?.audioVoice || globalConfig.audioVoice || defaultConfig.audioVoice,
+        audioVoice: node.metadata?.audioVoice ?? globalConfig.audioVoice ?? defaultConfig.audioVoice,
         audioFormat: node.metadata?.audioFormat || globalConfig.audioFormat || defaultConfig.audioFormat,
         audioSpeed: node.metadata?.audioSpeed || globalConfig.audioSpeed || defaultConfig.audioSpeed,
         audioLanguage: node.metadata?.audioLanguage || globalConfig.audioLanguage || defaultConfig.audioLanguage,

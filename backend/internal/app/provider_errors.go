@@ -56,9 +56,18 @@ func (providerCircuitOpenError) Error() string {
 type providerStatePendingError struct {
 	TaskID string
 	Cause  error
+	// Stage 是上游可读的排队/生成阶段，worker 退回调度时写入任务进度。
+	Stage string
+	// Detached 表示协议声明了分离式回查：上游仍在排队或生成，而不是状态未同步。
+	Detached bool
+	// PollDelay 是分离式回查的下次回查间隔；0 表示使用默认间隔。
+	PollDelay time.Duration
 }
 
 func (e providerStatePendingError) Error() string {
+	if e.Detached {
+		return fmt.Sprintf("上游任务仍在排队或生成，将继续查询原任务（任务 %s）", e.TaskID)
+	}
 	return fmt.Sprintf("上游任务状态尚未同步，将继续查询原任务（任务 %s）", e.TaskID)
 }
 
@@ -158,6 +167,8 @@ func (e providerHTTPError) summary() string {
 		return "模型服务拒绝了请求，请检查模型和参数"
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return "模型服务鉴权失败，请检查 API Key 和模型权限"
+	case http.StatusPaymentRequired:
+		return "模型服务余额不足（HTTP 402），请到渠道供应商充值或更换渠道后重试"
 	case http.StatusNotFound:
 		return "模型或模型接口不存在，请检查渠道配置"
 	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
@@ -208,7 +219,9 @@ func providerPayloadErrorCategory(raw string) (string, bool) {
 	// 该类目排在安全审核之前：错误码已经足够具体，比通用审核提示更可行动。
 	case strings.Contains(normalized, "privacyinformation"), strings.Contains(normalized, "sensitivecontentdetected"):
 		return "输入素材疑似包含真人形象，该模型拒绝生成，请更换为非真人素材或改用其他模型", true
-	case strings.Contains(normalized, "safety"), strings.Contains(normalized, "moderation"), strings.Contains(normalized, "content policy"), strings.Contains(normalized, "blocked"):
+	// 中文供应商的拒绝原文不含英文关键词，补少量稳定的拒绝措辞；不匹配「肖像」「色情」等可能回显提示词的单词。
+	case strings.Contains(normalized, "safety"), strings.Contains(normalized, "moderation"), strings.Contains(normalized, "content policy"), strings.Contains(normalized, "blocked"),
+		strings.Contains(normalized, "违反了关于"), strings.Contains(normalized, "防护限制"), strings.Contains(normalized, "安全策略"), strings.Contains(normalized, "内容安全"), strings.Contains(normalized, "违规内容"):
 		return "请求内容未通过模型服务安全审核，请调整后重试", true
 	// 工具调用与工具结果不配对：上游要求 assistant 消息声明的每一个 tool_call_id 都在
 	// 紧随其后的 tool 消息里被回应。这是**我们组装请求**的问题——用户改提示词或查额度

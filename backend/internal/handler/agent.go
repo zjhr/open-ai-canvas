@@ -41,6 +41,55 @@ func RegisterAgentRoutes(r *gin.RouterGroup, svc *service.Service) {
 		}
 		ok(c, view)
 	})
+	r.GET("/agent/conversations", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		limit, err := agentConversationLimit(c)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		page, err := svc.CloudAgentConversations(user.ID, c.Query("canvasId"), c.Query("before"), limit)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, page)
+	})
+	r.GET("/agent/conversations/:id", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		summary, err := svc.CloudAgentConversationSummaryByID(user.ID, c.Param("id"))
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, summary)
+	})
+	r.GET("/agent/conversations/:id/runs", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		limit, err := agentConversationLimit(c)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		page, err := svc.CloudAgentConversationRuns(user.ID, c.Param("id"), c.Query("after"), limit)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, page)
+	})
 	// Profiles are durable preference data, not an authorization surface. The
 	// service validates scope ownership and the compiler injects the effective
 	// layers only after the code-level policy has been fixed.
@@ -190,6 +239,19 @@ func RegisterAgentRoutes(r *gin.RouterGroup, svc *service.Service) {
 			return
 		}
 		ok(c, gin.H{"accepted": true, "pending": pending})
+	})
+	// 撤回尚未送达的插话；只改待送队列，不停止本轮，也不取消已提交的生成任务。
+	r.DELETE("/agent/runs/:id/interjections/:messageId", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		if err := svc.WithdrawCloudAgentInterjection(user.ID, c.Param("id"), c.Param("messageId")); err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, gin.H{"withdrawn": true})
 	})
 	r.GET("/agent/runs/:id", func(c *gin.Context) {
 		user, err := currentUser(c, svc)
@@ -379,8 +441,27 @@ func writeAgentSSE(c *gin.Context, event string, id int64, value any) {
 // 请求更大的页没有意义（单次响应体积），直接拒绝比静默截断更容易被发现。
 const agentRunEventQueryLimit = 500
 
+func agentConversationLimit(c *gin.Context) (int, error) {
+	raw, present := c.GetQuery("limit")
+	if !present {
+		return 100, nil
+	}
+	limit, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || limit < 1 || limit > 100 {
+		return 0, errors.New("limit 必须是 1–100 之间的整数")
+	}
+	return limit, nil
+}
+
 func agentRunViewOptions(c *gin.Context) (service.CloudAgentRunViewOptions, error) {
 	options := service.CloudAgentRunViewOptions{}
+	if raw := strings.TrimSpace(c.Query("fromStart")); raw != "" {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			return options, errors.New("fromStart 必须是布尔值")
+		}
+		options.FromStart = value
+	}
 	for _, item := range []struct {
 		name  string
 		value *int

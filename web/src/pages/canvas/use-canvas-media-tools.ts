@@ -3,10 +3,12 @@ import { App } from "antd";
 import { nanoid } from "nanoid";
 
 import type { CanvasImageCropRect } from "@/components/canvas/canvas-node-crop-dialog";
-import type { CanvasImageMaskEditPayload } from "@/components/canvas/canvas-node-mask-edit-dialog";
+import type { CanvasImageRegionEditPayload } from "@/components/canvas/canvas-node-region-edit-dialog";
+import { buildRegionEditPrompt } from "@/lib/canvas/image-region-edit";
 import type { CanvasImageEditPayload } from "@/components/canvas/canvas-node-image-edit-dialog";
 import type { CanvasImageLayerDecompositionPayload } from "@/components/canvas/canvas-node-layer-decomposition-dialog";
 import { buildCanvasTextEditPrompt, type CanvasImageTextEditPayload, type CanvasImageTextLine } from "@/components/canvas/canvas-node-text-edit-dialog";
+import { canvasTextDetectionModel, canvasTextDetectionSupportError } from "@/components/canvas/canvas-node-text-detection";
 import type { CanvasImageAnnotationPayload } from "@/components/canvas/canvas-node-annotation-dialog";
 import type { CanvasImageSplitParams } from "@/components/canvas/canvas-node-split-dialog";
 import type { CanvasImageUpscaleParams } from "@/components/canvas/canvas-node-upscale-dialog";
@@ -18,21 +20,25 @@ import type { PanoramaGenerateConfig } from "@/components/canvas/canvas-panorama
 import type { CanvasVideoFrameParams } from "@/components/canvas/canvas-video-frame-dialog";
 import { NODE_DEFAULT_SIZE } from "@/constant/canvas";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
+import { prepareRasterSource } from "@/lib/image-raster";
 import { isValidGridSplit, layoutGridSplitCells } from "@/lib/canvas/canvas-grid-split";
 import { audioMetadata, buildSourceImageLayerNodeResult, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-generation-task-sync";
 import { commitProducedModel } from "@/lib/canvas/produced-model";
 import { findAvailableGenerationGroupPosition, imageGenerationChildPosition, imageGenerationGroupSize } from "@/lib/canvas/canvas-generation-layout";
 import { canvasGenerationPromptMetadata } from "@/lib/canvas/canvas-generation-submission";
-import { cancelIncompleteImageBatch } from "@/lib/canvas/canvas-image-batch-retry";
+import { cancelIncompleteImageBatch, reconcileImageBatchRoot } from "@/lib/canvas/canvas-image-batch-retry";
+import { commitCanvasGenerationResult } from "@/lib/canvas/canvas-generation-result";
 import { experimentalLayerPrompt, imageLayerGenerationConfig, imageLayerProviderMetadata, parseExperimentalLayerTargets, layerDecompositionConfig, supportsExperimentalLayerExtraction, supportsLayerDecomposition } from "@/lib/canvas/canvas-image-layers";
 import { applyImageLayerPlanningPurpose, imageLayerOutputSize, imageLayerPlannerError, imageLayerPlanningPrompt, imageLayerPlanTargets, imageLayerTargetName, parseImageLayerPlan, type ImageLayerPlanningOptions } from "@/lib/canvas/canvas-image-layer-plan";
 import { imageLayerBackgroundPatch, imageLayerExtractionTargets, resolveImageLayerExtractions, type ImageLayerExtraction } from "@/lib/canvas/canvas-image-layer-strategy";
 import { buildAngleLabel, buildAnglePrompt, createCanvasNode } from "@/lib/canvas/canvas-project-domain";
 import { validateVideoSegmentBatch } from "@/lib/canvas/canvas-video-regeneration";
+import { listVideoEnhanceModels, VIDEO_ENHANCE_OPERATION, videoEnhanceSourceReference, videoEnhanceTaskInput, type VideoEnhanceParams } from "@/lib/canvas/canvas-video-enhance";
 import { resolveCanvasStyleExecution } from "@/lib/canvas/canvas-style-execution";
 import { buildGenerationConfig, buildImageGenerationMetadata, nodeReferenceImage, isGenerationCanceled, runBackendCanvasGenerationTask, runCanvasGenerationTaskToConsumer } from "@/lib/canvas/canvas-project-generation";
-import { fitNodeSize, VIDEO_NODE_MAX_SIZE } from "@/lib/canvas/canvas-node-size";
-import { compositeEmotionImage, emotionGenerationSize, emotionProviderMask, normalizeEmotionPromptForProvider, resolveEmotionEditPlan } from "@/lib/canvas/canvas-emotion";
+import { canvasImageNodeDimensions } from "@/lib/canvas/canvas-reference-image-size";
+import { fitImageNodeSize, fitNodeSize, preserveImageNodeSize, VIDEO_NODE_MAX_SIZE } from "@/lib/canvas/canvas-node-size";
+import { compositeEmotionImage, emotionGenerationSizeFor, emotionProviderMask, normalizeEmotionPromptForProvider, resolveEmotionEditPlan, supportsEmotionEdit } from "@/lib/canvas/canvas-emotion";
 import { DEFAULT_PORTRAIT_TEXTURE_SETTINGS } from "@/lib/canvas/canvas-portrait-texture";
 import { IMAGE_PROMPT_REVERSE } from "@/lib/prompts";
 import { createPortraitTextureNode, createNineGridNode } from "@/lib/canvas/canvas-image-source";
@@ -49,6 +55,8 @@ import { getTool } from "@/services/api/tools";
 import { getMediaBlob, uploadMediaFile } from "@/services/file-storage";
 import { getImageBlob, uploadImage } from "@/services/image-storage";
 import { ensureCanvasNodeAsset } from "@/services/project-asset-sync";
+import { isCanvasGenerationDurableAckError, prepareCanvasMediaNodeAsset } from "@/services/canvas-generation-consumer";
+import { runGenerationConsumer } from "@/services/generation-consumer-lifecycle";
 import { runImageLayerExtraction } from "@/services/canvas-image-layer-extraction";
 import { inspectImageLayer } from "@/services/canvas-image-layer-compositor";
 import { calibrateImageLayerPlan } from "@/services/canvas-image-layer-source";
@@ -57,7 +65,7 @@ import { resolveImageRequestSize } from "@/services/api/image-validation";
 import { resetGenerationTaskMetadata } from "@/lib/canvas/canvas-task-state";
 import type { GenerationTask } from "@/services/api/task-center";
 
-function normalizeMaskEditQuality(quality: string | undefined, size: string | undefined) {
+function normalizeRegionEditQuality(quality: string | undefined, size: string | undefined) {
     const value = String(quality || "").trim().toLowerCase();
     if (value && value !== "auto" && value !== "any") return value;
     const match = String(size || "").trim().toLowerCase().match(/^(\d+)x(\d+)$/);
@@ -65,9 +73,10 @@ function normalizeMaskEditQuality(quality: string | undefined, size: string | un
     const pixels = Number(match[1]) * Number(match[2]);
     return pixels <= 2_000_000 ? "1k" : pixels <= 4_300_000 ? "2k" : pixels <= 8_294_400 ? "4k" : quality || "auto";
 }
-import { defaultConfig, resolveModelRequestConfig, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { defaultConfig, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type ContextMenuState } from "@/types/canvas";
 import type { StartCanvasUploadStatus } from "./use-canvas-upload";
+import { translate } from "@/i18n";
 
 type UseCanvasMediaToolsOptions = {
     projectId: string;
@@ -127,7 +136,7 @@ export function useCanvasMediaTools({
     const [cropNodeId, setCropNodeId] = useState<string | null>(null);
     const [annotationNodeId, setAnnotationNodeId] = useState<string | null>(null);
     const [annotationEditNodeId, setAnnotationEditNodeId] = useState<string | null>(null);
-    const [maskEditNodeId, setMaskEditNodeId] = useState<string | null>(null);
+    const [regionEditNodeId, setRegionEditNodeId] = useState<string | null>(null);
     const [imageEditNodeId, setImageEditNodeId] = useState<string | null>(null);
     const [imageEditPreset, setImageEditPreset] = useState<"remove-background" | null>(null);
     const [layerDecompositionNodeId, setLayerDecompositionNodeId] = useState<string | null>(null);
@@ -144,6 +153,7 @@ export function useCanvasMediaTools({
     const [segmentRunningMode, setSegmentRunningMode] = useState<"audio" | "video" | null>(null);
     const segmentRunningRef = useRef(false);
     const [panoramaConfigNodeId, setPanoramaConfigNodeId] = useState<string | null>(null);
+    const [enhanceDialogNodeId, setEnhanceDialogNodeId] = useState<string | null>(null);
 
     const resolveImageEditStyle = useCallback((node: CanvasNodeData, prompt: string, config: AiConfig) => {
         try {
@@ -165,7 +175,7 @@ export function useCanvasMediaTools({
                 const result = await ensureCanvasNodeAsset({ canvasId: projectId, domainProjectId, node: mediaNode, source: "canvas-manual" });
                 assetIds.set(mediaNode.id, result.assetId);
             } catch (error) {
-                message.warning(`媒体节点已创建，但素材库写入失败：${error instanceof Error ? error.message : "未知错误"}`);
+                message.warning(translate("canvasPage.mediaTools.mediaNodeAssetWriteFailed", { error: error instanceof Error ? error.message : translate("canvasPage.common.unknownError") }));
             }
         }
         if (assetIds.size > 0) {
@@ -179,7 +189,7 @@ export function useCanvasMediaTools({
 
     const createImageReversePromptNodes = useCallback((node: CanvasNodeData) => {
         if (node.type !== CanvasNodeType.Image || !node.metadata?.content) {
-            message.warning("图片节点为空，无法反推提示词");
+            message.warning(translate("canvasPage.mediaTools.emptyImageReversePrompt"));
             return;
         }
         const gap = 96;
@@ -188,7 +198,7 @@ export function useCanvasMediaTools({
         const centerY = node.position.y + node.height / 2;
         const textNode = {
             ...createCanvasNode(CanvasNodeType.Text, { x: node.position.x + node.width + gap + textSpec.width / 2, y: centerY }, { content: IMAGE_PROMPT_REVERSE, prompt: IMAGE_PROMPT_REVERSE, status: NODE_STATUS_SUCCESS, fontSize: 14 }),
-            title: "反推提示词",
+            title: translate("canvasPage.mediaTools.reversePromptTitle"),
         };
         const resultNode = {
             ...createCanvasNode(CanvasNodeType.Text, { x: textNode.position.x + textNode.width + gap + resultSpec.width / 2, y: centerY }, {
@@ -198,7 +208,7 @@ export function useCanvasMediaTools({
                 count: 1,
                 composerContent: "参考图片：@图片1\n任务说明：@文本1",
             }),
-            title: "反推提示词结果",
+            title: translate("canvasPage.mediaTools.reversePromptResultTitle"),
         };
         setNodes((current) => [...current, textNode, resultNode]);
         setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: resultNode.id }, { id: nanoid(), fromNodeId: textNode.id, toNodeId: resultNode.id }]);
@@ -210,7 +220,7 @@ export function useCanvasMediaTools({
 
     const openPortraitTextureEditor = useCallback((node: CanvasNodeData) => {
         if (node.type !== CanvasNodeType.Image || !node.metadata?.content) {
-            message.warning("图片节点为空，无法调节人物质感");
+            message.warning(translate("canvasPage.mediaTools.emptyImagePortraitTexture"));
             return;
         }
         const portraitTextureSettings = { ...DEFAULT_PORTRAIT_TEXTURE_SETTINGS, ...node.metadata?.portraitTexture };
@@ -227,17 +237,15 @@ export function useCanvasMediaTools({
 
     const cropImageNode = useCallback(async (node: CanvasNodeData, crop: CanvasImageCropRect) => {
         if (!node.metadata?.content) return;
-        // 云端图片地址通常不带 CORS 头，直接画到 canvas 会被判定为跨域而无法导出。
-        // 优先用本地缓存里的 Blob 构造同源地址，裁剪才能读取像素。
         let releaseSource = () => {};
         try {
-            const source = await resolveCroppableImageSource(node);
+            const source = await resolveProcessableImageSource(node);
             releaseSource = source.release;
             const cropped = await cropDataUrl(source.url, crop);
             const image = await uploadImage(cropped);
-            const size = fitNodeSize(image.width, image.height, node.width, node.height);
+            const size = fitImageNodeSize(image.width, image.height);
             const childId = nanoid();
-            const child: CanvasNodeData = { id: childId, type: CanvasNodeType.Image, title: `${node.title || "图片"} · 裁剪`, position: { x: node.position.x + node.width + 96, y: node.position.y }, width: size.width, height: size.height, metadata: { ...imageMetadata(image), prompt: node.metadata?.prompt } };
+            const child: CanvasNodeData = { id: childId, type: CanvasNodeType.Image, title: translate("canvasPage.mediaTools.titleCrop", { title: node.title || translate("canvasPage.common.image") }), position: { x: node.position.x + node.width + 96, y: node.position.y }, width: size.width, height: size.height, metadata: { ...imageMetadata(image), prompt: node.metadata?.prompt } };
             setNodes((current) => [...current, child]);
             setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
             setSelectedNodeIds(new Set([childId]));
@@ -245,7 +253,7 @@ export function useCanvasMediaTools({
             setCropNodeId(null);
             await persistMediaNodes([child]);
         } catch (error) {
-            message.error(error instanceof Error ? `裁剪失败：${error.message}` : "裁剪失败，请重试");
+            message.error(error instanceof Error ? translate("canvasPage.mediaTools.cropFailedWithReason", { error: error.message }) : translate("canvasPage.mediaTools.cropFailed"));
         } finally {
             releaseSource();
         }
@@ -253,9 +261,9 @@ export function useCanvasMediaTools({
 
     const saveAnnotatedImageNode = useCallback(async (node: CanvasNodeData, dataUrl: string) => {
         const image = await uploadImage(dataUrl);
-        const size = fitNodeSize(image.width, image.height, node.width, node.height);
+        const size = fitImageNodeSize(image.width, image.height);
         const childId = nanoid();
-        const child: CanvasNodeData = { id: childId, type: CanvasNodeType.Image, title: `${node.title || "图片"} · 标注`, position: { x: node.position.x + node.width + 96, y: node.position.y }, width: size.width, height: size.height, metadata: { ...imageMetadata(image), prompt: node.metadata?.prompt } };
+        const child: CanvasNodeData = { id: childId, type: CanvasNodeType.Image, title: translate("canvasPage.mediaTools.titleAnnotation", { title: node.title || translate("canvasPage.common.image") }), position: { x: node.position.x + node.width + 96, y: node.position.y }, width: size.width, height: size.height, metadata: { ...imageMetadata(image), prompt: node.metadata?.prompt } };
         setNodes((current) => [...current, child]);
         setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
         setSelectedNodeIds(new Set([childId]));
@@ -263,12 +271,12 @@ export function useCanvasMediaTools({
         setDialogNodeId(null);
         setAnnotationNodeId(null);
         await persistMediaNodes([child]);
-        message.success("标注图片已保存为新节点");
+        message.success(translate("canvasPage.mediaTools.annotationSaved"));
     }, [message, persistMediaNodes, setConnections, setDialogNodeId, setNodes, setSelectedConnectionId, setSelectedNodeIds]);
 
     const openVideoFrameExtractor = useCallback((node: CanvasNodeData) => {
         if (!node.metadata?.content) {
-            message.warning("视频节点为空，无法提取画面");
+            message.warning(translate("canvasPage.mediaTools.emptyVideoFrames"));
             return;
         }
         if (extractingVideoFramesNodeIdRef.current) return;
@@ -285,27 +293,27 @@ export function useCanvasMediaTools({
     const extractVideoFrames = useCallback(async (node: CanvasNodeData, params: CanvasVideoFrameParams): Promise<CanvasNodeData[]> => {
         const content = node.metadata?.content;
         if (!content || extractingVideoFramesNodeIdRef.current || !params.timesMs.length) return [];
-        const progress = startUploadStatus("提取视频画面", "读取视频资源", params.timesMs.length + 2);
+        const progress = startUploadStatus(translate("canvasPage.mediaTools.extractFramesTitle"), translate("canvasPage.mediaTools.readingVideo"), params.timesMs.length + 2);
         extractingVideoFramesNodeIdRef.current = node.id;
         setExtractingVideoFramesNodeId(node.id);
         setFrameDialogNodeId(null);
         try {
             const storedBlob = node.metadata?.storageKey ? await getMediaBlob(node.metadata.storageKey).catch(() => null) : null;
-            progress.update("定位并绘制所选画面", 2);
+            progress.update(translate("canvasPage.mediaTools.drawingFrames"), 2);
             const captured = await captureVideoFrames(storedBlob || content, params.timesMs);
             const uploadedFrames = [];
             const uploadFailures: string[] = [];
             for (let index = 0; index < captured.frames.length; index += 1) {
                 const frame = captured.frames[index];
                 try {
-                    progress.update(`保存画面（${index + 1}/${captured.frames.length}）`, index + 3);
+                    progress.update(translate("canvasPage.mediaTools.savingFrame", { current: index + 1, total: captured.frames.length }), index + 3);
                     uploadedFrames.push({ timeMs: frame.timeMs, image: await uploadImage(frame.blob) });
                 } catch (error) {
-                    uploadFailures.push(error instanceof Error ? error.message : "画面图片上传失败");
+                    uploadFailures.push(error instanceof Error ? error.message : translate("canvasPage.mediaTools.frameUploadFailed"));
                 }
             }
             const frameNodes = buildVideoFrameNodes(node, uploadedFrames);
-            if (!frameNodes.length) throw new Error(uploadFailures[0] || "画面图片保存失败");
+            if (!frameNodes.length) throw new Error(uploadFailures[0] || translate("canvasPage.mediaTools.frameSaveFailed"));
             const links = frameNodes.map((frameNode) => ({ id: nanoid(), fromNodeId: node.id, toNodeId: frameNode.id }));
             const nextNodes = [...nodesRef.current, ...frameNodes];
             const nextConnections = [...connectionsRef.current, ...links];
@@ -319,11 +327,11 @@ export function useCanvasMediaTools({
             setSelectedConnectionId(null);
             await persistMediaNodes(frameNodes);
             const failedCount = captured.failures.length + uploadFailures.length;
-            progress.done(failedCount ? `已提取 ${frameNodes.length} 帧，${failedCount} 帧失败` : `已提取 ${frameNodes.length} 帧并创建图片节点`);
-            if (failedCount) message.warning(`${failedCount} 个时间点提取失败，其余画面已创建`);
+            progress.done(failedCount ? translate("canvasPage.mediaTools.framesExtractedPartial", { count: frameNodes.length, failed: failedCount }) : translate("canvasPage.mediaTools.framesExtracted", { count: frameNodes.length }));
+            if (failedCount) message.warning(translate("canvasPage.mediaTools.framesPartialFailed", { count: failedCount }));
             return frameNodes;
         } catch (error) {
-            const details = error instanceof Error ? error.message : "视频画面提取失败";
+            const details = error instanceof Error ? error.message : translate("canvasPage.mediaTools.frameExtractFailed");
             progress.fail(details);
             message.error(details);
             return [];
@@ -335,7 +343,7 @@ export function useCanvasMediaTools({
 
     const extractAudioFromVideo = useCallback((node: CanvasNodeData) => {
         if (!node.metadata?.content) {
-            message.warning("视频节点为空，无法提取声音");
+            message.warning(translate("canvasPage.mediaTools.emptyVideoAudio"));
             return;
         }
         if (segmentRunningRef.current) return;
@@ -347,7 +355,7 @@ export function useCanvasMediaTools({
 
     const openVideoSegmentExtractor = useCallback((node: CanvasNodeData) => {
         if (!node.metadata?.content) {
-            message.warning("视频节点为空，无法截取片段");
+            message.warning(translate("canvasPage.mediaTools.emptyVideoClip"));
             return;
         }
         if (segmentRunningRef.current) return;
@@ -365,12 +373,12 @@ export function useCanvasMediaTools({
 
     // 从视频片段提取声音：FFmpeg 提取 MP3 → 上传为音频资源 → 创建音频节点 → 写入素材库/项目资产。
     const runExtractVideoAudio = useCallback(async (node: CanvasNodeData, params: CanvasVideoSegmentParams) => {
-        const progress = startUploadStatus("提取音频", "加载 FFmpeg", 4);
+        const progress = startUploadStatus(translate("canvasPage.mediaTools.extractAudioTitle"), translate("canvasPage.mediaTools.loadingFfmpeg"), 4);
         try {
             const mp3 = await extractVideoAudio({ url: node.metadata?.content, storageKey: node.metadata?.storageKey }, { startMs: params.startMs, endMs: params.endMs }, node.metadata?.durationMs, (status) => {
-                progress.update(status.phase === "loading" ? "加载 FFmpeg" : status.phase === "reading" ? "读取视频资源" : "正在提取音频", status.phase === "encoding" ? 3 : 2);
+                progress.update(status.phase === "loading" ? translate("canvasPage.mediaTools.loadingFfmpeg") : status.phase === "reading" ? translate("canvasPage.mediaTools.readingVideo") : translate("canvasPage.mediaTools.extractingAudio"), status.phase === "encoding" ? 3 : 2);
             });
-            progress.update("上传音频到服务器", 4);
+            progress.update(translate("canvasPage.mediaTools.uploadingAudio"), 4);
             const uploaded = await uploadMediaFile(mp3, "audio");
             const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Audio];
             const audioNode = createCanvasNode(
@@ -378,7 +386,7 @@ export function useCanvasMediaTools({
                 { x: node.position.x + node.width + 96 + spec.width / 2, y: node.position.y + node.height / 2 },
                 { ...audioMetadata(uploaded), prompt: `从「${node.title || "视频"}」提取的声音`, status: NODE_STATUS_SUCCESS },
             );
-            audioNode.title = `${node.title || "视频"} · 音频`;
+            audioNode.title = translate("canvasPage.mediaTools.titleAudio", { title: node.title || translate("canvasPage.common.video") });
             const audioNodeId = audioNode.id;
             setNodes((current) => [...current, audioNode]);
             setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: audioNodeId }]);
@@ -387,12 +395,20 @@ export function useCanvasMediaTools({
             try {
                 const result = await ensureCanvasNodeAsset({ canvasId: projectId, domainProjectId, node: audioNode, source: "canvas-manual" });
                 setNodes((current) => current.map((item) => (item.id === audioNodeId ? { ...item, metadata: { ...item.metadata, assetId: result.assetId } } : item)));
-                progress.done(result.linkedToProject ? "声音已提取并加入素材库与项目资产" : "声音已提取并加入素材库");
+                progress.done(
+                    result.syncPending
+                        ? domainProjectId
+                            ? translate("canvasPage.mediaTools.audioSavedLocalProjectSync")
+                            : translate("canvasPage.mediaTools.audioSavedLocalAssetSync")
+                        : result.linkedToProject
+                          ? translate("canvasPage.mediaTools.audioExtractedProject")
+                          : translate("canvasPage.mediaTools.audioExtracted"),
+                );
             } catch (assetError) {
-                progress.done(`声音已提取并生成音频节点，素材库写入失败：${assetError instanceof Error ? assetError.message : "未知错误"}`);
+                progress.done(translate("canvasPage.mediaTools.audioAssetWriteFailed", { error: assetError instanceof Error ? assetError.message : translate("canvasPage.common.unknownError") }));
             }
         } catch (error) {
-            const details = error instanceof Error ? error.message : "音频提取失败";
+            const details = error instanceof Error ? error.message : translate("canvasPage.mediaTools.audioExtractFailed");
             progress.fail(details);
             message.error(details);
         }
@@ -402,7 +418,7 @@ export function useCanvasMediaTools({
     const runTrimVideoSegments = useCallback(async (node: CanvasNodeData, params: CanvasVideoSegmentParams) => {
         const segments = params.segments || [];
         if (!segments.length) {
-            message.warning("请至少添加一个截取片段");
+            message.warning(translate("canvasPage.mediaTools.addClipSegment"));
             return;
         }
         const createsGenerationNodes = params.action === "create-generation-nodes";
@@ -415,7 +431,7 @@ export function useCanvasMediaTools({
                 return;
             }
         }
-        const progress = startUploadStatus("截取视频片段", "加载 FFmpeg", segments.length * 4);
+        const progress = startUploadStatus(translate("canvasPage.mediaTools.clipVideoTitle"), translate("canvasPage.mediaTools.loadingFfmpeg"), segments.length * 4);
         try {
             const prepared: Array<{ segmentNode: CanvasNodeData; targetNode?: CanvasNodeData }> = [];
             const failedSegments: string[] = [];
@@ -433,18 +449,18 @@ export function useCanvasMediaTools({
                             ? { url: segment.sourceUrl, storageKey: segment.sourceStorageKey }
                             : { url: node.metadata?.content, storageKey: node.metadata?.storageKey };
                     const trimDurationMs = sourceNode?.metadata?.durationMs || node.metadata?.durationMs;
-                    progress.update(`加载 FFmpeg（${index + 1}/${segments.length}）`, index * 4 + 1);
+                    progress.update(translate("canvasPage.mediaTools.loadingFfmpegStep", { current: index + 1, total: segments.length }), index * 4 + 1);
                     const mp4 = await trimVideoSegment(trimSource, { startMs: segment.startMs, endMs: segment.endMs }, trimDurationMs, (status) => {
-                        progress.update(status.phase === "loading" ? `加载 FFmpeg（${index + 1}/${segments.length}）` : status.phase === "reading" ? `读取视频资源（${index + 1}/${segments.length}）` : `正在截取片段（${index + 1}/${segments.length}）`, status.phase === "encoding" ? index * 4 + 3 : index * 4 + 2);
+                        progress.update(translate(status.phase === "loading" ? "canvasPage.mediaTools.loadingFfmpegStep" : status.phase === "reading" ? "canvasPage.mediaTools.readingVideoStep" : "canvasPage.mediaTools.clippingStep", { current: index + 1, total: segments.length }), status.phase === "encoding" ? index * 4 + 3 : index * 4 + 2);
                     });
-                    progress.update(`上传片段到服务器（${index + 1}/${segments.length}）`, index * 4 + 3);
+                    progress.update(translate("canvasPage.mediaTools.uploadingClipStep", { current: index + 1, total: segments.length }), index * 4 + 3);
                     const uploaded = await uploadMediaFile(mp4, "video");
                     const size = fitNodeSize(uploaded.width || 1280, uploaded.height || 720, VIDEO_NODE_MAX_SIZE.width, VIDEO_NODE_MAX_SIZE.height);
                     const segmentId = nanoid();
                     const segmentNode: CanvasNodeData = {
                         id: segmentId,
                         type: CanvasNodeType.Video,
-                        title: `${sourceNode?.title || node.title || "视频"} · 片段 ${index + 1}`,
+                        title: translate("canvasPage.mediaTools.titleClip", { title: sourceNode?.title || node.title || translate("canvasPage.common.video"), index: index + 1 }),
                         position: { x: baseX, y: baseY + index * (Math.max(size.height, spec.height) + 24) },
                         width: size.width,
                         height: size.height,
@@ -454,7 +470,7 @@ export function useCanvasMediaTools({
                         ? {
                             id: nanoid(),
                             type: CanvasNodeType.Video,
-                            title: `待生成 ${index + 1} · ${sourceNode?.title || node.title || "视频"}`,
+                            title: translate("canvasPage.mediaTools.titlePendingClip", { title: sourceNode?.title || node.title || translate("canvasPage.common.video"), index: index + 1 }),
                             position: { x: segmentNode.position.x + size.width + 96, y: segmentNode.position.y + (size.height - spec.height) / 2 },
                             width: spec.width,
                             height: spec.height,
@@ -463,10 +479,10 @@ export function useCanvasMediaTools({
                         : undefined;
                     prepared.push({ segmentNode, targetNode });
                 } catch (segmentError) {
-                    failedSegments.push(segmentError instanceof Error ? segmentError.message : "视频截取失败");
+                    failedSegments.push(segmentError instanceof Error ? segmentError.message : translate("canvasPage.mediaTools.clipFailed"));
                 }
             }
-            if (!prepared.length) throw new Error(failedSegments[0] || "视频截取失败");
+            if (!prepared.length) throw new Error(failedSegments[0] || translate("canvasPage.mediaTools.clipFailed"));
             const segmentNodes = prepared.map((item) => item.segmentNode);
             const targetNodes = prepared.flatMap((item) => item.targetNode ? [item.targetNode] : []);
             const nextNodes = [...nodesRef.current, ...segmentNodes, ...targetNodes];
@@ -486,15 +502,15 @@ export function useCanvasMediaTools({
             selectedNodeIdsRef.current = selection;
             setSelectedNodeIds(selection);
             setSelectedConnectionId(null);
-            progress.done(targetNodes.length ? `已截取 ${prepared.length}/${segments.length} 段并创建待生成节点` : `已截取 ${prepared.length}/${segments.length} 段视频`);
+            progress.done(translate(targetNodes.length ? "canvasPage.mediaTools.clipsCreatedWithTargets" : "canvasPage.mediaTools.clipsCreated", { done: prepared.length, total: segments.length }));
             segmentNodes.forEach((segmentNode) => {
                 void ensureCanvasNodeAsset({ canvasId: projectId, domainProjectId, node: segmentNode, source: "canvas-manual" })
                     .then((result) => setNodes((current) => current.map((item) => (item.id === segmentNode.id ? { ...item, metadata: { ...item.metadata, assetId: result.assetId } } : item))))
-                    .catch((assetError) => message.warning(`片段已截取，但素材库写入失败：${assetError instanceof Error ? assetError.message : "未知错误"}`));
+                    .catch((assetError) => message.warning(translate("canvasPage.mediaTools.clipAssetWriteFailed", { error: assetError instanceof Error ? assetError.message : translate("canvasPage.common.unknownError") })));
             });
-            if (failedSegments.length) message.warning(`${failedSegments.length} 段截取失败，其余 ${prepared.length} 段已创建`);
+            if (failedSegments.length) message.warning(translate("canvasPage.mediaTools.clipsPartialFailed", { failed: failedSegments.length, done: prepared.length }));
         } catch (error) {
-            const details = error instanceof Error ? error.message : "视频截取失败";
+            const details = error instanceof Error ? error.message : translate("canvasPage.mediaTools.clipFailed");
             progress.fail(details);
             message.error(details);
         }
@@ -535,7 +551,7 @@ export function useCanvasMediaTools({
                 return leftShot - rightShot || left.position.y - right.position.y || left.position.x - right.position.x;
             });
         if (videos.length < 2) {
-            message.warning("请至少选择两个已有视频");
+            message.warning(translate("canvasPage.mediaTools.selectTwoVideos"));
             return;
         }
         mergeVideoRunningRef.current = true;
@@ -551,11 +567,11 @@ export function useCanvasMediaTools({
                 ...videoMetadata(uploaded),
                 prompt: `按选中顺序合并 ${videos.length} 段视频`,
                 workflowKind: "final",
-                workflowTitle: "合并成片",
+                workflowTitle: translate("canvasPage.mediaTools.mergeFinalTitle"),
                 videoEditOperation: "concat",
                 status: NODE_STATUS_SUCCESS,
             });
-            mergedNode.title = `合并成片 · ${videos.length} 段`;
+            mergedNode.title = translate("canvasPage.mediaTools.titleMerged", { count: videos.length });
             mergedNode.width = size.width;
             mergedNode.height = size.height;
             mergedNode.position = { x: left, y: top };
@@ -573,9 +589,9 @@ export function useCanvasMediaTools({
             setDialogNodeId(null);
             await persistMediaNodes([mergedNode]);
             setMergeVideoProgress({ phase: "encoding", progress: 100 });
-            message.success(`已合并 ${videos.length} 段视频，成片节点已添加`);
+            message.success(translate("canvasPage.mediaTools.mergedVideos", { count: videos.length }));
         } catch (error) {
-            message.error(error instanceof Error ? error.message : "视频合并失败");
+            message.error(error instanceof Error ? error.message : translate("canvasPage.mediaTools.mergeFailed"));
         } finally {
             mergeVideoRunningRef.current = false;
             window.setTimeout(() => setMergeVideoProgress(null), 700);
@@ -594,7 +610,7 @@ export function useCanvasMediaTools({
         const childNode: CanvasNodeData = {
             id: childId,
             type: CanvasNodeType.Panorama,
-            title: `${node.title || "图片"} · 全景`,
+            title: translate("canvasPage.mediaTools.titlePanorama", { title: node.title || translate("canvasPage.common.image") }),
             position: { x: node.position.x + node.width + 96, y: node.position.y },
             width: panoramaSpec.width,
             height: panoramaSpec.height,
@@ -622,12 +638,12 @@ export function useCanvasMediaTools({
         // 全景节点是纯查看器，创建后不弹提示词面板。
         setDialogNodeId(null);
         setPanoramaConfigNodeId(null);
-        message.success(config.sourceMode === "image" ? "已创建全景查看节点" : "已创建全景生成节点");
+        message.success(config.sourceMode === "image" ? translate("canvasPage.mediaTools.panoramaViewerCreated") : translate("canvasPage.mediaTools.panoramaGeneratorCreated"));
     }, [message, setConnections, setDialogNodeId, setNodes, setSelectedConnectionId, setSelectedNodeIds]);
 
     const addPanoramaCaptureNode = useCallback(async (node: CanvasNodeData, dataUrl: string, title: string) => {
         const image = await uploadImage(dataUrl);
-        const size = fitNodeSize(image.width || 720, image.height || 405);
+        const size = fitImageNodeSize(image.width || 720, image.height || 405);
         // 已有导出时按列错开，避免多张截图叠在同一位置。
         const outputCount = connectionsRef.current.filter((connection) => connection.fromNodeId === node.id).length;
         const childNode: CanvasNodeData = {
@@ -642,16 +658,19 @@ export function useCanvasMediaTools({
         setNodes((current) => [...current, childNode]);
         setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: childNode.id }]);
         await persistMediaNodes([childNode]);
-        message.success(`已导出「${title}」`);
+        message.success(translate("canvasPage.mediaTools.exported", { title }));
     }, [connectionsRef, message, persistMediaNodes, setConnections, setNodes]);
 
     const splitImageNode = useCallback(async (node: CanvasNodeData, params: CanvasImageSplitParams) => {
         if (!node.metadata?.content || !isValidGridSplit(params)) return;
+        let releaseSource = () => {};
         try {
-            const pieces = await splitDataUrl(node.metadata.content, params);
+            const source = await resolveProcessableImageSource(node);
+            releaseSource = source.release;
+            const pieces = await splitDataUrl(source.url, params);
             const sizedPieces = await Promise.all(pieces.map(async (piece) => {
                 const image = await uploadImage(piece.dataUrl);
-                return { piece, image, size: fitNodeSize(image.width, image.height) };
+                return { piece, image, size: fitImageNodeSize(image.width, image.height) };
             }));
             const positions = layoutGridSplitCells(
                 { x: node.position.x + node.width + 96, y: node.position.y },
@@ -660,7 +679,7 @@ export function useCanvasMediaTools({
             const childNodes = sizedPieces.map(({ piece, image, size }, index) => ({
                 id: nanoid(),
                 type: CanvasNodeType.Image,
-                title: `${node.title || "图片"} · 宫格 ${piece.row + 1}-${piece.column + 1}`,
+                title: translate("canvasPage.mediaTools.titleGridPiece", { title: node.title || translate("canvasPage.common.image"), row: piece.row + 1, column: piece.column + 1 }),
                 position: positions[index] || { x: node.position.x + node.width + 96, y: node.position.y },
                 width: size.width,
                 height: size.height,
@@ -672,28 +691,38 @@ export function useCanvasMediaTools({
             setSelectedConnectionId(null);
             setDialogNodeId(null);
             await persistMediaNodes(childNodes);
-            message.success(`已切分为 ${childNodes.length} 个子节点`);
+            message.success(translate("canvasPage.mediaTools.splitDone", { count: childNodes.length }));
         } catch (error) {
-            message.error(error instanceof Error ? `切分失败：${error.message}` : "图片切分失败，请重试");
+            message.error(error instanceof Error ? translate("canvasPage.mediaTools.splitFailedWithReason", { error: error.message }) : translate("canvasPage.mediaTools.splitFailed"));
+        } finally {
+            releaseSource();
         }
     }, [message, persistMediaNodes, setConnections, setDialogNodeId, setNodes, setSelectedConnectionId, setSelectedNodeIds]);
 
-    const maskEditImageNode = useCallback(async (node: CanvasNodeData, payload: CanvasImageMaskEditPayload) => {
+    const regionEditImageNode = useCallback(async (node: CanvasNodeData, payload: CanvasImageRegionEditPayload) => {
         if (!node.metadata?.content) return;
         const baseGenerationConfig = buildGenerationConfig(effectiveConfig, node, "image");
-        const selectedModel = payload.generationConfig?.model || payload.generationConfig?.imageModel || baseGenerationConfig.model;
+        const selectedModel = payload.generationConfig?.imageModel || payload.generationConfig?.model || baseGenerationConfig.model;
         const modelDefaults = defaultImageParamsForModel(baseGenerationConfig, selectedModel);
         const selectedImageProfile = modelCapabilityConfigFor(baseGenerationConfig, selectedModel).image;
-        if (!selectedImageProfile?.references.maskSupported) {
-            message.error("当前图片模型不支持局部重绘蒙版，请选择支持蒙版编辑的模型");
+        const maxReferenceImages = selectedImageProfile?.references.maxImages ?? 0;
+        if (!payload.regions.length) {
+            message.warning(translate("canvasPage.mediaTools.selectRegionFirst"));
             return;
         }
+        if (maxReferenceImages < 1) {
+            message.error(translate("canvasPage.mediaTools.modelNoReferenceEdit"));
+            return;
+        }
+        // 能收两张参考图时附带编号标注图；支持蒙版时再用蒙版锁住框外像素。坐标始终写进提示词，单图模型也能定位。
+        const useAnnotatedReference = maxReferenceImages >= 2;
+        const useMask = Boolean(selectedImageProfile?.references.maskSupported);
         const generationConfig = {
             ...baseGenerationConfig,
             ...payload.generationConfig,
             model: selectedModel,
-            imageModel: payload.generationConfig?.imageModel || payload.generationConfig?.model || effectiveConfig.imageModel,
-            quality: normalizeMaskEditQuality(payload.generationConfig?.quality || node.metadata?.quality || baseGenerationConfig.quality || modelDefaults.quality, payload.generationConfig?.size || node.metadata?.size || baseGenerationConfig.size || modelDefaults.size),
+            imageModel: selectedModel,
+            quality: normalizeRegionEditQuality(payload.generationConfig?.quality || node.metadata?.quality || baseGenerationConfig.quality || modelDefaults.quality, payload.generationConfig?.size || node.metadata?.size || baseGenerationConfig.size || modelDefaults.size),
             count: String(payload.generationConfig?.count || 1),
             // 原图像素尺寸不是模型的输出尺寸合同；非高级设置时使用模型默认尺寸，避免把节点尺寸误发给上游。
             size: payload.generationConfig?.size || node.metadata?.size || modelDefaults.size,
@@ -703,15 +732,18 @@ export function useCanvasMediaTools({
             return;
         }
         const userPrompt = payload.prompt.trim();
-        const prompt = `只修改蒙版透明区域，其他区域保持不变。${userPrompt}`;
+        const prompt = buildRegionEditPrompt({ prompt: userPrompt, regions: payload.regions, size: payload.size, annotatedReference: useAnnotatedReference, mask: useMask });
         const source = nodeReferenceImage(node);
         if (!source) return;
+        const annotatedReference = { id: `${node.id}-regions`, name: "regions.jpg", type: "image/jpeg", dataUrl: payload.annotatedDataUrl };
+        const referenceImages = useAnnotatedReference ? [source, annotatedReference] : [source];
+        const mask = useMask ? { id: `${node.id}-mask`, name: "mask.png", type: "image/png", dataUrl: payload.maskDataUrl } : undefined;
         const styleExecution = resolveImageEditStyle(node, prompt, generationConfig);
         if (!styleExecution) return;
         const { prompt: effectivePrompt, metadata: styleMetadata } = styleExecution;
         const requestedCount = Math.max(1, Number(generationConfig.count) || 1);
-        const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, requestedCount, [source]);
-        setMaskEditNodeId(null);
+        const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, requestedCount, referenceImages);
+        setRegionEditNodeId(null);
         const rootId = nanoid();
         const childIds = requestedCount > 1 ? Array.from({ length: requestedCount }, () => nanoid()) : [];
         const targetIds = requestedCount > 1 ? childIds : [rootId];
@@ -721,7 +753,7 @@ export function useCanvasMediaTools({
         const rootNode: CanvasNodeData = {
             id: rootId,
             type: CanvasNodeType.Image,
-            title: userPrompt.slice(0, 32) || "局部编辑结果",
+            title: userPrompt.slice(0, 32) || translate("canvasPage.mediaTools.regionEditResult"),
             position: rootPosition,
             width: node.width,
             height: node.height,
@@ -739,7 +771,7 @@ export function useCanvasMediaTools({
         const childNodes: CanvasNodeData[] = childIds.map((id, index) => ({
             id,
             type: CanvasNodeType.Image,
-            title: `${userPrompt.slice(0, 28) || "局部编辑结果"} · ${index + 1}`,
+            title: translate("canvasPage.mediaTools.titleIndexed", { title: userPrompt.slice(0, 28) || translate("canvasPage.mediaTools.regionEditResult"), index: index + 1 }),
             position: imageGenerationChildPosition(rootNode.position, rootNode.width, imageSize, index),
             width: node.width,
             height: node.height,
@@ -759,44 +791,35 @@ export function useCanvasMediaTools({
         setDialogNodeId(rootId);
         const controller = startGenerationRequest(rootId, node.id, rootId);
         targetIds.forEach((targetId) => startGenerationRequest(targetId, node.id, rootId, controller));
-        let hasSuccess = false;
-        let failureCount = 0;
+        const taskIds = new Map<string, string>();
         let representativeError: string | undefined;
         try {
             await Promise.all(targetIds.map(async (targetId) => {
                 try {
-                    const result = await runBackendCanvasGenerationTask({
+                    await runCanvasGenerationTaskToConsumer({
                         projectId,
                         nodeId: targetId,
                         mode: "image",
                         prompt: effectivePrompt,
                         config: { ...generationConfig, count: "1" },
-                        referenceImages: [source],
-                        mask: { id: `${node.id}-mask`, name: "mask.png", type: "image/png", dataUrl: payload.maskDataUrl },
+                        referenceImages,
+                        mask,
                         signal: controller.signal,
-                        metadata: { sourceNodeId: node.id, edit: "mask", ...styleMetadata },
-                        onTaskCreated: (task) => bindGenerationTask(targetId, task),
+                        metadata: { sourceNodeId: node.id, edit: "region", regionCount: payload.regions.length, annotationReference: useAnnotatedReference || undefined, ...styleMetadata },
+                    }, {
+                        bindTask: (task) => {
+                            taskIds.set(targetId, task.id);
+                            bindGenerationTask(targetId, task);
+                        },
+                        consumeTask: (task) => applyGenerationTaskResult(targetId, task),
                     });
-                    const image = result.images?.find((item) => item?.dataUrl);
-                    if (!image?.dataUrl) throw new Error("后端任务没有返回图片");
-                    const uploaded = await uploadImage(image.dataUrl);
-                    const size = fitNodeSize(uploaded.width, uploaded.height, node.width, node.height);
-                    const currentNode = nodesRef.current.find((item) => item.id === targetId);
-                    if (!currentNode) throw new Error("局部编辑节点已被删除");
-                    const finalizedNode = { ...currentNode, width: size.width, height: size.height, metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt: effectivePrompt, ...generationMetadata }) };
-                    setNodes((current) => current.map((item) => {
-                        if (item.id === targetId) return finalizedNode;
-                        if (item.id !== rootId || requestedCount <= 1 || item.metadata?.primaryImageId) return item;
-                        return { ...item, width: size.width, height: size.height, metadata: commitProducedModel({ ...item.metadata, ...imageMetadata(uploaded), primaryImageId: targetId, status: NODE_STATUS_SUCCESS }) };
-                    }));
-                    await persistMediaNodes([finalizedNode]);
-                    hasSuccess = true;
                 } catch (error) {
-                    if (isGenerationCanceled(error)) return;
-                    failureCount += 1;
+                    if (controller.signal.aborted || isGenerationCanceled(error)) return;
                     const details = generationErrorMessage(error);
                     representativeError = details;
-                    setNodes((current) => current.map((item) => (item.id === targetId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item)));
+                    if (!isCanvasGenerationDurableAckError(error)) {
+                        setNodes((current) => current.map((item) => (item.id === targetId && item.metadata?.taskId === taskIds.get(targetId) ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item)));
+                    }
                 } finally {
                     finishGenerationRequest(targetId, controller);
                 }
@@ -816,32 +839,27 @@ export function useCanvasMediaTools({
                 });
                 return;
             }
+            const targets = nodesRef.current.filter((item) => targetIds.includes(item.id) && item.metadata?.taskId === taskIds.get(item.id) && (requestedCount === 1 || item.metadata?.batchRootId === rootId));
+            const hasSuccess = targets.some((item) => item.metadata?.status === NODE_STATUS_SUCCESS && item.metadata.assetId);
+            const failureCount = targets.filter((item) => item.metadata?.status === NODE_STATUS_ERROR).length;
             if (failureCount > 0) {
-                message.error(hasSuccess ? "部分局部编辑失败" : representativeError || "局部编辑失败");
+                message.error(hasSuccess ? translate("canvasPage.mediaTools.regionEditPartialFailed") : representativeError || translate("canvasPage.mediaTools.regionEditFailed"));
+            } else if (representativeError && targets.length) {
+                message.warning(representativeError);
             }
             setNodes((current) => current.map((item) => {
-                if (item.id !== rootId) return item;
-                return {
-                    ...item,
-                    metadata: {
-                        ...item.metadata,
-                        status: hasSuccess ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR,
-                        batchFailedCount: requestedCount > 1 ? failureCount : undefined,
-                        ...(hasSuccess
-                            ? { errorDetails: undefined }
-                            : { errorDetails: representativeError || "局部编辑失败" }),
-                    },
-                };
+                if (item.id !== rootId || requestedCount <= 1) return item;
+                return reconcileImageBatchRoot(item, current);
             }));
         } finally {
             if (requestedCount > 1) finishGenerationRequest(rootId, controller);
             setRunningNodeId(null);
         }
-    }, [bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, nodesRef, persistMediaNodes, projectId, resolveImageEditStyle, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
+    }, [applyGenerationTaskResult, bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, nodesRef, projectId, resolveImageEditStyle, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
 
     const editImageNode = useCallback(async (node: CanvasNodeData, payload: CanvasImageEditPayload) => {
         if (!node.metadata?.content || !payload.prompt.trim()) return;
-        const baseGenerationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
+        const baseGenerationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image", undefined, false, canvasImageNodeDimensions(node)), count: "1" };
         const selectedModel = payload.generationConfig?.model || payload.generationConfig?.imageModel || baseGenerationConfig.model;
         const generationConfig = { ...baseGenerationConfig, ...payload.generationConfig, model: selectedModel, imageModel: payload.generationConfig?.imageModel || selectedModel, count: "1" };
         if (!isAiConfigReady(generationConfig, generationConfig.model)) {
@@ -861,7 +879,7 @@ export function useCanvasMediaTools({
         setNodes((current) => [...current, {
             id: childId,
             type: CanvasNodeType.Image,
-            title: payload.prompt.trim().slice(0, 32) || "图片编辑结果",
+            title: payload.prompt.trim().slice(0, 32) || translate("canvasPage.mediaTools.imageEditResult"),
             position: { x: node.position.x + node.width + 96, y: node.position.y },
             width: imageSpec.width,
             height: imageSpec.height,
@@ -872,38 +890,36 @@ export function useCanvasMediaTools({
         setSelectedConnectionId(null);
         setDialogNodeId(childId);
         const controller = startGenerationRequest(childId, node.id, childId);
+        let taskId: string | undefined;
         try {
-            const result = await runBackendCanvasGenerationTask({ projectId, nodeId: childId, mode: "image", prompt, config: generationConfig, referenceImages: [source], signal: controller.signal, metadata: { sourceNodeId: node.id, edit: "text", ...styleMetadata }, onTaskCreated: (task) => bindGenerationTask(childId, task) });
-            const image = result.images?.find((item) => item?.dataUrl);
-            if (!image?.dataUrl) throw new Error("后端任务没有返回图片");
-            const uploaded = await uploadImage(image.dataUrl);
-            const size = fitNodeSize(uploaded.width, uploaded.height, node.width, node.height);
-            const currentNode = nodesRef.current.find((item) => item.id === childId);
-            if (!currentNode) throw new Error("图片编辑节点已被删除");
-            const finalizedNode = { ...currentNode, width: size.width, height: size.height, metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt, status: NODE_STATUS_SUCCESS, ...generationMetadata }) };
-            setNodes((current) => current.map((item) => item.id === childId ? finalizedNode : item));
-            await persistMediaNodes([finalizedNode]);
+            await runCanvasGenerationTaskToConsumer(
+                { projectId, nodeId: childId, mode: "image", prompt, config: generationConfig, referenceImages: [source], signal: controller.signal, metadata: { sourceNodeId: node.id, edit: "text", ...styleMetadata } },
+                { bindTask: (task) => { taskId = task.id; bindGenerationTask(childId, task); }, consumeTask: (task) => applyGenerationTaskResult(childId, task) },
+            );
         } catch (error) {
-            if (!isGenerationCanceled(error)) {
+            if (!controller.signal.aborted && !isGenerationCanceled(error)) {
                 const details = generationErrorMessage(error);
                 message.error(details);
-                setNodes((current) => current.map((item) => item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item));
+                if (!isCanvasGenerationDurableAckError(error)) setNodes((current) => current.map((item) => item.id === childId && item.metadata?.taskId === taskId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item));
             }
         } finally {
             finishGenerationRequest(childId, controller);
             setRunningNodeId(null);
         }
-    }, [bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, nodesRef, persistMediaNodes, projectId, resolveImageEditStyle, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
+    }, [applyGenerationTaskResult, bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, projectId, resolveImageEditStyle, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
 
     const detectImageText = useCallback(async (node: CanvasNodeData): Promise<CanvasImageTextLine[]> => {
         const source = nodeReferenceImage(node);
-        if (!source) throw new Error("图片节点为空，无法识别文字");
-        const model = effectiveConfig.textModel || effectiveConfig.model;
+        if (!source) throw new Error(translate("canvasPage.mediaTools.emptyImageTextDetect"));
+        const model = canvasTextDetectionModel(effectiveConfig);
         const config = { ...effectiveConfig, model, textModel: model };
         if (!isAiConfigReady(config, model)) {
             navigateToSettings({ continueCreation: true });
-            throw new Error("请先配置可用的文字模型");
+            throw new Error(translate("canvasPage.mediaTools.configureTextModel"));
         }
+        // 识别要把图片交给文字模型；模型未声明看图能力时上游会直接 400，提交前拦下，不创建计费任务。
+        const supportError = canvasTextDetectionSupportError(config, model);
+        if (supportError) throw new Error(supportError);
         const result = await runBackendCanvasGenerationTask({
             projectId,
             nodeId: `${node.id}-text-detect`,
@@ -915,16 +931,16 @@ export function useCanvasMediaTools({
         });
         const raw = String(result.text || "").replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
         let parsed: unknown;
-        try { parsed = JSON.parse(raw); } catch { throw new Error("文字识别返回格式无效，请重试"); }
-        if (!Array.isArray(parsed)) throw new Error("没有识别到可编辑文字");
+        try { parsed = JSON.parse(raw); } catch { throw new Error(translate("canvasPage.mediaTools.textDetectInvalid")); }
+        if (!Array.isArray(parsed)) throw new Error(translate("canvasPage.mediaTools.noEditableText"));
         const lines = parsed.map((item) => ({ original: String((item as { original?: unknown })?.original || "").trim(), text: String((item as { text?: unknown })?.text || (item as { original?: unknown })?.original || "").trim(), location: String((item as { location?: unknown })?.location || "画面中" ).trim() })).filter((item) => item.original && item.location);
-        if (!lines.length) throw new Error("没有识别到可编辑文字");
+        if (!lines.length) throw new Error(translate("canvasPage.mediaTools.noEditableText"));
         return lines.slice(0, 100);
     }, [effectiveConfig, isAiConfigReady, projectId]);
 
     const openTextEditNode = useCallback((node: CanvasNodeData) => {
         if (!node.metadata?.content) {
-            message.warning("图片节点为空，无法编辑文字");
+            message.warning(translate("canvasPage.mediaTools.emptyImageTextEdit"));
             return;
         }
         setTextEditNodeId(node.id);
@@ -939,7 +955,7 @@ export function useCanvasMediaTools({
 
     const openAnnotationEditNode = useCallback((node: CanvasNodeData) => {
         if (!node.metadata?.content) {
-            message.warning("图片节点为空，无法标注编辑");
+            message.warning(translate("canvasPage.mediaTools.emptyImageAnnotationEdit"));
             return;
         }
         setAnnotationEditNodeId(node.id);
@@ -948,7 +964,7 @@ export function useCanvasMediaTools({
     const editAnnotatedImageNode = useCallback(async (node: CanvasNodeData, payload: CanvasImageAnnotationPayload) => {
         const source = nodeReferenceImage(node);
         if (!source) return;
-        const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
+        const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image", undefined, false, canvasImageNodeDimensions(node)), count: "1" };
         if (!isAiConfigReady(generationConfig, generationConfig.model)) {
             navigateToSettings({ continueCreation: true });
             return;
@@ -959,34 +975,29 @@ export function useCanvasMediaTools({
         const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, [source, annotatedReference]);
         setAnnotationEditNodeId(null);
         setRunningNodeId(childId);
-        setNodes((current) => [...current, { id: childId, type: CanvasNodeType.Image, title: `${node.title || "图片"} · 标注编辑`, position: { x: node.position.x + node.width + 96, y: node.position.y }, width: node.width, height: node.height, metadata: { ...canvasGenerationPromptMetadata("标注编辑", prompt), status: NODE_STATUS_LOADING, pluginId: "image-tools", pluginNodeId: "annotation-edit", ...generationMetadata } }]);
+        setNodes((current) => [...current, { id: childId, type: CanvasNodeType.Image, title: translate("canvasPage.mediaTools.titleAnnotationEdit", { title: node.title || translate("canvasPage.common.image") }), position: { x: node.position.x + node.width + 96, y: node.position.y }, width: node.width, height: node.height, metadata: { ...canvasGenerationPromptMetadata("标注编辑", prompt), status: NODE_STATUS_LOADING, pluginId: "image-tools", pluginNodeId: "annotation-edit", ...generationMetadata } }]);
         setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
         setSelectedNodeIds(new Set([childId]));
         setSelectedConnectionId(null);
         setDialogNodeId(childId);
         const controller = startGenerationRequest(childId, node.id, childId);
+        let taskId: string | undefined;
         try {
-            const result = await runBackendCanvasGenerationTask({ projectId, nodeId: childId, mode: "image", prompt, config: generationConfig, referenceImages: [source, annotatedReference], signal: controller.signal, metadata: { sourceNodeId: node.id, edit: "annotation", annotationReference: true }, onTaskCreated: (task) => bindGenerationTask(childId, task) });
-            const image = result.images?.find((item) => item?.dataUrl);
-            if (!image?.dataUrl) throw new Error("标注编辑任务没有返回图片");
-            const uploaded = await uploadImage(image.dataUrl);
-            const size = fitNodeSize(uploaded.width, uploaded.height, node.width, node.height);
-            const currentNode = nodesRef.current.find((item) => item.id === childId);
-            if (!currentNode) throw new Error("标注编辑节点已被删除");
-            const finalizedNode = { ...currentNode, width: size.width, height: size.height, metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt, status: NODE_STATUS_SUCCESS, ...generationMetadata }) };
-            setNodes((current) => current.map((item) => item.id === childId ? finalizedNode : item));
-            await persistMediaNodes([finalizedNode]);
+            await runCanvasGenerationTaskToConsumer(
+                { projectId, nodeId: childId, mode: "image", prompt, config: generationConfig, referenceImages: [source, annotatedReference], signal: controller.signal, metadata: { sourceNodeId: node.id, edit: "annotation", annotationReference: true } },
+                { bindTask: (task) => { taskId = task.id; bindGenerationTask(childId, task); }, consumeTask: (task) => applyGenerationTaskResult(childId, task) },
+            );
         } catch (error) {
-            if (!isGenerationCanceled(error)) {
+            if (!controller.signal.aborted && !isGenerationCanceled(error)) {
                 const details = generationErrorMessage(error);
                 message.error(details);
-                setNodes((current) => current.map((item) => item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item));
+                if (!isCanvasGenerationDurableAckError(error)) setNodes((current) => current.map((item) => item.id === childId && item.metadata?.taskId === taskId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item));
             }
         } finally {
             finishGenerationRequest(childId, controller);
             setRunningNodeId(null);
         }
-    }, [bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, nodesRef, persistMediaNodes, projectId, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
+    }, [applyGenerationTaskResult, bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, projectId, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
 
     const openBackgroundRemoval = useCallback((node: CanvasNodeData) => {
         setImageEditPreset("remove-background");
@@ -995,7 +1006,7 @@ export function useCanvasMediaTools({
 
     const planImageLayers = useCallback(async (node: CanvasNodeData, model: string, prompt: string, signal: AbortSignal, options?: ImageLayerPlanningOptions) => {
         const source = nodeReferenceImage(node);
-        if (!source) throw new Error("源图为空，无法规划拆层");
+        if (!source) throw new Error(translate("canvasPage.mediaTools.emptySourcePlanLayers"));
         if (options?.history) {
             const plan = await readImageLayerPlanningHistory(projectId, node.id, node.metadata?.storageKey, signal);
             return calibrateImageLayerPlan(source, applyImageLayerPlanningPurpose(plan, options?.purpose || "recompose"));
@@ -1003,7 +1014,7 @@ export function useCanvasMediaTools({
         const config = { ...effectiveConfig, model, textModel: model, taskWorkflowProvider: "model" as const };
         const error = imageLayerPlannerError(config, model);
         if (error) throw new Error(error);
-        if (!isAiConfigReady(config, model)) throw new Error("所选识图规划模型未配置可用渠道");
+        if (!isAiConfigReady(config, model)) throw new Error(translate("canvasPage.mediaTools.planModelNoChannel"));
         const { reference, sourceSize } = await prepareImageLayerPlanningReference(source, options?.input || "preview", signal);
         const referenceSize = { width: reference.width!, height: reference.height! };
         let taskId: string | undefined;
@@ -1041,11 +1052,11 @@ export function useCanvasMediaTools({
                     payload.plannerModel,
                 )
             ) {
-                message.error("所选视觉规划模型未配置可用渠道");
+                message.error(translate("canvasPage.mediaTools.visionPlanModelNoChannel"));
                 return;
             }
             if (!supportsLayerDecomposition(generationConfig, selectedModel) && !supportsExperimentalLayerExtraction(generationConfig, selectedModel)) {
-                message.error("请选择可编辑参考图的图片模型或专用拆层模型");
+                message.error(translate("canvasPage.mediaTools.selectLayerModel"));
                 return;
             }
             if (!isAiConfigReady(generationConfig, selectedModel)) {
@@ -1067,7 +1078,7 @@ export function useCanvasMediaTools({
                 {
                     id: taskNodeId,
                     type: CanvasNodeType.Image,
-                    title: "AI 图层拆分",
+                    title: translate("canvasPage.mediaTools.layerDecompositionTitle"),
                     position,
                     ...imageSize,
                     metadata: {
@@ -1090,7 +1101,7 @@ export function useCanvasMediaTools({
             try {
                 const plan = await planImageLayers(node, payload.plannerModel, payload.prompt, controller.signal, { input: "preview", purpose: "recompose" });
                 if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
-                if (!nodesRef.current.some((item) => item.id === taskNodeId)) throw new Error("拆层节点已删除，未提交拆图任务");
+                if (!nodesRef.current.some((item) => item.id === taskNodeId)) throw new Error(translate("canvasPage.mediaTools.layerNodeDeletedNotSubmitted"));
                 payload = {
                     ...payload,
                     planning: plan,
@@ -1127,21 +1138,21 @@ export function useCanvasMediaTools({
                 const needsModel = !experimental || extractions!.some((extraction) => extraction.method === "generate");
                 const hasGeneratedObjects = extractions?.some((extraction, index) => index > 0 && extraction.method === "generate");
                 if (needsModel && !supportsLayerDecomposition(generationConfig, selectedModel) && !(experimental && supportsExperimentalLayerExtraction(generationConfig, selectedModel))) {
-                    throw new Error("请选择支持独立透明图层输出的专用拆层模型");
+                    throw new Error(translate("canvasPage.mediaTools.selectTransparentLayerModel"));
                 }
                 if (needsModel && !isAiConfigReady(generationConfig, generationConfig.model)) {
-                    throw new Error("所选图层拆分模型未配置可用渠道");
+                    throw new Error(translate("canvasPage.mediaTools.layerModelNoChannel"));
                 }
                 const source = nodeReferenceImage(node);
-                if (!source) throw new Error("源图为空，未提交拆图任务");
+                if (!source) throw new Error(translate("canvasPage.mediaTools.emptySourceNotSubmitted"));
                 let sourceCanvas: { width: number; height: number };
                 try {
                     const info = await inspectImageLayer(source);
-                    if (!info.nonempty) throw new Error("源图是完全透明的空图");
+                    if (!info.nonempty) throw new Error(translate("canvasPage.mediaTools.sourceFullyTransparent"));
                     sourceCanvas = { width: info.width, height: info.height };
                     generationConfig.size = needsModel ? imageLayerOutputSize(generationConfig, selectedModel, sourceCanvas) : `${info.width}x${info.height}`;
-                    if (needsModel && !generationConfig.size) throw new Error("所选拆层模型没有支持原图比例的尺寸，请选择其他模型");
-                    if (extractions?.[0].method === "source" && !info.opaque) throw new Error("原图含透明区域，不能直接作为完整不透明底图，请选择模型修补底图");
+                    if (needsModel && !generationConfig.size) throw new Error(translate("canvasPage.mediaTools.layerModelNoRatio"));
+                    if (extractions?.[0].method === "source" && !info.opaque) throw new Error(translate("canvasPage.mediaTools.sourceHasTransparency"));
                     const profile = needsModel && modelCapabilityConfigFor(generationConfig, selectedModel).image;
                     // 持久化任务先经过服务端配置校验，必须提交已解析的协议尺寸，不能只校验后仍发送比例字符串。
                     if (profile) generationConfig.size = resolveImageRequestSize(profile, generationConfig.quality, generationConfig.size)?.value || "auto";
@@ -1150,7 +1161,7 @@ export function useCanvasMediaTools({
                 }
                 if (controller.signal.aborted || !nodesRef.current.some((item) => item.id === taskNodeId)) throw new DOMException("Aborted", "AbortError");
                 const liveSource = nodesRef.current.find((item) => item.id === node.id);
-                if (!liveSource || liveSource.metadata?.content !== node.metadata.content || liveSource.metadata?.storageKey !== node.metadata.storageKey) throw new Error("源图已更改或删除，请重新发起拆层");
+                if (!liveSource || liveSource.metadata?.content !== node.metadata.content || liveSource.metadata?.storageKey !== node.metadata.storageKey) throw new Error(translate("canvasPage.mediaTools.sourceChanged"));
                 const removalConfig =
                     hasGeneratedObjects && payload.backgroundRemovalModel
                         ? layerDecompositionConfig(
@@ -1165,12 +1176,12 @@ export function useCanvasMediaTools({
                           )
                         : undefined;
                 if (removalConfig && (!supportsExperimentalLayerExtraction(removalConfig, removalConfig.model) || !isAiConfigReady(removalConfig, removalConfig.model))) {
-                    throw new Error("默认去背景模型不可用，请在模型配置中检查图片编辑能力");
+                    throw new Error(translate("canvasPage.mediaTools.defaultRemovalModelUnavailable"));
                 }
                 const removalSizeError =
                     removalConfig &&
                     (!removalConfig.size
-                        ? "所选去背景模型没有支持原图比例的尺寸，请选择其他模型"
+                        ? translate("canvasPage.mediaTools.removalModelNoRatio")
                         : modelCompatibilityError(removalConfig, removalConfig.model, {
                               capability: "image",
                               imageSize: removalConfig.size,
@@ -1205,7 +1216,7 @@ export function useCanvasMediaTools({
                 const taskNode: CanvasNodeData = {
                     id: taskNodeId,
                     type: CanvasNodeType.Image,
-                    title: "AI 图层拆分",
+                    title: translate("canvasPage.mediaTools.layerDecompositionTitle"),
                     position,
                     width: imageSize.width,
                     height: imageSize.height,
@@ -1230,7 +1241,7 @@ export function useCanvasMediaTools({
                                       requests,
                                       plannerModel: payload.planning?.model,
                                       planningTaskId: payload.planning?.taskId,
-                                      progress: `并发拆层：0/${requests.length} 层完成`,
+                                      progress: translate("canvasPage.mediaTools.layerProgressStart", { total: requests.length }),
                                   },
                                   isBatchRoot: true,
                                   batchChildIds: requests.map((request) => request.nodeId),
@@ -1315,12 +1326,12 @@ export function useCanvasMediaTools({
                         assertActive: (index) => {
                             const present = nodesRef.current.some((item) => item.id === taskNodeId);
                             if (present) observedGroup = true;
-                            if (observedGroup && (!present || !nodesRef.current.some((item) => item.id === requests[index].nodeId))) throw new Error("拆层节点已删除，本层后续请求已停止");
+                            if (observedGroup && (!present || !nodesRef.current.some((item) => item.id === requests[index].nodeId))) throw new Error(translate("canvasPage.mediaTools.layerNodeDeletedStopped"));
                         },
                         onProgress: (index, phase) => {
                             phases[index] = phase;
                             const count = (value: string) => phases.filter((item) => item === value).length;
-                            const progress = `并发拆层：${count("complete")}/${requests.length} 层完成，提取 ${count("extract")}，去背景 ${count("remove-background")}${count("error") ? `，失败 ${count("error")}` : ""}`;
+                            const progress = translate(count("error") ? "canvasPage.mediaTools.layerProgressWithFailures" : "canvasPage.mediaTools.layerProgress", { done: count("complete"), total: requests.length, extract: count("extract"), removeBackground: count("remove-background"), failed: count("error") });
                             setNodes((current) =>
                                 current.map((item) =>
                                     item.id === taskNodeId && item.metadata?.experimentalLayerPlan
@@ -1338,18 +1349,20 @@ export function useCanvasMediaTools({
                                 ),
                             );
                         },
-                        onLocalResult: async (index, image) => {
+                        onLocalResult: (index, image) => runGenerationConsumer(controller.signal, async (signal) => {
                             const targetId = requests[index].nodeId;
                             const current = nodesRef.current.find((item) => item.id === targetId) || extractionNodes[index];
-                            const completed = await buildSourceImageLayerNodeResult(current, image, controller.signal);
-                            if (!nodesRef.current.some((item) => item.id === targetId) || controller.signal.aborted) throw new Error("拆层节点已删除或停止，本层结果不再写入");
-                            setNodes((items) => items.map((item) => (item.id === targetId ? completed : item)));
-                            await persistMediaNodes([completed]);
-                        },
+                            const result = await buildSourceImageLayerNodeResult(current, image, signal);
+                            const completed = await prepareCanvasMediaNodeAsset(projectId, result, signal);
+                            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+                            if (!nodesRef.current.some((item) => item.id === targetId)) throw new Error(translate("canvasPage.mediaTools.layerNodeDeletedDiscarded"));
+                            setNodes((items) => commitCanvasGenerationResult(items, current, completed, current.metadata?.taskId || ""));
+                        }),
                         onLayerError: (index, error) => {
+                            if (controller.signal.aborted || isGenerationCanceled(error)) return;
                             setNodes((current) =>
                                 current.map((item) =>
-                                    item.id === requests[index].nodeId
+                                    item.id === requests[index].nodeId && !(isCanvasGenerationDurableAckError(error) && item.metadata?.status === NODE_STATUS_SUCCESS && item.metadata.assetId)
                                         ? {
                                               ...item,
                                               metadata: {
@@ -1384,6 +1397,7 @@ export function useCanvasMediaTools({
                                 }),
                             );
                             startGenerationRequest(targetId, node.id, taskNodeId, controller);
+                            let stageTaskId: string | undefined;
                             try {
                                 return await runCanvasGenerationTaskToConsumer(
                                     {
@@ -1401,14 +1415,15 @@ export function useCanvasMediaTools({
                                         },
                                     },
                                     {
-                                        bindTask: (task) => bindGenerationTask(targetId, task),
+                                        bindTask: (task) => { stageTaskId = task.id; bindGenerationTask(targetId, task); },
                                         consumeTask: (task) => applyGenerationTaskResult(targetId, task),
                                     },
                                 );
                             } catch (error) {
+                                if (controller.signal.aborted || isGenerationCanceled(error) || isCanvasGenerationDurableAckError(error)) throw error;
                                 setNodes((current) =>
                                     current.map((item) =>
-                                        item.id === targetId
+                                        item.id === targetId && item.metadata?.taskId === stageTaskId
                                             ? {
                                                   ...item,
                                                   metadata: {
@@ -1452,10 +1467,10 @@ export function useCanvasMediaTools({
                         consumeTask: (task) => applyGenerationTaskResult(taskNodeId, task),
                     },
                 );
-                message.success("图层已拆分，可展开查看并独立编辑");
+                message.success(translate("canvasPage.mediaTools.layersSplit"));
             } catch (error) {
                 {
-                    const details = isGenerationCanceled(error) ? "拆层已停止，未提交的图层不会继续调用" : generationErrorMessage(error);
+                    const details = isGenerationCanceled(error) ? translate("canvasPage.mediaTools.layerStopped") : generationErrorMessage(error);
                     message.error(details);
                     setNodes((current) =>
                         current.map((item) =>
@@ -1465,7 +1480,7 @@ export function useCanvasMediaTools({
                                       metadata: {
                                           ...item.metadata,
                                           status: NODE_STATUS_ERROR,
-                                          errorDetails: item.id === taskNodeId ? details : "本层未完成，未自动重试或继续提交请求",
+                                          errorDetails: item.id === taskNodeId ? details : translate("canvasPage.mediaTools.layerIncomplete"),
                                       },
                                   }
                                 : item,
@@ -1507,25 +1522,30 @@ export function useCanvasMediaTools({
     const upscaleImageNode = useCallback(async (node: CanvasNodeData, params: CanvasImageUpscaleParams) => {
         if (!node.metadata?.content) return;
         setUpscaleNodeId(null);
+        let releaseSource = () => {};
         try {
-            const upscaled = await upscaleDataUrl(node.metadata.content, params);
+            const source = await resolveProcessableImageSource(node);
+            releaseSource = source.release;
+            const upscaled = await upscaleDataUrl(source.url, params);
             const image = await uploadImage(upscaled);
-            const size = fitNodeSize(image.width, image.height);
+            const size = fitImageNodeSize(image.width, image.height);
             const childId = nanoid();
-            const child: CanvasNodeData = { id: childId, type: CanvasNodeType.Image, title: `${node.title || "图片"} · 放大`, position: { x: node.position.x + node.width + 96, y: node.position.y }, width: size.width, height: size.height, metadata: { ...imageMetadata(image), prompt: node.metadata?.prompt } };
+            const child: CanvasNodeData = { id: childId, type: CanvasNodeType.Image, title: translate("canvasPage.mediaTools.titleUpscale", { title: node.title || translate("canvasPage.common.image") }), position: { x: node.position.x + node.width + 96, y: node.position.y }, width: size.width, height: size.height, metadata: { ...imageMetadata(image), prompt: node.metadata?.prompt } };
             setNodes((current) => [...current, child]);
             setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
             setSelectedNodeIds(new Set([childId]));
             setDialogNodeId(childId);
             await persistMediaNodes([child]);
         } catch (error) {
-            message.error(error instanceof Error ? `放大失败：${error.message}` : "图片放大失败，请重试");
+            message.error(error instanceof Error ? translate("canvasPage.mediaTools.upscaleFailedWithReason", { error: error.message }) : translate("canvasPage.mediaTools.upscaleFailed"));
+        } finally {
+            releaseSource();
         }
     }, [message, persistMediaNodes, setConnections, setDialogNodeId, setNodes, setSelectedNodeIds]);
 
     const generateAngleNode = useCallback(async (node: CanvasNodeData, params: CanvasImageAngleParams) => {
         if (!node.metadata?.content) return;
-        const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
+        const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image", undefined, false, canvasImageNodeDimensions(node)), count: "1" };
         if (!isAiConfigReady(generationConfig, generationConfig.model)) {
             navigateToSettings({ continueCreation: true });
             return;
@@ -1550,12 +1570,12 @@ export function useCanvasMediaTools({
         try {
             const result = await runBackendCanvasGenerationTask({ projectId, nodeId: childId, mode: "image", prompt: effectivePrompt, config: generationConfig, referenceImages: [source], signal: controller.signal, metadata: { sourceNodeId: node.id, edit: "angle", ...styleMetadata }, onTaskCreated: (task) => bindGenerationTask(childId, task) });
             const image = result.images?.[0];
-            if (!image?.dataUrl) throw new Error("后端任务没有返回图片");
+            if (!image?.dataUrl) throw new Error(translate("canvasPage.mediaTools.noImageReturned"));
             const uploaded = await uploadImage(image.dataUrl);
-            const size = fitNodeSize(uploaded.width, uploaded.height, imageSpec.width, imageSpec.height);
+            const size = fitImageNodeSize(uploaded.width, uploaded.height);
             const currentNode = nodesRef.current.find((item) => item.id === childId);
-            if (!currentNode) throw new Error("视角生成节点已被删除");
-            const finalizedNode = { ...currentNode, width: size.width, height: size.height, metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt: effectivePrompt, ...generationMetadata }) };
+            if (!currentNode) throw new Error(translate("canvasPage.mediaTools.angleNodeDeleted"));
+            const finalizedNode = { ...currentNode, ...preserveImageNodeSize(currentNode, size), metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt: effectivePrompt, ...generationMetadata }) };
             setNodes((current) => current.map((item) => item.id === childId ? finalizedNode : item));
             await persistMediaNodes([finalizedNode]);
         } catch (error) {
@@ -1570,7 +1590,7 @@ export function useCanvasMediaTools({
 
     const generateNineGridNode = useCallback(async (node: CanvasNodeData, toolId: number, label: string, icon: string) => {
         if (node.type !== CanvasNodeType.Image || !node.metadata?.content) {
-            message.warning("图片节点为空，无法执行九宫格工具");
+            message.warning(translate("canvasPage.mediaTools.emptyImageGrid"));
             return;
         }
         const child = createNineGridNode(node, nanoid(), toolId, label, "nine_grid",icon);
@@ -1585,7 +1605,7 @@ export function useCanvasMediaTools({
 
     const generateLightingNode = useCallback((node: CanvasNodeData, options: CanvasImageLightingOptions, prompt: string) => {
         if (!node.metadata?.content) return;
-        const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image"), count: "1" };
+        const generationConfig = { ...buildGenerationConfig(effectiveConfig, node, "image", undefined, false, canvasImageNodeDimensions(node)), count: "1" };
         const childId = nanoid();
         const imageSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
         const title = buildLightingLabel(options);
@@ -1616,14 +1636,15 @@ export function useCanvasMediaTools({
     const generateEmotionNode = useCallback(async (node: CanvasNodeData, payload: CanvasImageEmotionPayload) => {
         if (!node.metadata?.content) return;
         const baseConfig = buildGenerationConfig(effectiveConfig, node, "image");
-        const providerSize = emotionGenerationSize(payload.editRegion);
+        // 是否可用、发不发蒙版、尺寸怎么写都看模型能力声明，不再限定 OpenAI Images 协议。
+        const imageProfile = modelCapabilityConfigFor(baseConfig, baseConfig.model).image!;
+        const providerSize = emotionGenerationSizeFor(imageProfile.size, payload.editRegion);
         const generationConfig = { ...baseConfig, count: "1", size: providerSize, quality: !baseConfig.quality || baseConfig.quality === "auto" ? "high" : baseConfig.quality };
         if (!isAiConfigReady(generationConfig, generationConfig.model)) { navigateToSettings({ continueCreation: true }); return; }
-        if (resolveModelRequestConfig(generationConfig, generationConfig.model).interfaceType !== "openai-image") {
-            message.error("表情编辑需要支持多参考图编辑的 OpenAI Images 渠道");
+        if (!supportsEmotionEdit(imageProfile.references)) {
+            message.error(translate("canvasPage.mediaTools.expressionNeedsReferenceImages"));
             return;
         }
-        const imageProfile = modelCapabilityConfigFor(generationConfig, generationConfig.model).image!;
         const editPlan = resolveEmotionEditPlan(imageProfile.references.maskSupported);
         const source = nodeReferenceImage(node);
         if (!source) return;
@@ -1659,13 +1680,13 @@ export function useCanvasMediaTools({
             const mask = emotionProviderMask(editPlan, { id: `${node.id}-emotion-mask`, name: "emotion-mask.png", type: "image/png", dataUrl: payload.maskDataUrl });
             const result = await runBackendCanvasGenerationTask({ projectId, nodeId: childId, mode: "image", prompt: providerPrompt, config: generationConfig, referenceImages: [editReference, characterReference], mask, signal: controller.signal, metadata: { sourceNodeId: node.id, edit: "emotion", emotionEditMode: editPlan.mode, emotion: emotionEdit, ...styleMetadata }, onTaskCreated: (task) => bindGenerationTask(childId, task) });
             const image = result.images?.[0];
-            if (!image?.dataUrl) throw new Error("后端任务没有返回图片");
+            if (!image?.dataUrl) throw new Error(translate("canvasPage.mediaTools.noImageReturned"));
             const composited = await compositeEmotionImage(node.metadata.content, image.dataUrl, payload.editRegion, payload.faceBox);
             const uploaded = await uploadImage(composited);
-            const size = fitNodeSize(uploaded.width, uploaded.height, node.width, node.height);
+            const size = fitImageNodeSize(uploaded.width, uploaded.height);
             const currentNode = nodesRef.current.find((item) => item.id === childId);
-            if (!currentNode) throw new Error("表情编辑节点已被删除");
-            const finalizedNode = { ...currentNode, width: size.width, height: size.height, metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt: providerPrompt, ...generationMetadata, emotionEdit }) };
+            if (!currentNode) throw new Error(translate("canvasPage.mediaTools.expressionNodeDeleted"));
+            const finalizedNode = { ...currentNode, ...preserveImageNodeSize(currentNode, size), metadata: commitProducedModel({ ...currentNode.metadata, ...imageMetadata(uploaded), prompt: providerPrompt, ...generationMetadata, emotionEdit }) };
             setNodes((current) => current.map((item) => item.id === childId ? finalizedNode : item));
             await persistMediaNodes([finalizedNode]);
         } catch (error) {
@@ -1676,7 +1697,64 @@ export function useCanvasMediaTools({
         } finally { finishGenerationRequest(childId, controller); setRunningNodeId(null); }
     }, [bindGenerationTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, nodesRef, persistMediaNodes, projectId, resolveImageEditStyle, setConnections, setDialogNodeId, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
 
+    const openVideoEnhance = useCallback((node: CanvasNodeData) => {
+        if (!node.metadata?.storageKey && !node.metadata?.content) {
+            message.warning(translate("canvasPage.mediaTools.emptyVideoEnhance"));
+            return;
+        }
+        if (!listVideoEnhanceModels(effectiveConfig).length) {
+            message.warning(translate("canvasPage.mediaTools.noEnhanceModel"));
+            return;
+        }
+        setHoveredNodeId(null);
+        setToolbarNodeId(null);
+        setEnhanceDialogNodeId(node.id);
+    }, [effectiveConfig, message, setHoveredNodeId, setToolbarNodeId]);
+
+    // 画质增强：在源节点右侧创建 loading 视频节点并连线，后端任务完成后由统一结果回写填充。
+    const enhanceVideoNode = useCallback(async (node: CanvasNodeData, params: VideoEnhanceParams) => {
+        setEnhanceDialogNodeId(null);
+        const source = videoEnhanceSourceReference(node);
+        const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Video];
+        const childId = nanoid();
+        const videoEnhance = { sourceNodeId: node.id, model: params.model, resolution: params.resolution, fps: params.fps, bitrateLevel: params.bitrateLevel, bitrate: params.bitrate };
+        setRunningNodeId(childId);
+        setNodes((current) => [...current, {
+            id: childId,
+            type: CanvasNodeType.Video,
+            title: translate("canvasPage.mediaTools.titleEnhance", { title: node.title || translate("canvasPage.common.video"), resolution: params.resolution.toUpperCase() }),
+            position: { x: node.position.x + node.width + 96, y: node.position.y },
+            width: spec.width,
+            height: spec.height,
+            metadata: { prompt: `画质增强（${params.resolution}）`, status: NODE_STATUS_LOADING, generationMode: "video", model: params.model, vquality: params.resolution, videoEditOperation: VIDEO_ENHANCE_OPERATION, videoEnhance, taskCreatedAt: new Date().toISOString() },
+        }]);
+        setConnections((current) => [...current, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
+        setSelectedNodeIds(new Set([childId]));
+        setSelectedConnectionId(null);
+        const controller = startGenerationRequest(childId, node.id, childId);
+        let taskId: string | undefined;
+        try {
+            await runCanvasGenerationTaskToConsumer(
+                videoEnhanceTaskInput({ config: effectiveConfig, params, source, sourceNodeId: node.id, projectId, nodeId: childId, signal: controller.signal }),
+                { bindTask: (task) => { taskId = task.id; bindGenerationTask(childId, task); }, consumeTask: (task) => applyGenerationTaskResult(childId, task) },
+            );
+        } catch (error) {
+            if (!controller.signal.aborted && !isGenerationCanceled(error)) {
+                const details = generationErrorMessage(error);
+                message.error(details);
+                if (!isCanvasGenerationDurableAckError(error)) setNodes((current) => current.map((item) => item.id === childId && item.metadata?.taskId === taskId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: details } } : item));
+            }
+        } finally {
+            finishGenerationRequest(childId, controller);
+            setRunningNodeId(null);
+        }
+    }, [applyGenerationTaskResult, bindGenerationTask, effectiveConfig, finishGenerationRequest, message, projectId, setConnections, setNodes, setRunningNodeId, setSelectedConnectionId, setSelectedNodeIds, startGenerationRequest]);
+
     return {
+        enhanceDialogNodeId,
+        setEnhanceDialogNodeId,
+        openVideoEnhance,
+        enhanceVideoNode,
         angleNodeId,
         lightingNodeId,
         emotionNodeId,
@@ -1701,8 +1779,8 @@ export function useCanvasMediaTools({
         addPanoramaCaptureNode,
         panoramaConfigNodeId,
         setPanoramaConfigNodeId,
-        maskEditImageNode,
-        maskEditNodeId,
+        regionEditImageNode,
+        regionEditNodeId,
         imageEditNodeId,
         imageEditPreset,
         layerDecompositionNodeId,
@@ -1723,7 +1801,7 @@ export function useCanvasMediaTools({
         setAnnotationNodeId,
         setAnnotationEditNodeId,
         setCropNodeId,
-        setMaskEditNodeId,
+        setRegionEditNodeId,
         setImageEditNodeId,
         setImageEditPreset,
         openBackgroundRemoval,
@@ -1747,17 +1825,11 @@ export function useCanvasMediaTools({
     };
 }
 
-// 裁剪、切分等像素级操作要求图片同源可读：云端地址若不带 CORS 头，
-// canvas 会被标记为跨域，toDataURL 直接抛 SecurityError。
-// 这里优先用本地缓存 Blob 构造同源 objectURL，取不到时再回退原始地址。
-async function resolveCroppableImageSource(node: CanvasNodeData): Promise<{ url: string; release: () => void }> {
+// 资源 Blob 读取使用 browser-process 授权，复用缓存；读取失败时保留错误，不退回展示地址。
+async function resolveProcessableImageSource(node: CanvasNodeData): Promise<{ url: string; release: () => void }> {
     const content = node.metadata?.content ?? "";
-    if (content.startsWith("data:") || content.startsWith("blob:")) return { url: content, release: () => {} };
     const storageKey = node.metadata?.storageKey;
-    if (!storageKey) return { url: content, release: () => {} };
+    if (!storageKey) return prepareRasterSource(content);
     const readBlob = storageKey.startsWith("image:") || storageKey.startsWith("generation-image:") ? getImageBlob : getMediaBlob;
-    const blob = await readBlob(storageKey).catch(() => null);
-    if (!blob) return { url: content, release: () => {} };
-    const url = URL.createObjectURL(blob);
-    return { url, release: () => URL.revokeObjectURL(url) };
+    return prepareRasterSource(content, () => readBlob(storageKey));
 }

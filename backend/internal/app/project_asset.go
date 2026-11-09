@@ -39,22 +39,23 @@ type CreateAssetVersionRequest struct {
 }
 
 type ProjectAssetSummary struct {
-	ID               string                   `json:"id"`
-	Title            string                   `json:"title"`
-	MediaType        string                   `json:"mediaType"`
-	Category         model.AssetCategory      `json:"category"`
-	Status           model.AssetVersionStatus `json:"status"`
-	PrimaryVersionID string                   `json:"primaryVersionId,omitempty"`
-	VersionCount     int                      `json:"versionCount"`
-	Usages           []string                 `json:"usages"`
-	FolderID         string                   `json:"folderId,omitempty"`
-	Position         int                      `json:"position"`
-	StorageKey       string                   `json:"storageKey,omitempty"`
-	DurationMs       int64                    `json:"durationMs,omitempty"`
-	PreviewText      string                   `json:"previewText,omitempty"`
-	UpdatedAt        time.Time                `json:"updatedAt"`
-	Source           string                   `json:"source,omitempty"`
-	Character        *CharacterCardSummary    `json:"character,omitempty"`
+	ID               string                     `json:"id"`
+	Title            string                     `json:"title"`
+	MediaType        string                     `json:"mediaType"`
+	Category         model.AssetCategory        `json:"category"`
+	Status           model.AssetVersionStatus   `json:"status"`
+	PrimaryVersionID string                     `json:"primaryVersionId,omitempty"`
+	VersionCount     int                        `json:"versionCount"`
+	Usages           []string                   `json:"usages"`
+	FolderID         string                     `json:"folderId,omitempty"`
+	Position         int                        `json:"position"`
+	StorageKey       string                     `json:"storageKey,omitempty"`
+	DurationMs       int64                      `json:"durationMs,omitempty"`
+	PreviewText      string                     `json:"previewText,omitempty"`
+	UpdatedAt        time.Time                  `json:"updatedAt"`
+	Source           string                     `json:"source,omitempty"`
+	Character        *CharacterCardSummary      `json:"character,omitempty"`
+	Visual           *ProjectAssetVisualSummary `json:"visual,omitempty"`
 }
 
 type ProjectAssetFilter struct {
@@ -133,8 +134,8 @@ func (s *Service) LinkProjectAsset(userID string, projectID string, req LinkProj
 	if category == "" {
 		category = asset.Category
 	}
-	if !validAssetCategory(category) {
-		return ProjectAssetSummary{}, BadAuthRequest("不支持的资产业务分类")
+	if err := assignableAssetCategory(category, asset.Category); err != nil {
+		return ProjectAssetSummary{}, err
 	}
 	folderID, err := s.resolveProjectAssetFolderID(projectID, req.FolderID)
 	if err != nil {
@@ -198,7 +199,7 @@ func (s *Service) assetFromUploadedResource(userID string, resourceID string, ti
 			"storageKey": "resource:" + resource.ID,
 			"mimeType":   resource.MimeType,
 			"kind":       resource.Kind,
-			"size":       resource.Size,
+			"bytes":      resource.Size,
 			"width":      resource.Width,
 			"height":     resource.Height,
 			"durationMs": resource.DurationMs,
@@ -225,6 +226,7 @@ func (s *Service) assetFromUploadedResource(userID string, resourceID string, ti
 		CreatedAt:   resource.CreatedAt,
 		UpdatedAt:   resource.UpdatedAt,
 	}
+	asset.PayloadJSON = string(clientAssetPayload(*asset))
 	// 不在此预落库：资产创建交给 LinkProjectAsset 的事务统一提交，
 	// 事务失败时与链接一起回滚，避免留下“有资产无链接”的孤儿记录。
 	return asset, nil
@@ -315,8 +317,8 @@ func (s *Service) UpdateProjectAsset(userID string, projectID string, assetID st
 	}
 	if req.Category != nil {
 		category := model.AssetCategory(strings.TrimSpace(*req.Category))
-		if !validAssetCategory(category) {
-			return ProjectAssetSummary{}, BadAuthRequest("不支持的资产业务分类")
+		if err := assignableAssetCategory(category, asset.Category); err != nil {
+			return ProjectAssetSummary{}, err
 		}
 		asset.Category = category
 		asset.UpdatedAt = time.Now()
@@ -444,9 +446,16 @@ func (s *Service) ConfirmProjectAssetCandidate(userID string, projectID string, 
 			characterPayload, marshalErr = characterAssetPayload(assetID, versionID, candidate.Name, json.RawMessage(candidate.DetailsJSON), now, now)
 			payload = []byte(characterPayload)
 		} else {
+			if projectVisualCategory(candidate.Category) {
+				kind = "entity"
+			}
+			data := map[string]any{"content": ""}
+			if kind == "entity" {
+				data = map[string]any{"definition": json.RawMessage(candidate.DetailsJSON)}
+			}
 			payload, marshalErr = json.Marshal(map[string]any{
 				"id": assetID, "kind": kind, "category": candidate.Category, "status": model.AssetVersionStatusConfirmed,
-				"primaryVersionId": versionID, "title": candidate.Name, "tags": []string{}, "data": map[string]string{"content": ""},
+				"primaryVersionId": versionID, "title": candidate.Name, "coverUrl": "", "tags": []string{}, "data": data,
 				"createdAt": now.Format(time.RFC3339Nano), "updatedAt": now.Format(time.RFC3339Nano),
 			})
 		}
@@ -545,11 +554,23 @@ func containsString(values []string, target string) bool {
 
 func validAssetCategory(category model.AssetCategory) bool {
 	switch category {
-	case model.AssetCategoryCharacter, model.AssetCategoryEnvironment, model.AssetCategoryProp, model.AssetCategoryMaterial, model.AssetCategoryOther:
+	case model.AssetCategoryCharacter, model.AssetCategoryEnvironment, model.AssetCategoryProp, model.AssetCategoryMaterial, model.AssetCategoryOther, model.AssetCategoryArk:
 		return true
 	default:
 		return false
 	}
+}
+
+// assignableAssetCategory 校验用户请求的目标分类。方舟认证分类只由认证结果写入，
+// 已在该分类的素材可以保持原样，但不能把未认证素材手动改成方舟认证。
+func assignableAssetCategory(next model.AssetCategory, current model.AssetCategory) error {
+	if !validAssetCategory(next) {
+		return BadAuthRequest("不支持的资产业务分类")
+	}
+	if next == model.AssetCategoryArk && current != model.AssetCategoryArk {
+		return BadAuthRequest("方舟认证分类由认证结果自动设置，不能手动选择")
+	}
+	return nil
 }
 
 func (s *Service) projectAssetSummary(userID string, projectID string, asset *model.Asset) (ProjectAssetSummary, error) {
@@ -573,6 +594,26 @@ func (s *Service) projectAssetSummary(userID string, projectID string, asset *mo
 			return ProjectAssetSummary{}, cardErr
 		}
 		summary.Character = &card
+	}
+	if projectVisualCategory(asset.Category) && asset.PrimaryVersionID != "" {
+		for _, version := range versions {
+			if version.ID != asset.PrimaryVersionID {
+				continue
+			}
+			var definition map[string]any
+			if err := json.Unmarshal([]byte(version.DefinitionJSON), &definition); err != nil {
+				return ProjectAssetSummary{}, err
+			}
+			// 普通上传图片仍走媒体卡；有提取设定的场景、道具提供出图流程。
+			if asset.Kind == "entity" || definition["prompt"] != nil {
+				status := "missing"
+				if asset.Kind == "image" && storageKey != "" {
+					status = "ready"
+				}
+				summary.Visual = &ProjectAssetVisualSummary{Definition: definition, Status: status}
+			}
+			break
+		}
 	}
 	return summary, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -108,7 +109,7 @@ func approveAgentMediaDraft(t *testing.T, s *Service, runID string) {
 
 func TestCloudAgentMediaApprovalCreatesNodeReferencesAndResult(t *testing.T) {
 	s, db, a := agentMediaFixture(t)
-	catalog, err := s.cloudAgentModelList(nil)
+	catalog, err := s.cloudAgentModelList(testGroupUserID(s), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +326,7 @@ func TestCloudAgentImageCreatesReferencedNode(t *testing.T) {
 	if err = json.Unmarshal([]byte(task.InputJSON), &input); err != nil {
 		t.Fatal(err)
 	}
-	if task.Operation != "image_to_image" || len(input.ReferenceImages) != 1 || input.Config.Count != "1" || input.Config.Quality != "2k" {
+	if task.Operation != "image_to_image" || len(input.ReferenceImages) != 1 || input.Config.Count != "1" || input.Config.ImageResolution != "2k" || input.Config.Quality != "" {
 		t.Fatal("image generation contract was lost")
 	}
 	canvas, _ := s.repo.CanvasProjectForUser("user", "agent-canvas")
@@ -416,6 +417,63 @@ func TestCloudAgentMediaRejectAndInvalidModelDoNotCreateTasks(t *testing.T) {
 			}
 			if count != 0 || state.Generations != 0 {
 				t.Fatalf("unsafe submission or nonrecoverable tool failure: count=%d index=%d status=%s", count, state.CallIndex, run.Status)
+			}
+		})
+	}
+}
+
+func TestCloudAgentApprovalRejectionMessageMatchesOperation(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		media     bool
+		wantText  string
+		forbidden string
+	}{
+		{name: "ordinary write", wantText: "已拒绝本次操作，本次操作未执行。", forbidden: "草稿节点仍保留"},
+		{name: "media generation", media: true, wantText: "已拒绝本次生成，草稿节点仍保留在画布中；未提交任务、未产生扣费。", forbidden: "本次操作未执行"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, _, args := agentMediaFixture(t)
+			run, state := agentMediaRun(t, s, args, "request_approval")
+			call := cloudAgentCall{ID: "approval-call"}
+			call.Function.Name = "canvas_apply_ops"
+			arguments, err := json.Marshal(map[string]any{
+				"snapshotHash": args.SnapshotHash,
+				"ops":          []map[string]any{{"type": "update_node", "id": "cat", "patch": map[string]any{"title": "拒绝后不应写入"}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			call.Function.Arguments = string(arguments)
+			if scenario.media {
+				call = agentMediaCall(args)
+				call.ID = "approval-call"
+			}
+			state.Calls = []cloudAgentCall{call}
+			state.Approval = &cloudAgentApproval{ID: "approval-id", Call: call}
+			if err := s.repo.MutateCloudAgent("user", run.ID, run.Revision, func(current *model.CloudAgentExecution, _ *repository.Repository) error {
+				current.Status = "waiting_approval"
+				return cloudAgentSave(current, &state)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DecideCloudAgentApproval("user", run.ID, "approval-id", "reject", "暂不执行"); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := s.repo.CloudAgent("user", run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, err = cloudAgentDecode(stored)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != "rejected" || len(state.Events) == 0 {
+				t.Fatalf("approval rejection was not persisted: status=%s events=%+v", stored.Status, state.Events)
+			}
+			event := state.Events[len(state.Events)-1]
+			if event.Type != "approval_decided" || !strings.Contains(stringValue(event.Payload["text"]), scenario.wantText) || strings.Contains(stringValue(event.Payload["text"]), scenario.forbidden) {
+				t.Fatalf("rejection message does not match operation type: %+v", event)
 			}
 		})
 	}
@@ -534,7 +592,7 @@ func TestCloudAgentModelListFiltersActualReferences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		catalog, err := s.cloudAgentModelList(intent)
+		catalog, err := s.cloudAgentModelList(testGroupUserID(s), intent)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -542,7 +600,7 @@ func TestCloudAgentModelListFiltersActualReferences(t *testing.T) {
 		if strings.Contains(string(encoded), `"channelModelKey":"text-only"`) != tc.wantText || !strings.Contains(string(encoded), `"channelModelKey":"seedance-test"`) {
 			t.Fatalf("unexpected filtered catalog for %s: %s", tc.args, encoded)
 		}
-		if intent != nil && !tc.wantText && (intent.Inputs["image"] != 2 || intent.Operation != "image_to_video") {
+		if intent != nil && !tc.wantText && (intent.Inputs["image"] != 2 || intent.Operation != "") {
 			t.Fatalf("intent = %+v", intent)
 		}
 	}
@@ -561,13 +619,130 @@ func TestCloudAgentModelListFiltersActualReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	catalog, err := s.cloudAgentModelList(intent)
+	catalog, err := s.cloudAgentModelList(testGroupUserID(s), intent)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(catalog.(map[string]any)["models"].([]map[string]any)) != 0 {
 		t.Fatal("no-match query fell back to incompatible models")
 	}
+}
+
+func TestCloudAgentImageCatalogTreatsUnselectedPricedOptionsAsCandidates(t *testing.T) {
+	s, db, _, _ := creationTestService(t)
+	imageModel := seedAgentLogicalImageModel(t, s, db)
+	intent := ModelRequestIntent{Capability: "image", Inputs: map[string]int{}, Options: map[string]any{}}
+
+	models, err := s.PublicLogicalModels(testGroupAccess(s), &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != imageModel.ID || !models[0].Available || len(models[0].PriceTiers) != 9 {
+		t.Fatalf("unselected image options should expose the priced candidate and all 9 tiers: %#v", models)
+	}
+
+	adminModels, err := s.AdminLogicalModels(&model.User{ID: "admin", Role: model.UserRoleAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adminModels) != 1 || len(adminModels[0].PriceTiers) != 9 {
+		t.Fatalf("admin projection should expose the route's 9 configured tiers: %#v", adminModels)
+	}
+
+	catalog, err := s.cloudAgentModelList(testGroupUserID(s), &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logicalEntry map[string]any
+	for _, entry := range catalog.(map[string]any)["models"].([]map[string]any) {
+		if entry["selection"].(map[string]any)["logicalModelId"] == imageModel.ID {
+			logicalEntry = entry
+			break
+		}
+	}
+	if logicalEntry == nil || len(logicalEntry["priceTiers"].([]PublicLogicalModelPriceTier)) != 9 {
+		t.Fatalf("agent catalog did not expose the logical candidate with 9 price tiers: %#v", logicalEntry)
+	}
+	defaultRoute, err := s.ResolveLogicalModel(nil, imageModel.ID, intent)
+	if err != nil || defaultRoute.PriceTier == nil {
+		t.Fatalf("declared model defaults must resolve a priced specification: %v", err)
+	}
+	selectedIntent := ModelRequestIntent{Capability: "image", Inputs: map[string]int{}, Options: map[string]any{"imageResolution": "4k", "quality": "max"}}
+	routed, err := s.ResolveLogicalModel(nil, imageModel.ID, selectedIntent)
+	if err != nil || routed.PriceTier == nil || routed.PriceTier.ID != "agent-image-4k-max" {
+		t.Fatalf("complete selection should resolve only its exact price tier: routed=%#v error=%v", routed, err)
+	}
+}
+
+func TestCloudAgentImageCatalogRejectsUnpricedExplicitCombination(t *testing.T) {
+	s, db, _, _ := creationTestService(t)
+	imageModel := seedAgentLogicalImageModel(t, s, db)
+	if err := db.Where("channel_model_id = ? AND selector_json = ?", "agent-image-cm", "{\"imageResolution\":\"4k\",\"quality\":\"max\"}").Delete(&model.ChannelModelPriceTier{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	s.invalidateRouteCatalog()
+	intent := ModelRequestIntent{Capability: "image", Inputs: map[string]int{}, Options: map[string]any{"imageResolution": "4k", "quality": "max"}}
+
+	models, err := s.PublicLogicalModels(testGroupAccess(s), &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != imageModel.ID || models[0].Available {
+		t.Fatalf("supported but unpriced explicit combination must not be available: %#v", models)
+	}
+	catalog, err := s.cloudAgentModelList(testGroupUserID(s), &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(catalog)
+	if strings.Contains(string(encoded), "\"logicalModelId\":\""+imageModel.ID+"\"") {
+		t.Fatalf("agent exposed a model with no price tier for the explicit combination: %s", encoded)
+	}
+	if _, err := s.ResolveLogicalModel(nil, imageModel.ID, intent); err == nil {
+		t.Fatal("strict routing accepted an explicitly unpriced combination")
+	}
+}
+
+func seedAgentLogicalImageModel(t *testing.T, s *Service, db *gorm.DB) model.LogicalModel {
+	t.Helper()
+	if err := db.Create(&model.SystemSetting{Key: featureAvailabilitySettingKey, ValueJSON: "{\"frontendModelsEnabled\":true}"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.ModelChannel{ID: "agent-image-channel", Scope: model.ChannelScopeSystem, Enabled: true, Name: "Agent image test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultModelCapabilityConfigForModel(string(model.ChannelInterfaceOpenAIImage), "gpt-image-2.5-sunburst")
+	config.Image.Resolution = ImageResolutionConfig{Supported: true, Values: []string{"1k", "2k", "4k"}, Default: "1k"}
+	config.Image.Quality = ImageQualityConfig{Supported: true, Values: []string{"medium", "high", "max"}, Default: "medium"}
+	if err := db.Create(&model.ChannelModel{ID: "agent-image-cm", ChannelID: "agent-image-channel", ModelKey: "gpt-image-2.5-sunburst", DisplayName: "Sunburst", Capability: "image", Protocol: model.ChannelInterfaceOpenAIImage, CapabilityConfigJSON: mustEncodeModelCapabilityConfig(t, config), BillingMode: "fixed_request", PriceConfigured: true, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, resolution := range []string{"1k", "2k", "4k"} {
+		for _, quality := range []string{"medium", "high", "max"} {
+			selector := fmt.Sprintf("{\"imageResolution\":%q,\"quality\":%q}", resolution, quality)
+			if err := db.Create(&model.ChannelModelPriceTier{ID: "agent-image-" + resolution + "-" + quality, ChannelModelID: "agent-image-cm", SelectorKey: selector, SelectorJSON: selector, BillingMode: "fixed_request", UnitPriceMicrocredits: 100, PriceConfigured: true, Enabled: true}).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	spec, err := CapabilitySpecFromModelCapabilityConfig(config, "image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageModel := model.LogicalModel{ID: "agent-sunburst", Code: "agent-sunburst", Name: "Sunburst", Capability: "image", Enabled: true, ActiveRevisionID: "agent-sunburst-revision", PricePolicy: "channel", BillingMode: "fixed_request"}
+	revision := model.LogicalModelRevision{ID: imageModel.ActiveRevisionID, LogicalModelID: imageModel.ID, Version: 1, CapabilitySpecJSON: string(specJSON), DefaultOptionsJSON: "{}"}
+	route := model.LogicalModelRoute{ID: "agent-sunburst-route", LogicalModelRevisionID: revision.ID, ChannelModelID: "agent-image-cm", Enabled: true, Weight: 1}
+	for _, row := range []any{&imageModel, &revision, &route} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.invalidateRouteCatalog()
+	return imageModel
 }
 
 func TestCloudAgentMediaDraftReuseLifecycle(t *testing.T) {
@@ -857,6 +1032,68 @@ func TestCloudAgentMediaCancellationUpdatesNode(t *testing.T) {
 	state, _ := cloudAgentDecode(run)
 	if run.Status != "cancelled" || state.MediaTaskID != "" {
 		t.Fatal("cancellation did not checkpoint media completion")
+	}
+}
+
+// 停止本轮（或用户想撤回插话时误点停止）不能把已经提交上游、可能已计费的媒体任务
+// 一起取消：任务继续生成，结果照常回写画布，收尾等它结束后再完成。
+func TestCloudAgentStopKeepsSubmittedMediaTask(t *testing.T) {
+	s, db, a := agentMediaFixture(t)
+	s.closeApprovedCloudAgentMediaWaiters()
+	run, _ := agentMediaRun(t, s, a, "request_approval")
+	if err := s.advanceCloudAgentByID("user", run.ID); err != nil {
+		t.Fatal(err)
+	}
+	approveAgentMediaDraft(t, s, run.ID)
+	run, state := agentInterjectionState(t, s, run.ID)
+	taskID := state.MediaTaskID
+	if taskID == "" {
+		t.Fatal("approved task missing")
+	}
+	if err := db.Model(&model.Task{}).Where("id = ?", taskID).Updates(map[string]any{"status": model.TaskStatusRunning, "stage": "上游生成中", "provider_request_id": "upstream-1"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CancelCloudAgent(context.Background(), "user", run.ID); err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.repo.TaskForUser("user", taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.TaskStatusRunning {
+		t.Fatalf("submitted media task was cancelled with the run: %s", task.Status)
+	}
+	run, state = agentInterjectionState(t, s, run.ID)
+	if run.Status != "cancelled" || !run.CleanupPending || state.MediaTaskID != taskID {
+		t.Fatalf("stop must wait for the submitted media: status=%s cleanup=%v media=%s", run.Status, run.CleanupPending, state.MediaTaskID)
+	}
+	notice := false
+	for _, event := range state.Events {
+		if event.Type == "run_cancelled" && event.Payload["mediaContinues"] == true {
+			notice = true
+		}
+	}
+	if !notice {
+		t.Fatal("stop did not tell the user the billed media continues")
+	}
+	if err := db.Create(&model.Resource{ID: "stop-output", UserID: "user", Kind: "video", Status: "ready", MimeType: "video/mp4"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.Task{}).Where("id = ?", taskID).Updates(map[string]any{"status": model.TaskStatusSucceeded, "result_json": `{"mode":"video","video":{"storageKey":"resource:stop-output"}}`}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.advanceCloudAgentByID("user", run.ID); err != nil {
+		t.Fatal(err)
+	}
+	run, state = agentInterjectionState(t, s, run.ID)
+	if run.Status != "cancelled" || run.CleanupPending || state.MediaTaskID != "" {
+		t.Fatalf("cleanup did not finish after media completed: status=%s cleanup=%v media=%s", run.Status, run.CleanupPending, state.MediaTaskID)
+	}
+	canvas, _ := s.repo.CanvasProjectForUser("user", "agent-canvas")
+	doc, _ := creationDocument(canvas.PayloadJSON)
+	nodes, _ := creationObjects(doc["nodes"])
+	if meta := nodes[a.NodeID]["metadata"].(map[string]any); meta["status"] != "success" {
+		t.Fatalf("finished media was not written back: %+v", meta["status"])
 	}
 }
 

@@ -6,7 +6,8 @@ import { bindingForConnectedNode, storyboardComposerContent, storyboardRowRefere
 import type { CanvasImageAngleParams } from "@/components/canvas/canvas-node-angle-dialog";
 import type { NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import { isFrameNode } from "@/lib/canvas/canvas-frame";
-import { nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
+import { imageNodeSizeFromRatio, nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
+import { batchCellAnchor, type BatchScroll } from "@/lib/canvas/canvas-batch-references";
 import { canvasNodeMentionToken, canvasResourceMentionToken, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { batchReferenceHandleY } from "@/lib/canvas/canvas-batch-table";
@@ -78,6 +79,48 @@ export function storyboardPromptTemplateMetadata(row: StoryboardRow, kind: "imag
     return variables
         ? { promptTemplateOperation: kind === "image" ? PromptTemplateOperation.StoryboardFirstFrame : PromptTemplateOperation.StoryboardVideo, promptTemplateVariables: variables }
         : { promptTemplateOperation: undefined, promptTemplateVariables: undefined };
+}
+
+const EMPTY_STORYBOARD_SOUND_FIELD = /^(?:[-—/]|无|暂无|无台词|无旁白|无对白|无音效|（无）|\(无\))$/;
+
+function cleanStoryboardSoundField(value: string | undefined) {
+    const trimmed = (value || "").trim();
+    return trimmed && !EMPTY_STORYBOARD_SOUND_FIELD.test(trimmed) ? trimmed : "";
+}
+
+// 视频节点的最终发送文本只取输入框可见提示词（不静默追加隐藏上游文本），
+// 因此从分镜行创建或同步视频节点时需将台词/旁白与音效显式编入镜头提示词。
+export function storyboardRowVideoPrompt(row: Pick<StoryboardRow, "videoMotionPrompt" | "plotDescription" | "dialogue" | "audioEffects">) {
+    const base = (row.videoMotionPrompt || row.plotDescription || "").trim();
+    if (!base) return "";
+    const dialogue = cleanStoryboardSoundField(row.dialogue);
+    const audioEffects = cleanStoryboardSoundField(row.audioEffects);
+    return [
+        base,
+        dialogue && !base.includes(dialogue) ? `台词/旁白：${dialogue}` : "",
+        audioEffects && !base.includes(audioEffects) ? `音效：${audioEffects}` : "",
+    ].filter(Boolean).join("\n");
+}
+
+export function syncStoryboardVideoNode(node: CanvasNodeData, metadata: CanvasNodeMetadata): CanvasNodeData {
+    const hasCommittedMedia = Boolean(node.metadata?.content || node.metadata?.storageKey);
+    const nextMetadata: CanvasNodeMetadata = hasCommittedMedia && node.metadata?.prompt !== undefined ? { ...metadata, prompt: node.metadata.prompt } : metadata;
+    if (!node.metadata?.generationSpec) return { ...node, metadata: nextMetadata };
+    const synced = synchronizeGenerationSpec(
+        { ...node, metadata: nextMetadata },
+        {
+            ...(hasCommittedMedia ? {} : { prompt: nextMetadata.prompt }),
+            composerContent: nextMetadata.composerContent,
+            seconds: nextMetadata.seconds,
+        },
+    );
+    return {
+        ...synced,
+        metadata: {
+            ...synced.metadata,
+            ...(synced.metadata?.model === undefined && nextMetadata.model !== undefined ? { model: nextMetadata.model } : {}),
+        },
+    };
 }
 
 export function cinematicStoryboardColumns(columns?: StoryboardColumn[]): StoryboardColumn[] {
@@ -238,6 +281,7 @@ export function storyboardRowsFromTask(task: GenerationTask) {
 // 新模型不支持时若残留，会在 buildNodeConfig 的「节点优先、全局兜底」合并中反复叠加（issue #254）。
 const NODE_MODEL_GENERATION_PARAMS: ReadonlyArray<keyof CanvasNodeMetadata> = [
     "size",
+    "imageSizeSource",
     "quality",
     "transparentBackground",
     "count",
@@ -258,7 +302,8 @@ export function applyNodeConfigPatch(node: CanvasNodeData, patch: Partial<Canvas
     const nextPatch = resetGenerationParamsOnModelSwitch(node, safePatch);
     const next = synchronizeGenerationSpec(node, nextPatch);
     const spec = node.type === CanvasNodeType.Video ? NODE_DEFAULT_SIZE[CanvasNodeType.Video] : NODE_DEFAULT_SIZE[CanvasNodeType.Image];
-    const size = typeof safePatch.size === "string" && !node.metadata?.content ? nodeSizeFromRatio(safePatch.size, spec.width, spec.height) : null;
+    const size = typeof safePatch.size === "string" && !node.metadata?.content && !node.metadata?.manualSize
+        ? node.type === CanvasNodeType.Image ? imageNodeSizeFromRatio(safePatch.size) : nodeSizeFromRatio(safePatch.size, spec.width, spec.height) : null;
     return size && (node.type === CanvasNodeType.Image || node.type === CanvasNodeType.Video) ? { ...next, ...size, position: { x: node.position.x + node.width / 2 - size.width / 2, y: node.position.y + node.height / 2 - size.height / 2 } } : next;
 }
 
@@ -279,7 +324,9 @@ function resetGenerationParamsOnModelSwitch(node: CanvasNodeData, patch: Partial
  * 连线落到目标节点上的吸附点。单端口一侧取边的正中——与 connectionHandleY 保持同一个
  * 口径，否则吸附点和实际画出来的线会对不上（这两处是同一规则的两份实现，改一处必错）。
  */
-export function getConnectionTargetAnchor(node: CanvasNodeData, current: ConnectionHandle, handleId?: string, scrollTop = 0) {
+export function getConnectionTargetAnchor(node: CanvasNodeData, current: ConnectionHandle, handleId?: string, scrollTop = 0, batchScroll?: BatchScroll) {
+    const cell = current.handleType === "source" ? batchCellAnchor(node, handleId, batchScroll) : undefined;
+    if (cell) return { x: cell.x, y: cell.y };
     return {
         x: current.handleType === "source" ? node.position.x : node.position.x + node.width,
         y: batchReferenceHandleY(node, handleId) ?? storyboardHandleY(node, handleId, scrollTop) ?? node.position.y + node.height / 2,
@@ -334,12 +381,13 @@ export function attachNodeToStoryboardRow(nodes: CanvasNodeData[], connection: P
     const scriptNode = nodes.find((node) => node.id === scriptNodeId && node.type === CanvasNodeType.Script);
     if (!scriptNodeId || !linkedNode || !scriptNode) return nodes;
     const row = rowId ? scriptNode.metadata?.storyboard?.rows.find((item) => item.id === rowId) : undefined;
-    const videoPrompt = row ? (row.videoMotionPrompt || row.plotDescription).trim() : "";
+    const videoPrompt = row ? storyboardRowVideoPrompt(row) : "";
     const videoComposerContent = row ? storyboardComposerContent(videoPrompt, storyboardRowReferenceNodeIds(scriptNode, row, nodes, [], false), nodes) : "";
 
     return nodes.map((node) => {
         if (row && node.id === linkedNode.id && scriptNodeId === connection.fromNodeId && node.type === CanvasNodeType.Video) {
-            return { ...node, title: `镜头 ${row.shotNumber} · 视频`, metadata: { ...node.metadata, prompt: videoPrompt, composerContent: videoComposerContent, ...storyboardPromptTemplateMetadata(row, "video"), workflowKind: "shot" as const, workflowTitle: `镜头 ${row.shotNumber} 视频`, shotIndex: row.shotNumber, generationMode: "video" as const, videoEditOperation: node.metadata?.videoEditOperation || "text_to_video", seconds: String(row.durationSeconds) } };
+            const synced = syncStoryboardVideoNode(node, { ...node.metadata, prompt: videoPrompt, composerContent: videoComposerContent, ...storyboardPromptTemplateMetadata(row, "video"), workflowKind: "shot" as const, workflowTitle: `镜头 ${row.shotNumber} 视频`, shotIndex: row.shotNumber, generationMode: "video" as const, videoEditOperation: node.metadata?.videoEditOperation || "text_to_video", seconds: String(row.durationSeconds) });
+            return { ...synced, title: `镜头 ${row.shotNumber} · 视频` };
         }
         if (node.id !== scriptNodeId || node.type !== CanvasNodeType.Script) return node;
         const storyboard = node.metadata?.storyboard;
@@ -508,7 +556,18 @@ export function removeCanvasNodes(nodes: CanvasNodeData[], requestedIds: Set<str
     });
     const remainingNodes = nodes.filter((node) => !removedIds.has(node.id));
     const cleanedNodes = remainingNodes.map((node) => {
-        const detached = node.parentId && removedIds.has(node.parentId) ? { ...node, parentId: undefined } : node;
+        let detached = node.parentId && removedIds.has(node.parentId) ? { ...node, parentId: undefined } : node;
+        const batchTable = detached.metadata?.batchTable;
+        if (batchTable) {
+            const rows = batchTable.rows.map(row => {
+                const inputNodeIds = row.inputNodeIds.map(id => removedIds.has(id) ? "" : id);
+                const textNodeIds = row.textNodeIds?.map(id => removedIds.has(id) ? "" : id);
+                const outputNodeId = row.outputNodeId && removedIds.has(row.outputNodeId) ? undefined : row.outputNodeId;
+                const changed = inputNodeIds.some((id, i) => id !== row.inputNodeIds[i]) || textNodeIds?.some((id, i) => id !== row.textNodeIds?.[i]);
+                return changed || outputNodeId !== row.outputNodeId ? { ...row, inputNodeIds, textNodeIds, outputNodeId, inputChanged: Boolean(outputNodeId) || row.inputChanged } : row;
+            });
+            if (rows.some((row, i) => row !== batchTable.rows[i])) detached = { ...detached, metadata: { ...detached.metadata, batchTable: { ...batchTable, rows } } };
+        }
         const storyboard = detached.metadata?.storyboard;
         const cleaned = storyboard
             ? {

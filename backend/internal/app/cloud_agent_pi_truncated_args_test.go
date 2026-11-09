@@ -70,7 +70,13 @@ func TestCloudAgentPiModelRetriesTruncatedToolArguments(t *testing.T) {
 				t.Fatal(decodeErr)
 			}
 			if state.ActiveTaskID != "" && state.ActiveTaskID != skip {
-				return state.ActiveTaskID
+				task, taskErr := s.repo.TaskForUser("user", state.ActiveTaskID)
+				if taskErr != nil {
+					t.Fatal(taskErr)
+				}
+				if task.Operation == cloudAgentStepOperation {
+					return state.ActiveTaskID
+				}
 			}
 			select {
 			case got := <-done:
@@ -95,8 +101,8 @@ func TestCloudAgentPiModelRetriesTruncatedToolArguments(t *testing.T) {
 	if !ok {
 		t.Fatalf("first model task textOptions = %#v", firstInput["textOptions"])
 	}
-	if thinking, ok := textOptions["thinking"].(bool); !ok || thinking {
-		t.Fatalf("disabled thinking should be false, got %#v", textOptions["thinking"])
+	if textOptions["thinkingLevel"] != ThinkingLevelOff {
+		t.Fatalf("disabled thinking should be off, got %#v", textOptions["thinkingLevel"])
 	}
 	if err := db.Model(&model.Task{}).Where("id = ?", first).Updates(map[string]any{
 		"status": model.TaskStatusFailed,

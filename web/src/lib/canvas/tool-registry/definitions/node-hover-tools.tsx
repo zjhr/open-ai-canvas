@@ -1,9 +1,11 @@
-import { AudioLines, Captions, Clapperboard, Download, FolderPlus, Images, Image as ImageIcon, Info, LoaderCircle, Lock, Maximize2, MessageSquare, Minus, Music2, Plus, RefreshCw, Scissors, Settings2, Trash2, Unlock, Upload, UserRound, Video, WandSparkles } from "lucide-react";
+import { AudioLines, Captions, CircleCheckBig, Clapperboard, Download, FolderPlus, History, Images, Image as ImageIcon, Info, LoaderCircle, Lock, Maximize2, MessageSquare, Minus, Music2, Plus, RefreshCw, RotateCcw, RotateCw, Scissors, Settings2, Trash2, Unlock, Upload, UserRound, Video, ImageUpscale } from "lucide-react";
 
 import { CONTENT_MODERATION_ERROR_CODE, isContentModerationError } from "@/lib/generation-error";
 import { registerToolbarTools, type ToolContext, type ToolDefinition } from "@/lib/canvas/tool-registry";
 import { CanvasNodeType } from "@/types/canvas";
 import { isCanvasImageSourceNode } from "@/lib/canvas/canvas-image-source";
+import { canRotateCanvasImage, currentImageRotation } from "@/lib/canvas/canvas-image-rotation";
+import { hasMediaVersionHistory, listMediaVersions } from "@/lib/canvas/canvas-media-versions";
 
 // 节点状态判定辅助函数——从 ToolContext 派生
 function isImage(ctx: ToolContext) { return ctx.node?.type === CanvasNodeType.Image; }
@@ -30,6 +32,38 @@ function canRetry(ctx: ToolContext) {
 }
 
 export const nodeHoverToolbarTools: ToolDefinition[] = [
+    {
+        id: "createEditCopy",
+        toolbar: "node-hover",
+        category: "node-state",
+        label: "创建编辑副本",
+        displayLabel: "创建编辑副本",
+        icon: <Images className="size-3.5" />,
+        defaultVisible: true,
+        defaultOrder: 195,
+        nodeToolbar: { group: "process", order: 5, section: "编辑副本", description: "保留原图，连线复制后在副本上调整" },
+        applicable: (ctx) => hasImage(ctx) && !ctx.nodeMetadata?.imageLayerGroup && !ctx.nodeMetadata?.imageLayer && !ctx.nodeMetadata?.layerExtraction,
+        disabled: (ctx) => Boolean(ctx.nodeMetadata?.fileUpload) || !ctx.handlers.onNodeCreateEditCopy,
+        run: (ctx) => ctx.handlers.onNodeCreateEditCopy?.(ctx.node!),
+    },
+    ...([
+        { id: "rotateClockwise", label: "向右转 90°", direction: 1, icon: <RotateCw className="size-3.5" /> },
+        { id: "rotateCounterclockwise", label: "向左转 90°", direction: -1, icon: <RotateCcw className="size-3.5" /> },
+        { id: "restoreImageOrientation", label: "恢复原方向", direction: 0, icon: <RefreshCw className="size-3.5" /> },
+    ] as const).map((rotation, index): ToolDefinition => ({
+        id: rotation.id,
+        toolbar: "node-hover",
+        category: "node-state",
+        label: rotation.label,
+        displayLabel: rotation.label,
+        icon: rotation.icon,
+        defaultVisible: true,
+        defaultOrder: 200 + index,
+        nodeToolbar: { group: (ctx) => ctx.nodeMetadata?.imageEditSourceNodeId && rotation.direction !== 0 ? "primary" : "process", order: 25 + index, section: "方向校正", description: "首次创建编辑副本，之后在副本上继续调整" },
+        applicable: (ctx) => hasImage(ctx) && !ctx.nodeMetadata?.imageLayerGroup && !ctx.nodeMetadata?.imageLayer && !ctx.nodeMetadata?.layerExtraction,
+        disabled: (ctx) => !ctx.node || !canRotateCanvasImage(ctx.node) || Boolean(ctx.rotatingImage) || !ctx.handlers.onNodeRotateImage || (rotation.direction === 0 && !currentImageRotation(ctx.node)?.quarterTurns),
+        run: (ctx) => ctx.handlers.onNodeRotateImage?.(ctx.node!, rotation.direction),
+    })),
     // 基础工具组
     {
         id: "info",
@@ -115,6 +149,20 @@ export const nodeHoverToolbarTools: ToolDefinition[] = [
         applicable: (ctx) => hasVideo(ctx) && !simpleMode(ctx),
         disabled: (ctx) => ctx.extractingAudio || ctx.trimmingVideo,
         run: (ctx) => ctx.handlers.onNodeTrimVideoSegments(ctx.node!),
+    },
+    {
+        id: "enhanceVideo",
+        toolbar: "node-hover",
+        category: "node-state",
+        label: "画质增强：提升视频分辨率与细节，生成新视频节点",
+        displayLabel: "画质增强",
+        icon: <ImageUpscale className="size-3.5" />,
+        defaultVisible: true,
+        defaultOrder: 45,
+        nodeToolbar: { group: "process", order: 30, section: "画质", description: "AI 提升清晰度，另存为新视频" },
+        applicable: (ctx) => hasVideo(ctx) && !simpleMode(ctx) && Boolean(ctx.handlers.onNodeEnhanceVideo) && ctx.nodeMetadata?.status !== "loading",
+        disabled: (ctx) => !ctx.nodeMetadata?.storageKey && !ctx.nodeMetadata?.content,
+        run: (ctx) => ctx.handlers.onNodeEnhanceVideo?.(ctx.node!),
     },
     {
         id: "saveAsset",
@@ -259,6 +307,47 @@ export const nodeHoverToolbarTools: ToolDefinition[] = [
         applicable: (ctx) => hasVideo(ctx),
         run: (ctx) => ctx.handlers.onNodeSubtitles(ctx.node!),
     },
+    // 精修画布 → 短剧：只在关联短剧的画布上由页面提供处理函数。
+    {
+        id: "adoptToDrama",
+        toolbar: "node-hover",
+        category: "node-state",
+        label: (ctx) => (isVideo(ctx) ? "采用为剧情段视频" : "采用为设定参考图"),
+        displayLabel: "采用到短剧",
+        icon: <CircleCheckBig className="size-3.5" />,
+        defaultVisible: true,
+        defaultOrder: 146,
+        nodeToolbar: { group: "workspace", order: 5, section: "短剧", description: "写回短剧，成为新的当前版本" },
+        applicable: (ctx) => Boolean(ctx.handlers.onNodeAdoptToDrama) && (hasImage(ctx) || hasVideo(ctx)) && !isImageBatchRoot(ctx),
+        run: (ctx) => ctx.handlers.onNodeAdoptToDrama?.(ctx.node!),
+    },
+    {
+        id: "refreshFromDrama",
+        toolbar: "node-hover",
+        category: "node-state",
+        label: "同步短剧最新版本",
+        displayLabel: "同步短剧",
+        icon: <RefreshCw className="size-3.5" />,
+        defaultVisible: true,
+        defaultOrder: 146,
+        nodeToolbar: { group: "workspace", order: 6, section: "短剧", description: "短剧侧已有更新的版本，换成它；当前画面保留在版本历史" },
+        applicable: (ctx) => Boolean(ctx.handlers.onNodeRefreshFromDrama),
+        run: (ctx) => ctx.handlers.onNodeRefreshFromDrama?.(ctx.node!),
+    },
+    {
+        id: "mediaVersions",
+        toolbar: "node-hover",
+        category: "node-state",
+        label: "版本历史",
+        displayLabel: (ctx) => `版本 ${listMediaVersions(ctx.node).length}`,
+        icon: <History className="size-3.5" />,
+        defaultVisible: true,
+        defaultOrder: 147,
+        nodeToolbar: { group: "workspace", order: 10, section: "版本", description: "预览、对比并切换历史版本" },
+        // 只有一个版本时没有可回看的内容，不占工具条位置。
+        applicable: (ctx) => Boolean(ctx.handlers.onNodeVersions) && hasMediaVersionHistory(ctx.node),
+        run: (ctx) => ctx.handlers.onNodeVersions?.(ctx.node!),
+    },
     {
         id: "timeline",
         toolbar: "node-hover",
@@ -291,7 +380,7 @@ export const nodeHoverToolbarTools: ToolDefinition[] = [
         toolbar: "node-hover",
         category: "navigation",
         label: (ctx) => ctx.nodeMetadata?.locked ? "解锁节点" : "锁定位置和尺寸",
-        displayLabel: "锁定位置与尺寸",
+        displayLabel: (ctx) => ctx.nodeMetadata?.locked ? "解锁位置与尺寸" : "锁定位置与尺寸",
         icon: (ctx) => ctx.nodeMetadata?.locked ? <Unlock className="size-3.5" /> : <Lock className="size-3.5" />,
         defaultVisible: true,
         defaultOrder: 160,

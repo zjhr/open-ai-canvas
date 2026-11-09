@@ -23,6 +23,16 @@ type ManifestOperation struct {
 	Files               []ManifestFilePart `json:"files,omitempty"`
 }
 
+// ManifestUpload 声明“先上传素材、再按上游素材 ID 引用”的前置步骤。宿主在 create 之前
+// 对 Kinds 内的每个输入媒体执行一次该请求（模板里可用 media.* 引用当前媒体），
+// 用 ID 表达式从响应取出上游素材 ID，写入 media.uploadId 供 create 模板引用。
+// 恢复已有上游任务时不会重复上传。
+type ManifestUpload struct {
+	ManifestOperation
+	Kinds []string `json:"kinds"`
+	ID    any      `json:"id"`
+}
+
 type ManifestFilePart struct {
 	Name     string `json:"name"`
 	Source   any    `json:"source"`
@@ -50,12 +60,16 @@ type ManifestResponse struct {
 	TaskID            any  `json:"taskId,omitempty"`
 	Status            any  `json:"status,omitempty"`
 	Message           any  `json:"message,omitempty"`
-	Text              any  `json:"text,omitempty"`
-	Reasoning         any  `json:"reasoning,omitempty"`
-	Images            any  `json:"images,omitempty"`
-	Videos            any  `json:"videos,omitempty"`
-	Audios            any  `json:"audios,omitempty"`
-	Usage             any  `json:"usage,omitempty"`
+	// Stage 映射上游可读的排队/生成阶段文案，宿主只用于任务进度展示。
+	Stage any `json:"stage,omitempty"`
+	// QueueAhead 映射排在本任务前面的条数；分离式回查据此拉长回查间隔，减少长队列下的无效查询。
+	QueueAhead any `json:"queueAhead,omitempty"`
+	Text       any `json:"text,omitempty"`
+	Reasoning  any `json:"reasoning,omitempty"`
+	Images     any `json:"images,omitempty"`
+	Videos     any `json:"videos,omitempty"`
+	Audios     any `json:"audios,omitempty"`
+	Usage      any `json:"usage,omitempty"`
 }
 
 // ManifestAgentResponse describes the provider response shape for a
@@ -292,8 +306,28 @@ func ValidateManifest(manifest Manifest) error {
 			return fmt.Errorf("duplicate provider contribution %q", provider.ID)
 		}
 		providerIDs[provider.ID] = struct{}{}
+		if err := ValidateImageParameters(provider.ImageParameters); err != nil {
+			return fmt.Errorf("provider %q image parameters: %w", provider.ID, err)
+		}
+		for _, parameter := range provider.ImageParameters {
+			if parameter.Binding == "" {
+				return fmt.Errorf("provider %q image parameter %s requires a binding", provider.ID, parameter.Name)
+			}
+			if strings.HasPrefix(parameter.Binding, "providerOptions.") && !strings.HasPrefix(parameter.Binding, "providerOptions."+provider.ID+".") {
+				return fmt.Errorf("provider %q image parameter %s must use its own namespace", provider.ID, parameter.Name)
+			}
+		}
 		if len(provider.Capabilities) == 0 || len(provider.Scopes) == 0 {
 			return fmt.Errorf("provider contribution %q requires capabilities and scopes", provider.ID)
+		}
+		switch provider.Kind {
+		case "", ProviderKindGeneration:
+		case ProviderKindProcessing:
+			if len(provider.Capabilities) != 1 || provider.Capabilities[0] == CapabilityText {
+				return fmt.Errorf("processing provider %q must declare exactly one media capability", provider.ID)
+			}
+		default:
+			return fmt.Errorf("unsupported provider kind %q", provider.Kind)
 		}
 		for _, capability := range provider.Capabilities {
 			if capability != CapabilityText && capability != CapabilityImage && capability != CapabilityVideo && capability != CapabilityAudio {
@@ -321,6 +355,22 @@ func ValidateManifest(manifest Manifest) error {
 		if provider.Poll != nil {
 			if err := validateManifestOperation(*provider.Poll); err != nil {
 				return fmt.Errorf("provider %q poll operation: %w", provider.ID, err)
+			}
+		}
+		if provider.DetachedPolling && provider.Poll == nil {
+			return fmt.Errorf("provider %q detachedPolling requires a poll operation", provider.ID)
+		}
+		if provider.Upload != nil {
+			if err := validateManifestOperation(provider.Upload.ManifestOperation); err != nil {
+				return fmt.Errorf("provider %q upload operation: %w", provider.ID, err)
+			}
+			if provider.Upload.ID == nil || len(provider.Upload.Kinds) == 0 {
+				return fmt.Errorf("provider %q upload operation requires kinds and id mapping", provider.ID)
+			}
+			for _, kind := range provider.Upload.Kinds {
+				if kind != "image" && kind != "video" && kind != "audio" {
+					return fmt.Errorf("provider %q upload kind %q is unsupported", provider.ID, kind)
+				}
 			}
 		}
 		if provider.Cancel != nil {
@@ -375,8 +425,48 @@ func validatePaymentProviderContributions(manifest Manifest) error {
 				return fmt.Errorf("payment provider contribution %q has invalid notification response status", provider.ID)
 			}
 		}
+		methods := make(map[string]struct{}, len(provider.Methods))
+		for _, method := range provider.Methods {
+			if !ValidPaymentMethodID(method.ID) || strings.TrimSpace(method.Label) == "" {
+				return fmt.Errorf("payment provider contribution %q has invalid method %q", provider.ID, method.ID)
+			}
+			if _, exists := methods[method.ID]; exists {
+				return fmt.Errorf("payment provider contribution %q has duplicate method %q", provider.ID, method.ID)
+			}
+			methods[method.ID] = struct{}{}
+		}
+		if field := strings.TrimSpace(provider.MethodsField); field != "" && !manifestHasConfigField(manifest, field) {
+			return fmt.Errorf("payment provider contribution %q methods field %q is not a configuration field", provider.ID, field)
+		}
 	}
 	return nil
+}
+
+// ValidPaymentMethodID 限定支付方式 ID 为 1-32 位小写字母、数字、- 或 _，且以字母或数字开头；
+// 该值会原样作为渠道下单参数，宿主据此拒绝任意字符串。
+func ValidPaymentMethodID(value string) bool {
+	if len(value) == 0 || len(value) > 32 {
+		return false
+	}
+	for index, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		if index > 0 && (char == '-' || char == '_') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func manifestHasConfigField(manifest Manifest, name string) bool {
+	for _, field := range manifest.Configuration.Fields {
+		if field.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeManifest(manifest *Manifest) error {
@@ -399,13 +489,27 @@ func normalizeManifestForProvider(manifest *Manifest, index int) error {
 	manifest.Metadata.Categories = provider.Capabilities
 	manifest.Metadata.Scopes = provider.Scopes
 	manifest.Metadata.Parameters = provider.Parameters
+	manifest.Metadata.ImageParameters = provider.ImageParameters
 	manifest.Metadata.Create = operationSummary(provider.Create)
+	manifest.Metadata.Agent = operationSummaryPtr(provider.Agent)
 	manifest.Metadata.Poll = operationSummaryPtr(provider.Poll)
 	manifest.Metadata.Cancel = operationSummaryPtr(provider.Cancel)
 	manifest.Metadata.ContentType = provider.Create.ContentType
+	manifest.Metadata.TextWire, manifest.Metadata.AgentWire = "", ""
+	if hasCapability(provider.Capabilities, CapabilityText) {
+		manifest.Metadata.TextWire = TextWireForPath(provider.Create.Path)
+		if provider.Agent != nil {
+			manifest.Metadata.AgentWire = TextWireForPath(provider.Agent.Path)
+		}
+	}
+	manifest.Metadata.Auth = provider.Auth
 	manifest.Metadata.RequiresPublicMediaURLs = provider.RequiresPublicMediaURLs
+	manifest.Metadata.DetachedPolling = provider.DetachedPolling
+	manifest.Metadata.IdempotentCreate = provider.IdempotentCreate
+	manifest.Metadata.Kind = provider.Kind
 	manifest.Metadata.Execution = manifest.Runtime.Backend
 	manifest.Create = provider.Create
+	manifest.Upload = provider.Upload
 	manifest.Agent = provider.Agent
 	manifest.Poll = provider.Poll
 	manifest.Cancel = provider.Cancel

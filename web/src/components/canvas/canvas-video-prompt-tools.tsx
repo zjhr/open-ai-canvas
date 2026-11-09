@@ -1,10 +1,12 @@
 import { type CSSProperties, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Image as ImageIcon } from "lucide-react";
+import { observeMovablePopupAnchor } from "@/lib/movable-popup-anchor";
 
 import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
 import type { CanvasNodeMetadata } from "@/types/canvas";
+import { useTranslation } from "react-i18next";
 
 type VideoFrameOption = {
     nodeId: string;
@@ -34,6 +36,7 @@ const MENU_ITEM_HEIGHT = 28;
 const CONTROL_TEXT_STYLE: CSSProperties = { fontFamily: "inherit", fontSize: 11, fontWeight: 400, letterSpacing: 0, lineHeight: 1 };
 
 export function CanvasVideoPromptTools({ metadata, frameOptions, onMetadataChange, referenceMode = "frames", referenceSummary }: CanvasVideoPromptToolsProps) {
+    const { t } = useTranslation();
     const theme = canvasThemes[useActiveTheme()];
     const startFrame = metadata?.videoStartFrameNodeId || EMPTY_FRAME_VALUE;
     const endFrame = metadata?.videoEndFrameNodeId || EMPTY_FRAME_VALUE;
@@ -46,23 +49,23 @@ export function CanvasVideoPromptTools({ metadata, frameOptions, onMetadataChang
     if (referenceMode === "all") {
         const summary = referenceSummary
             ? [
-                  referenceSummary.imageCount ? `${referenceSummary.imageCount} 图` : "",
-                  referenceSummary.videoCount ? `${referenceSummary.videoCount} 视频` : "",
-                  referenceSummary.audioCount ? `${referenceSummary.audioCount} 音频` : "",
+                  referenceSummary.imageCount ? t("canvasC.videoPromptTools.imageCount", { count: referenceSummary.imageCount }) : "",
+                  referenceSummary.videoCount ? t("canvasC.videoPromptTools.videoCount", { count: referenceSummary.videoCount }) : "",
+                  referenceSummary.audioCount ? t("canvasC.videoPromptTools.audioCount", { count: referenceSummary.audioCount }) : "",
               ].filter(Boolean).join(" · ")
             : "";
         return (
             <div
-                className="flex min-h-8 min-w-0 items-center gap-2 rounded-md px-2 py-1.5"
+                className="flex min-h-8 min-w-0 items-center gap-2 rounded-md px-2 py-2"
                 data-canvas-no-zoom
                 style={{ background: theme.toolbar.itemHover, color: theme.node.text }}
-                title="已连接的图片、视频和音频会按工作流字段映射传入"
+                title={t("canvasC.videoPromptTools.workflowReferenceHint")}
                 onMouseDown={(event) => event.stopPropagation()}
                 onPointerDown={(event) => event.stopPropagation()}
             >
                 <ImageIcon className="size-3.5 shrink-0 opacity-80" />
-                <span className="shrink-0 text-[var(--fs-tiny)] font-medium">工作流参考</span>
-                <span className="min-w-0 truncate text-[var(--fs-micro)] opacity-65">{summary || "尚未连接媒体"}</span>
+                <span className="shrink-0 text-[var(--fs-tiny)] font-medium">{t("canvasC.videoPromptTools.workflowReference")}</span>
+                <span className="min-w-0 truncate text-[var(--fs-micro)] opacity-65">{summary || t("canvasC.videoPromptTools.noMedia")}</span>
             </div>
         );
     }
@@ -76,15 +79,16 @@ export function CanvasVideoPromptTools({ metadata, frameOptions, onMetadataChang
             onMouseDown={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
         >
-            <FrameMenu label="首帧" value={startFrame} options={frameOptions} theme={theme} onChange={(value) => setFrame("videoStartFrameNodeId", value)} />
-            <FrameMenu label="尾帧" value={endFrame} options={frameOptions} theme={theme} onChange={(value) => setFrame("videoEndFrameNodeId", value)} />
+            <FrameMenu label={t("canvasC.videoPromptTools.startFrame")} value={startFrame} options={frameOptions} theme={theme} onChange={(value) => setFrame("videoStartFrameNodeId", value)} />
+            <FrameMenu label={t("canvasC.videoPromptTools.endFrame")} value={endFrame} options={frameOptions} theme={theme} onChange={(value) => setFrame("videoEndFrameNodeId", value)} />
         </div>
     );
 }
 
 function FrameMenu({ label, value, options, theme, onChange }: { label: string; value: string; options: VideoFrameOption[]; theme: CanvasTheme; onChange: (value: string) => void }) {
+    const { t } = useTranslation();
     const selected = options.find((item) => item.nodeId === value);
-    const items = [{ value: EMPTY_FRAME_VALUE, label: "不指定" }, ...options.map((option) => ({ value: option.nodeId, label: `${option.label} · ${option.title}`, previewUrl: option.previewUrl }))];
+    const items = [{ value: EMPTY_FRAME_VALUE, label: t("canvasC.videoPromptTools.none") }, ...options.map((option) => ({ value: option.nodeId, label: `${option.label} · ${option.title}`, previewUrl: option.previewUrl }))];
     return (
         <CompactMenuButton
             theme={theme}
@@ -154,11 +158,13 @@ function CompactMenuButton({
             if (event.key === "Escape") setOpen(false);
         };
         const reposition = () => updatePosition();
+        const stopMovingAnchor = triggerRef.current ? observeMovablePopupAnchor(triggerRef.current, reposition) : undefined;
         document.addEventListener("pointerdown", close, true);
         document.addEventListener("keydown", closeOnEscape, true);
         window.addEventListener("resize", reposition);
         window.addEventListener("scroll", reposition, true);
         return () => {
+            stopMovingAnchor?.();
             document.removeEventListener("pointerdown", close, true);
             document.removeEventListener("keydown", closeOnEscape, true);
             window.removeEventListener("resize", reposition);
@@ -200,7 +206,7 @@ function CompactMenuButton({
                                   <button
                                       key={item.value}
                                       type="button"
-                                      className="flex h-7 w-full min-w-0 items-center gap-1.5 rounded-lg px-2 text-left transition"
+                                      className="flex h-7 w-full min-w-0 items-center gap-2 rounded-lg px-2 text-left transition"
                                       style={{ ...CONTROL_TEXT_STYLE, background: selected ? theme.toolbar.itemHover : "transparent", color: selected ? theme.toolbar.activeText : theme.node.text }}
                                       onMouseEnter={(event) => {
                                           event.currentTarget.style.background = theme.toolbar.itemHover;
@@ -230,7 +236,7 @@ function CompactMenuButton({
             <button
                 ref={triggerRef}
                 type="button"
-                className="inline-flex h-6 w-full min-w-0 items-center gap-1 rounded-[var(--dock-item-radius)] border-0 bg-transparent px-1.5 shadow-none transition hover:opacity-80 focus-visible:outline-none focus-visible:ring-1"
+                className="inline-flex h-6 w-full min-w-0 items-center gap-1 rounded-[var(--dock-item-radius)] border-0 bg-transparent px-2 shadow-none transition hover:opacity-80 focus-visible:outline-none focus-visible:ring-1"
                 style={buttonStyle}
                 title={title}
                 onClick={() => setOpen((value) => !value)}

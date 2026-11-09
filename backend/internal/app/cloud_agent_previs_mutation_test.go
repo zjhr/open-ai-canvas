@@ -3,10 +3,12 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
 	"yingce/backend/internal/model"
+	"yingce/backend/internal/repository"
 )
 
 func previsMutationFixture(t *testing.T) (*Service, *model.CanvasProject) {
@@ -73,9 +75,22 @@ func TestCloudAgentPrevisSceneCreateAndPatchKeepSemanticAndCanvasHashesSeparate(
 		"title":              "客厅对白",
 		"templateId":         "dialogue",
 	})
-	createResult, err := applyCloudAgentPrevisMutation(s.repo, "user", canvas.ID, createCall, policy, cloudAgentMutationRecorderForRun(run.ID))
+	captureRecorder, recordedPreview := cloudAgentCaptureMutationPreview()
+	createRecorder := cloudAgentMutationRecorder(func(repo *repository.Repository, input cloudAgentMutationInput) error {
+		if err := cloudAgentMutationRecorderForRun(run.ID)(repo, input); err != nil {
+			return err
+		}
+		return captureRecorder(repo, input)
+	})
+	createResult, err := applyCloudAgentPrevisMutation(s.repo, "user", canvas.ID, createCall, policy, createRecorder)
 	if err != nil {
 		t.Fatal(err)
+	}
+	createResultMap := createResult.(map[string]any)
+	createPreview := createResultMap["preview"].(cloudAgentApprovalPreview)
+	assertCloudAgentAppliedPreview(t, createPreview, createPreview.Items[0].Summary)
+	if recorded, ok := recordedPreview(); !ok || recorded.Description != createPreview.Description || recorded.Status != createPreview.Status {
+		t.Fatalf("previs mutation event preview diverged from tool result: result=%+v recorded=%+v", createPreview, recorded)
 	}
 	createdSceneHash := previsResultString(t, createResult, "snapshotHash")
 	createdCanvasHash := previsResultString(t, createResult, "canvasSnapshotHash")
@@ -116,6 +131,9 @@ func TestCloudAgentPrevisSceneCreateAndPatchKeepSemanticAndCanvasHashesSeparate(
 	if err != nil {
 		t.Fatal(err)
 	}
+	patchResultMap := patchResult.(map[string]any)
+	patchPreview := patchResultMap["preview"].(cloudAgentApprovalPreview)
+	assertCloudAgentAppliedPreview(t, patchPreview, patchPreview.Items[0].Summary)
 	patchedSceneHash := previsResultString(t, patchResult, "snapshotHash")
 	patchedCanvasHash := previsResultString(t, patchResult, "canvasSnapshotHash")
 	if patchedSceneHash == createdSceneHash || patchedCanvasHash == createdCanvasHash {
@@ -577,8 +595,13 @@ func TestCloudAgentPrevisCharacterBindingAndAnimationPatch(t *testing.T) {
 	storedDoc, _ = creationDocument(stored.PayloadJSON)
 	scene, _ = findPrevisScene(creationMaps(storedDoc["previsScenes"]), "binding-scene")
 	actor = cloudAgentPrevisFindByID(creationMaps(scene["objects"]), "hero-actor")
-	if len(creationMaps(actor["keyframes"])) != 1 || actor["motionPath"] == nil {
+	if len(creationMaps(actor["keyframes"])) != 3 || actor["motionPath"] == nil {
 		t.Fatalf("animation patch was not persisted: %#v", actor)
+	}
+	for _, keyframe := range creationMaps(actor["keyframes"]) {
+		if !strings.HasPrefix(stringValue(keyframe["id"]), "hero-actor-path-") {
+			t.Fatalf("motion path retained a conflicting manual keyframe: %#v", keyframe)
+		}
 	}
 }
 
@@ -648,7 +671,11 @@ func TestCloudAgentPrevisAnimationOperationsRespectShotDurationAndRemoval(t *tes
 		t.Fatal("motion path beyond active shot duration was accepted")
 	}
 
-	objectKeyframeID := stringValue(creationMaps(actor["keyframes"])[0]["id"])
+	objectFrames := creationMaps(actor["keyframes"])
+	if len(objectFrames) != 1 || !strings.HasSuffix(stringValue(objectFrames[0]["id"]), "-path-hold") {
+		t.Fatalf("path at shot end must replace the manual track with a hold: %#v", objectFrames)
+	}
+	objectKeyframeID := stringValue(objectFrames[0]["id"])
 	cameraKeyframeID := stringValue(creationMaps(camera["keyframes"])[0]["id"])
 	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "object_keyframe_remove", ID: actor["id"].(string), KeyframeID: previsStringPtr(objectKeyframeID)}, 6); err != nil {
 		t.Fatalf("object keyframe removal failed: %v", err)
@@ -758,4 +785,155 @@ func mustCreationDocument(t *testing.T, raw string) map[string]any {
 		t.Fatal(err)
 	}
 	return doc
+}
+
+func TestCloudAgentPrevisAgentControlFixes(t *testing.T) {
+	scene, err := cloudAgentPrevisSceneCreateTemplate(cloudAgentPrevisSceneCreateArgs{SceneID: "control", Title: "控制修复", TemplateID: "monologue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorKind := "actor"
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "object_add", ID: "control-walker", Kind: actorKind}, 0); err != nil {
+		t.Fatalf("actor add failed: %v", err)
+	}
+	walker := cloudAgentPrevisFindByID(creationMaps(scene["objects"]), "control-walker")
+	if stringValue(walker["primitive"]) != "character" {
+		t.Fatalf("actor without primitive must default to character, got %q", stringValue(walker["primitive"]))
+	}
+
+	camera := cloudAgentPrevisFindByID(creationMaps(scene["cameras"]), "control-camera-1")
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "camera_update", ID: "control-camera-1", FocalLength: float64Ptr(85)}, 1); err != nil {
+		t.Fatalf("camera update failed: %v", err)
+	}
+	if fov := numberValue(camera["fov"], 0); math.Abs(fov-cloudAgentPrevisFocalToFov(85)) > 1e-9 || fov > 30 {
+		t.Fatalf("focal length change must update fov, got %v", fov)
+	}
+
+	walk := true
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{
+		Type: "object_motion_path_set", ID: "control-walker", PathPoints: [][]float64{{0, 0, 0}, {2.8, 0, 0}}, StartDelay: float64Ptr(1), OrientToPath: &walk,
+	}, 2); err != nil {
+		t.Fatalf("motion path failed: %v", err)
+	}
+	keyframes := creationMaps(walker["keyframes"])
+	if len(keyframes) != 3 {
+		t.Fatalf("path must produce hold + 2 waypoint keyframes, got %d", len(keyframes))
+	}
+	// 2.8m 以步行 1.4m/s 用时 2s：1s 出发、3s 到达，并朝 +X 转身。
+	if numberValue(keyframes[0]["time"], -1) != 0 || numberValue(keyframes[1]["time"], -1) != 1 || numberValue(keyframes[2]["time"], -1) != 3 {
+		t.Fatalf("unexpected path timing: %#v", keyframes)
+	}
+	yaw := numberValue(cloudAgentPrevisMapTransform(keyframes[2])["rotation"].([]any)[1], 0)
+	if math.Abs(yaw-math.Pi/2) > 1e-6 {
+		t.Fatalf("orientToPath must face travel direction, got yaw %v", yaw)
+	}
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "object_motion_path_clear", ID: "control-walker"}, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(creationMaps(walker["keyframes"])) != 0 {
+		t.Fatal("clearing a motion path must remove its derived keyframes")
+	}
+}
+
+func TestCloudAgentPrevisActorMotionOperations(t *testing.T) {
+	scene, err := cloudAgentPrevisSceneCreateTemplate(cloudAgentPrevisSceneCreateArgs{SceneID: "motion", Title: "动作", TemplateID: "monologue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := cloudAgentPrevisFindByID(creationMaps(scene["objects"]), "motion-actor-1")
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "actor_motion_add", ID: "motion-actor-1", Motion: "wave", Time: float64Ptr(1), Duration: float64Ptr(2)}, 0); err != nil {
+		t.Fatalf("motion add failed: %v", err)
+	}
+	motions := creationMaps(actor["motions"])
+	if len(motions) != 1 || stringValue(motions[0]["motion"]) != "wave" || numberValue(motions[0]["start"], -1) != 1 {
+		t.Fatalf("unexpected motions: %#v", motions)
+	}
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "actor_motion_add", ID: "motion-actor-1", Motion: "moonwalk"}, 1); err == nil {
+		t.Fatal("unknown motion accepted")
+	}
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "actor_motion_add", ID: "motion-actor-1", Motion: "nod", Time: float64Ptr(99)}, 2); err == nil {
+		t.Fatal("motion beyond shot duration accepted")
+	}
+	camera := "motion-camera-1"
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "actor_motion_add", ID: camera, Motion: "nod"}, 3); err == nil {
+		t.Fatal("motion on non-object accepted")
+	}
+	id := stringValue(motions[0]["id"])
+	if _, err := cloudAgentPrevisApplyPatchOperation(scene, cloudAgentPrevisPatchOperation{Type: "actor_motion_remove", ID: "motion-actor-1", KeyframeID: previsStringPtr(id)}, 4); err != nil {
+		t.Fatalf("motion remove failed: %v", err)
+	}
+	if len(creationMaps(actor["motions"])) != 0 {
+		t.Fatal("motion not removed")
+	}
+}
+
+func TestCloudAgentPrevisGroundScene(t *testing.T) {
+	scene := map[string]any{"objects": []any{
+		map[string]any{"id": "a", "kind": "actor", "transform": map[string]any{"position": []any{1.0, -14.54, 2.0}}, "keyframes": []any{map[string]any{"transform": map[string]any{"position": []any{0.0, 3.0, 0.0}}}, map[string]any{"transform": map[string]any{"position": []any{0.0, -1.0, 0.0}}}}, "motionPath": map[string]any{"points": []any{[]any{0.0, -1.0, 0.0}, []any{1.0, 2.0, 1.0}}}},
+		map[string]any{"id": "b", "kind": "primitive", "transform": map[string]any{"position": []any{0.0, 0.8, 0.0}}},
+		map[string]any{"id": "c", "kind": "primitive", "transform": map[string]any{"position": []any{0.0, -2.0, 0.0}}},
+		map[string]any{"id": "d", "kind": "actor", "transform": map[string]any{"position": []any{0.0, 0.76, 0.0}}},
+	}}
+	cloudAgentPrevisGroundScene(scene)
+	objects := creationMaps(scene["objects"])
+	y := func(object map[string]any) float64 {
+		return numberValue(object["transform"].(map[string]any)["position"].([]any)[1], -99)
+	}
+	if y(objects[0]) != 0 || y(objects[1]) != 0.8 || y(objects[2]) != 0 {
+		t.Fatalf("unexpected heights: %v %v %v", y(objects[0]), y(objects[1]), y(objects[2]))
+	}
+	if y(objects[3]) != 0.76 {
+		t.Fatalf("raised actor must keep its height, got %v", y(objects[3]))
+	}
+	keyframes := creationMaps(objects[0]["keyframes"])
+	if y(keyframes[0]) != 3 || y(keyframes[1]) != 0 {
+		t.Fatalf("actor keyframes: raised kept, underground grounded; got %v %v", y(keyframes[0]), y(keyframes[1]))
+	}
+	points := objects[0]["motionPath"].(map[string]any)["points"].([]any)
+	if numberValue(points[0].([]any)[1], -99) != 0 || numberValue(points[1].([]any)[1], -99) != 2 {
+		t.Fatalf("actor path: underground grounded, raised kept; got %v", points)
+	}
+}
+
+// Agent 把演员放上桌面（Y=0.76）后，写入、落地规则与校验都不得把高度改回 0。
+func TestCloudAgentPrevisPatchKeepsRaisedActorHeight(t *testing.T) {
+	scene, err := cloudAgentPrevisSceneCreateTemplate(cloudAgentPrevisSceneCreateArgs{SceneID: "raise", Title: "站上桌子", TemplateID: "empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := []float64{0.5, 0.76, -0.2}
+	ops := []cloudAgentPrevisPatchOperation{
+		// 省略 position：演员默认站在地面，而不是几何体默认的 0.5m。
+		{Type: "object_add", ID: "hero", Name: strPtr("主角"), Kind: "actor"},
+		{Type: "object_update", ID: "hero", Position: &update},
+		{Type: "object_keyframe_upsert", ID: "hero", Time: float64Ptr(1), Position: &[]float64{0.5, 1.2, -0.2}},
+	}
+	for index, op := range ops {
+		if _, err := cloudAgentPrevisApplyPatchOperation(scene, op, index); err != nil {
+			t.Fatalf("op %d (%s) failed: %v", index, op.Type, err)
+		}
+		if index == 0 {
+			added, _ := cloudAgentPrevisNumberVec3(cloudAgentPrevisMapTransform(cloudAgentPrevisFindByID(creationMaps(scene["objects"]), "hero"))["position"])
+			if added[1] != 0 {
+				t.Fatalf("actor added without position must stand on the ground, got %v", added)
+			}
+		}
+	}
+	cloudAgentPrevisGroundScene(scene)
+	if err := cloudAgentPrevisValidateScene(scene); err != nil {
+		t.Fatalf("scene invalid: %v", err)
+	}
+	hero := cloudAgentPrevisFindByID(creationMaps(scene["objects"]), "hero")
+	position, _ := cloudAgentPrevisNumberVec3(cloudAgentPrevisMapTransform(hero)["position"])
+	if position[1] != 0.76 {
+		t.Fatalf("actor height reset by grounding, got %v", position)
+	}
+	keyframes := creationMaps(hero["keyframes"])
+	if len(keyframes) == 0 {
+		t.Fatal("actor keyframe missing")
+	}
+	keyPosition, _ := cloudAgentPrevisNumberVec3(cloudAgentPrevisMapTransform(keyframes[len(keyframes)-1])["position"])
+	if keyPosition[1] != 1.2 {
+		t.Fatalf("actor keyframe height reset by grounding, got %v", keyPosition)
+	}
 }

@@ -1,13 +1,15 @@
 import { motion, useReducedMotion } from "motion/react";
 import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
-import { Clapperboard, Image as ImageIcon, List, Music2, Pencil, Table2, Video, WandSparkles, Workflow as WorkflowIcon } from "lucide-react";
+import { Clapperboard, Image as ImageIcon, List, Music2, Pencil, Table2, Video, Workflow as WorkflowIcon, ArrowRightLeft } from "lucide-react";
 
 import { useCanvasOverlayLayer } from "@/components/canvas/canvas-overlay-layer";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { aceternityMotion } from "@/lib/aceternity-motion";
+import { canvasOverlayBounds, observeCanvasOverlayBounds, placeCanvasNodePanel, updateCanvasNodePanelBounds } from "@/lib/canvas/canvas-overlay-layout";
 import { subscribeCanvasGraphicsViewportPreview, subscribeCanvasNodeDragPreview, subscribeCanvasViewportPreview } from "@/lib/canvas/canvas-live-viewport";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
 import { CanvasNodeType, type CanvasNodeData, type ConnectionHandle, type Position, type ViewportTransform } from "@/types/canvas";
+import { useCanvasNodeResizeMotion } from "./canvas-node-resize-motion";
 
 export type PendingConnectionCreate = {
     connection: ConnectionHandle;
@@ -86,7 +88,7 @@ export function CanvasSelectionToolbar({ anchorRef, containerRef, count, childre
                 className="flex items-center gap-2"
             >
                 <span
-                    className="aceternity-floating-panel shrink-0 rounded-full border px-2.5 py-1.5 text-[var(--fs-tiny)] font-semibold tabular-nums backdrop-blur-2xl"
+                    className="aceternity-floating-panel shrink-0 rounded-full border px-2 py-2 text-[var(--fs-tiny)] font-semibold tabular-nums backdrop-blur-2xl"
                     style={{ background: theme.spatial.elevated, borderColor: theme.toolbar.border, color: theme.accent.primary }}
                 >
                     已选 {count}
@@ -119,6 +121,7 @@ export function CanvasNodePanelOverlay({
     children: ReactNode;
 }) {
     const panelRef = useRef<HTMLDivElement>(null);
+    const resizeMotion = useCanvasNodeResizeMotion();
     const { bringToFront, zIndex } = useCanvasOverlayLayer(`node-panel:${node.id}`, "var(--z-modal-overlay)");
     const initialWidth = resolveNodePanelWidth(node, viewport, panelWidth);
     const initialPosition = getNodePanelPosition(node, viewport, { width: containerRef.current?.clientWidth || 0, height: containerRef.current?.clientHeight || 0 }, initialWidth, panelHeight, dragOffset);
@@ -133,45 +136,63 @@ export function CanvasNodePanelOverlay({
         if (!container || !panel) return;
         let liveViewport = viewport;
         let liveDragOffset = dragOffset;
-        let viewportSize = { width: container.clientWidth, height: container.clientHeight };
+        let availableBounds = canvasOverlayBounds({ width: container.clientWidth, height: container.clientHeight });
+        let measuredHeight = panel.scrollHeight || panelHeight;
         const update = (nextViewport: ViewportTransform) => {
             liveViewport = nextViewport;
-            const nextWidth = resolveNodePanelWidth(node, nextViewport, panelWidth);
+            const visualNode = resizeMotion?.resolveNode(node) || node;
+            const nextWidth = Math.min(resolveNodePanelWidth(visualNode, nextViewport, panelWidth), Math.max(0, availableBounds.right - availableBounds.left));
+            const availableHeight = Math.max(0, availableBounds.bottom - availableBounds.top);
             panel.style.width = `${nextWidth}px`;
+            panel.style.maxHeight = `${availableHeight}px`;
+            panel.style.overflowY = measuredHeight > availableHeight || !allowOverflow ? "auto" : "visible";
             // 视口预览期间世界层刚写入 transform，读取节点布局会强制浏览器同步
             // layout。节点位置和拖拽偏移已经在这里可用，直接用世界坐标计算浮层位置。
-            const position = getNodePanelPosition(node, nextViewport, viewportSize, nextWidth, panelHeight, liveDragOffset);
+            const position = placeCanvasNodePanel(visualNode, nextViewport, availableBounds, { width: nextWidth, height: measuredHeight }, liveDragOffset);
             panel.style.transform = `translate3d(${position.left}px, ${position.top}px, 0)`;
+            updateCanvasNodePanelBounds(container, panel, { left: position.left, top: position.top, right: position.left + nextWidth, bottom: position.top + Math.min(measuredHeight, availableHeight) });
         };
         update(viewport);
         const resizeObserver = new ResizeObserver(() => {
-            viewportSize = { width: container.clientWidth, height: container.clientHeight };
+            measuredHeight = panel.scrollHeight || panelHeight;
             update(liveViewport);
         });
-        resizeObserver.observe(container);
+        resizeObserver.observe(panel);
+        if (panel.firstElementChild) resizeObserver.observe(panel.firstElementChild);
+        const stopBounds = observeCanvasOverlayBounds(container, (bounds) => {
+            availableBounds = bounds;
+            update(liveViewport);
+        });
         const unsubscribeViewport = subscribeCanvasGraphicsViewportPreview(container, update);
+        const unsubscribeResize = resizeMotion?.subscribeNode(node.id, () => update(liveViewport));
         const unsubscribeDrag = subscribeCanvasNodeDragPreview(container, (preview) => {
             liveDragOffset = preview?.nodeIds.has(node.id) ? { x: preview.x, y: preview.y } : null;
             update(liveViewport);
         });
         return () => {
             resizeObserver.disconnect();
+            stopBounds();
             unsubscribeViewport();
+            unsubscribeResize?.();
             unsubscribeDrag();
+            updateCanvasNodePanelBounds(container, panel, null);
         };
-    }, [containerRef, dragOffset?.x, dragOffset?.y, isDragging, node.height, node.id, node.position.x, node.position.y, node.width, panelHeight, panelWidth, viewport]);
+    }, [allowOverflow, containerRef, dragOffset?.x, dragOffset?.y, isDragging, node.height, node.id, node.position.x, node.position.y, node.width, panelHeight, panelWidth, resizeMotion, viewport]);
 
     return (
         <div
             ref={panelRef}
             data-canvas-no-zoom
             data-canvas-node-panel
+            data-popover-anchor-container
+            data-canvas-wheel-scroll
             className={`thin-scrollbar absolute max-w-[calc(100%_-_24px)] ${allowOverflow ? "overflow-visible" : "overflow-y-auto"}`}
             style={{ left: 0, top: 0, transform: `translate3d(${initialPosition.left}px, ${initialPosition.top}px, 0)`, width: initialWidth, maxHeight: allowOverflow ? "none" : "calc(100% - 84px)", zIndex }}
             onMouseDown={(event) => event.stopPropagation()}
             onPointerDownCapture={bringToFront}
             onFocusCapture={bringToFront}
             onPointerDown={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
         >
             {children}
         </div>
@@ -182,6 +203,20 @@ function resolveNodePanelWidth(node: CanvasNodeData, viewport: ViewportTransform
     if (requestedWidth) return requestedWidth;
     return clamp(Math.round(node.width * viewport.k * 1.5), 680, 920);
 }
+
+type ConnectionCreateNodeType = CanvasNodeType.Image | CanvasNodeType.Text | CanvasNodeType.Script | CanvasNodeType.BatchTable | CanvasNodeType.Video | CanvasNodeType.Audio | CanvasNodeType.Drawing | CanvasNodeType.Config | CanvasNodeType.MediaConversion;
+
+const CONNECTION_CREATE_OPTIONS: Array<{ type: ConnectionCreateNodeType; title: string; description: string; icon: ReactNode }> = [
+    { type: CanvasNodeType.Text, title: "文本生成", description: "引用当前内容，生成或改写文本", icon: <List /> },
+    { type: CanvasNodeType.Script, title: "分镜脚本", description: "根据剧情拆解镜头，编排分镜脚本", icon: <Clapperboard /> },
+    { type: CanvasNodeType.BatchTable, title: "批量创作表", description: "汇总多张图片，批量执行换装或创意生图", icon: <Table2 /> },
+    { type: CanvasNodeType.Image, title: "图片生成", description: "结合提示词和参考图，生成新的画面", icon: <ImageIcon /> },
+    { type: CanvasNodeType.Config, title: "生成配置", description: "选择模型，或使用已启用的工作流插件", icon: <WorkflowIcon /> },
+    { type: CanvasNodeType.Drawing, title: "绘图", description: "以参考图片为底图，自由绘制和标注", icon: <Pencil /> },
+    { type: CanvasNodeType.Video, title: "视频生成", description: "结合提示词与参考素材，生成动态视频", icon: <Video /> },
+    { type: CanvasNodeType.Audio, title: "音频参考", description: "连接文本或角色卡，创建音频生成节点", icon: <Music2 /> },
+    { type: CanvasNodeType.MediaConversion, title: "转换", description: "本地处理图片或视频", icon: <ArrowRightLeft /> },
+];
 
 export function CanvasConnectionCreateMenu({
     pending,
@@ -214,8 +249,12 @@ export function CanvasConnectionCreateMenu({
     const [activeOption, setActiveOption] = useState<string | null>(null);
     const lastPointerRef = useRef<Position | null>(null);
     const { bringToFront, zIndex } = useCanvasOverlayLayer("connection-create-menu", "var(--z-modal-overlay)");
+    const options = CONNECTION_CREATE_OPTIONS.filter((option) => canCreateDrawing || option.type !== CanvasNodeType.Drawing);
+    const active = options.find((option) => option.title === activeOption);
+    const activeDisabledReason = active ? getDisabledReason(active.type) : "";
     const menuWidth = Math.min(288, viewportSize.width - 24);
-    const menuHeight = canCreateDrawing ? 448 : 404;
+    // 行高 40 + 间距 2，加列表内边距与底部 52px 说明区；只用于首帧定位，随后按实际高度修正。
+    const menuHeight = options.length * 42 + 14 + 52;
     const gap = 12;
     const initialPosition = getConnectionMenuPosition(pending.position, viewport, viewportSize, menuWidth, menuHeight, gap);
 
@@ -242,7 +281,7 @@ export function CanvasConnectionCreateMenu({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: aceternityMotion.duration.instant, ease: aceternityMotion.easing.enter }}
-            className="thin-scrollbar absolute origin-top-left overflow-x-hidden overflow-y-auto rounded-[var(--r-2xl)] border p-2"
+            className="absolute flex origin-top-left flex-col overflow-hidden rounded-[var(--r-2xl)] border"
             data-canvas-no-zoom
             data-connection-create-menu
             aria-label="创建下一步"
@@ -277,112 +316,33 @@ export function CanvasConnectionCreateMenu({
             }}
             onPointerDown={(event) => event.stopPropagation()}
         >
-            <div className="grid min-w-0 grid-cols-1 gap-1">
-                <ConnectionCreateOption
-                    expanded={activeOption === "文本生成"}
-                    motionEnabled={!reducedMotion}
-                    icon={<List className="size-4" />}
-                    title="文本生成"
-                    description="引用当前内容，生成或改写文本"
-                    disabledReason={getDisabledReason(CanvasNodeType.Text)}
-                    onClick={() => onCreate(CanvasNodeType.Text)}
-                />
-                <ConnectionCreateOption
-                    expanded={activeOption === "分镜脚本"}
-                    motionEnabled={!reducedMotion}
-                    icon={<Clapperboard className="size-4" />}
-                    title="分镜脚本"
-                    description="根据剧情拆解镜头，编排分镜脚本"
-                    disabledReason={getDisabledReason(CanvasNodeType.Script)}
-                    onClick={() => onCreate(CanvasNodeType.Script)}
-                />
-                <ConnectionCreateOption
-                    expanded={activeOption === "批量创作表"}
-                    motionEnabled={!reducedMotion}
-                    icon={<Table2 className="size-4" />}
-                    title="批量创作表"
-                    description="汇总多张图片，批量执行换装或创意生图"
-                    disabledReason={getDisabledReason(CanvasNodeType.BatchTable)}
-                    onClick={() => onCreate(CanvasNodeType.BatchTable)}
-                />
-                <ConnectionCreateOption
-                    expanded={activeOption === "图片生成"}
-                    motionEnabled={!reducedMotion}
-                    icon={<ImageIcon className="size-4" />}
-                    title="图片生成"
-                    description="结合提示词和参考图，生成新的画面"
-                    disabledReason={getDisabledReason(CanvasNodeType.Image)}
-                    onClick={() => onCreate(CanvasNodeType.Image)}
-                />
-                <ConnectionCreateOption
-                    expanded={activeOption === "生成配置"}
-                    motionEnabled={!reducedMotion}
-                    icon={<WorkflowIcon className="size-4" />}
-                    title="生成配置"
-                    description="选择模型，或使用已启用的工作流插件"
-                    disabledReason={getDisabledReason(CanvasNodeType.Config)}
-                    onClick={() => onCreate(CanvasNodeType.Config)}
-                />
-                {canCreateDrawing ? (
-                    <ConnectionCreateOption
-                        expanded={activeOption === "绘图"}
-                        motionEnabled={!reducedMotion}
-                        icon={<Pencil className="size-4" />}
-                        title="绘图"
-                        description="以参考图片为底图，自由绘制和标注"
-                        disabledReason={getDisabledReason(CanvasNodeType.Drawing)}
-                        onClick={() => onCreate(CanvasNodeType.Drawing)}
-                    />
-                ) : null}
-                <ConnectionCreateOption
-                    expanded={activeOption === "视频生成"}
-                    motionEnabled={!reducedMotion}
-                    icon={<Video className="size-4" />}
-                    title="视频生成"
-                    description="结合提示词与参考素材，生成动态视频"
-                    disabledReason={getDisabledReason(CanvasNodeType.Video)}
-                    onClick={() => onCreate(CanvasNodeType.Video)}
-                />
-                <ConnectionCreateOption
-                    expanded={activeOption === "音频参考"}
-                    motionEnabled={!reducedMotion}
-                    icon={<Music2 className="size-4" />}
-                    title="音频参考"
-                    description="连接文本或角色卡，创建音频生成节点"
-                    disabledReason={getDisabledReason(CanvasNodeType.Audio)}
-                    onClick={() => onCreate(CanvasNodeType.Audio)}
-                />
-                <ConnectionCreateOption
-                    expanded={activeOption === "转换"}
-                    motionEnabled={!reducedMotion}
-                    icon={<WandSparkles className="size-4" />}
-                    title="转换"
-                    description="本地处理图片或视频"
-                    disabledReason={getDisabledReason(CanvasNodeType.MediaConversion)}
-                    onClick={() => onCreate(CanvasNodeType.MediaConversion)}
-                />
+            {/* 行高固定，说明统一放在底部说明区：悬停只换高亮和说明文字，列表不移动。 */}
+            <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-2">
+                <div className="grid min-w-0 grid-cols-1 gap-0.5">
+                    {options.map((option) => (
+                        <ConnectionCreateOption
+                            key={option.type}
+                            active={activeOption === option.title}
+                            icon={option.icon}
+                            title={option.title}
+                            description={option.description}
+                            disabledReason={getDisabledReason(option.type)}
+                            onClick={() => onCreate(option.type)}
+                        />
+                    ))}
+                </div>
+            </div>
+            <div className="canvas-connection-create-detail" aria-hidden="true" data-motion={reducedMotion ? "reduced" : "enabled"} style={{ borderColor: theme.toolbar.border, color: theme.node.muted }}>
+                <p key={active ? `${active.title}:${activeDisabledReason}` : "idle"} className="canvas-connection-create-detail-text">
+                    {active && activeDisabledReason ? <span style={{ color: theme.node.text }}>暂不可用 · </span> : null}
+                    {active ? activeDisabledReason || active.description : "选择节点类型，新节点会自动连接当前内容"}
+                </p>
             </div>
         </motion.div>
     );
 }
 
-function ConnectionCreateOption({
-    expanded,
-    motionEnabled,
-    icon,
-    title,
-    description,
-    disabledReason,
-    onClick,
-}: {
-    expanded: boolean;
-    motionEnabled: boolean;
-    icon: ReactNode;
-    title: string;
-    description: string;
-    disabledReason?: string;
-    onClick: () => void;
-}) {
+function ConnectionCreateOption({ active, icon, title, description, disabledReason, onClick }: { active: boolean; icon: ReactNode; title: string; description: string; disabledReason?: string; onClick: () => void }) {
     const theme = canvasThemes[useActiveTheme()];
     return (
         <button
@@ -391,25 +351,17 @@ function ConnectionCreateOption({
             aria-label={title}
             aria-description={disabledReason || description}
             data-create-option={title}
-            data-expanded={expanded}
-            data-motion={motionEnabled ? "enabled" : "reduced"}
-            className="canvas-connection-create-option group flex min-h-10 w-full cursor-pointer items-start gap-2 rounded-[var(--dock-item-radius)] px-2 py-1.5 text-left outline-none focus-visible:ring-2 aria-disabled:cursor-not-allowed aria-disabled:opacity-40"
-            style={{ color: theme.node.text, "--tw-ring-color": theme.node.muted, background: expanded ? theme.toolbar.itemHover : undefined } as CSSProperties}
+            data-active={active}
+            className="canvas-connection-create-option group flex h-10 w-full shrink-0 cursor-pointer items-center gap-2.5 rounded-[var(--dock-item-radius)] px-2 text-left outline-none focus-visible:ring-2 aria-disabled:cursor-not-allowed aria-disabled:opacity-40"
+            style={{ color: theme.node.text, "--tw-ring-color": theme.node.muted, background: active ? theme.toolbar.itemHover : undefined } as CSSProperties}
             onClick={() => {
                 if (!disabledReason) onClick();
             }}
         >
-            <span className="grid size-7 shrink-0 place-items-center rounded-[var(--r-md)] opacity-65 transition-opacity group-hover:opacity-100 [&_svg]:size-3.5" style={{ background: theme.toolbar.itemHover }}>
+            <span className="canvas-connection-create-icon grid size-7 shrink-0 place-items-center rounded-[var(--r-md)] [&_svg]:size-3.5" style={{ background: theme.toolbar.itemHover }}>
                 {icon}
             </span>
-            <span className="min-w-0 flex-1 pt-1.5">
-                <span className="flex items-center gap-2 text-[var(--fs-tiny)] font-semibold leading-4">{title}</span>
-                <span aria-hidden="true" className="canvas-connection-create-description" style={{ color: theme.node.muted }}>
-                    <span className="min-h-0 overflow-hidden">
-                        <span className="block pt-1 whitespace-normal break-words text-[var(--fs-micro)] leading-relaxed">{disabledReason || description}</span>
-                    </span>
-                </span>
-            </span>
+            <span className="min-w-0 flex-1 truncate text-[var(--fs-tiny)] font-semibold leading-4">{title}</span>
         </button>
     );
 }
@@ -427,15 +379,6 @@ function getConnectionMenuPosition(position: Position, viewport: ViewportTransfo
     };
 }
 
-export function getNodePanelPosition(node: CanvasNodeData, viewport: ViewportTransform, _viewportSize: { width: number; height: number }, panelWidth: number, _panelHeight: number, dragOffset?: Position | null) {
-    const gap = 10;
-    const offsetX = dragOffset?.x || 0;
-    const offsetY = dragOffset?.y || 0;
-    const nodeCenterX = viewport.x + (node.position.x + offsetX + node.width / 2) * viewport.k;
-    const nodeBottom = viewport.y + (node.position.y + offsetY + node.height) * viewport.k;
-    return {
-        left: nodeCenterX - panelWidth / 2,
-        top: nodeBottom + gap,
-        placement: "below" as const,
-    };
+export function getNodePanelPosition(node: CanvasNodeData, viewport: ViewportTransform, viewportSize: { width: number; height: number }, panelWidth: number, panelHeight: number, dragOffset?: Position | null) {
+    return placeCanvasNodePanel(node, viewport, canvasOverlayBounds(viewportSize), { width: panelWidth, height: panelHeight }, dragOffset);
 }

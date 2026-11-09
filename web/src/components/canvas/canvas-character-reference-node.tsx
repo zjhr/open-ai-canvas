@@ -1,5 +1,8 @@
 import { Image as ImageIcon, Mic } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+
+import { translate } from "@/i18n";
 
 import { getResourceAccess, resolveResourceAccessURL, resourceStorageKey } from "@/services/api/resources";
 import type { CanvasNodeData } from "@/types/canvas";
@@ -35,13 +38,14 @@ export function characterCoverResourceId(url?: string) {
 }
 
 export function characterInitial(name: string) {
-    return Array.from(name.trim())[0] || "角";
+    return Array.from(name.trim())[0] || translate("canvasA.characterNode.initialFallback");
 }
 
 /** 画布上的角色卡：海报式主视觉，底部压名字与形象/声音状态。 */
 export function CanvasCharacterReferenceNodeContent({ node }: { node: CanvasNodeData }) {
+    const { t } = useTranslation();
     const metadata = node.metadata;
-    const name = metadata?.characterName || node.title || "未命名角色";
+    const name = metadata?.characterName || node.title || t("canvasA.characterNode.unnamed");
     const role = typeof metadata?.characterDefinition?.role === "string" ? metadata.characterDefinition.role.trim() : "";
     const visualReady = metadata?.characterVisualStatus === "ready";
     const voiceReady = metadata?.characterVoiceStatus === "ready";
@@ -56,21 +60,23 @@ export function CanvasCharacterReferenceNodeContent({ node }: { node: CanvasNode
                 </>
             ) : (
                 <div className="absolute inset-0 grid place-items-center bg-[radial-gradient(circle_at_50%_36%,rgba(255,255,255,.1),transparent_60%)] pb-10">
-                    <span className="grid size-20 place-items-center rounded-full border border-white/15 bg-white/[.03] text-3xl font-light text-white/75">{characterInitial(name)}</span>
+                    <span className="grid size-20 place-items-center rounded-full border border-white/15 bg-white/[.03] text-3xl font-normal text-white/75">{characterInitial(name)}</span>
                 </div>
             )}
             <div className="pointer-events-none absolute inset-x-0 bottom-0 h-3/5 bg-gradient-to-t from-black/90 via-black/45 to-transparent" />
-            <span className="absolute left-3.5 top-3 text-[10px] font-medium uppercase tracking-[.24em] text-white/55">Character</span>
-            <div className="absolute inset-x-0 bottom-0 flex items-end gap-3 px-3.5 pb-3">
+            <span className="absolute left-3.5 top-3 text-[var(--fs-label)] font-medium uppercase tracking-[.24em] text-white/55">Character</span>
+            <div className="absolute inset-x-0 bottom-0 flex items-end gap-3 px-4 pb-3">
                 <div className="min-w-0 flex-1">
-                    <div className="truncate text-[17px] font-semibold leading-6 tracking-tight">{name}</div>
-                    <div className="truncate text-[11px] leading-4 text-white/55">{role || (voiceReady && metadata?.characterVoiceName ? `声音 · ${metadata.characterVoiceName}` : "角色卡")}</div>
+                    <div className="truncate text-[var(--fs-heading)] font-semibold leading-6 tracking-tight">{name}</div>
+                    <div className="truncate text-[var(--fs-label)] leading-4 text-white/55">
+                        {role || (voiceReady && metadata?.characterVoiceName ? t("canvasA.characterNode.voiceWithName", { name: metadata.characterVoiceName }) : t("canvasA.characterNode.card"))}
+                    </div>
                 </div>
                 <div className="flex shrink-0 gap-1">
-                    <Indicator ready={visualReady} label={visualReady ? "形象已就绪" : "形象待完善"}>
+                    <Indicator ready={visualReady} label={visualReady ? t("canvasA.characterNode.visualReady") : t("canvasA.characterNode.visualPending")}>
                         <ImageIcon className="size-3" />
                     </Indicator>
-                    <Indicator ready={voiceReady} label={voiceReady ? `声音：${metadata?.characterVoiceName || "已绑定"}` : "声音未绑定"}>
+                    <Indicator ready={voiceReady} label={voiceReady ? t("canvasA.characterNode.voiceBound", { name: metadata?.characterVoiceName || t("canvasA.characterNode.voiceBoundFallback") }) : t("canvasA.characterNode.voiceUnbound")}>
                         <Mic className="size-3" />
                     </Indicator>
                 </div>

@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { zhCN as canvasAZh } from "../src/i18n/messages/areas/canvasA/zh-CN";
+import { zhCN as canvasCZh } from "../src/i18n/messages/areas/canvasC/zh-CN";
 import { readFileSync } from "node:fs";
 import { canvasDockStyle } from "../src/lib/canvas/canvas-aceternity-style";
 import { canvasThemes } from "../src/lib/canvas-theme";
@@ -15,7 +17,7 @@ test("canvas removes the standalone asset tray while retaining sidebar assets an
 
 test("workspace keeps a permanent rail and independent task/history entries", () => {
     const source = component("canvas-workspace-panel.tsx");
-    for (const label of ["主页", "节点", "资产", "任务", "历史"]) expect(source).toContain(label);
+    for (const label of ["主页", "节点", "素材库", "任务", "历史"]) expect(source).toContain(label);
     expect(source).not.toContain('id: "tools"');
     expect(source).not.toContain("CanvasWorkspaceToolPanel");
     expect(source).not.toContain("onInsertTool");
@@ -43,14 +45,16 @@ test("image style and presets remain visible without the prompt template picker"
     expect(source).toContain("<CanvasNineGridPicker");
     expect(source).toContain('dense appearance="quiet"');
     expect(source).toContain('const showPromptTemplates = !simpleMode && mode !== "image"');
-    expect(source).toContain("{showPromptTemplates ? <CanvasPresetPicker");
+    expect(source).toMatch(/\{showPromptTemplates\s*\?\s*\(?\s*<CanvasPresetPicker/);
     expect(source).toContain("if (showPromptTemplates &&");
     expect(source).not.toContain('aria-label="生成工具"');
-    expect(component("canvas-choose-image-style-picker.tsx")).toContain('resolvedLabel || "风格"');
+    expect(component("canvas-choose-image-style-picker.tsx")).toContain('resolvedLabel || t("canvasA.toolPicker.style.short")');
+    expect(canvasAZh.toolPicker.style.short).toBe("风格");
 });
 
 test("history explicitly describes its bounded dataset", () => {
-    expect(component("canvas-workspace-history-panel.tsx")).toContain("最近 30 条（含 Agent）");
+    expect(component("canvas-workspace-history-panel.tsx")).toContain('t("canvasC.workspaceHistory.title")');
+    expect(canvasCZh.workspaceHistory.title).toContain("最近 30 条（含 Agent）");
 });
 
 test("cleared tool references do not fall back to the original generation prompt", () => {
@@ -75,7 +79,7 @@ test("workspace starts collapsed and keeps separated navigation and bottom toggl
 test("rail inherits canvas dock colors from the workspace shell", () => {
     const panel = component("canvas-workspace-panel.tsx");
     expect(panel).toContain("canvasThemes[useActiveTheme()]");
-    expect(panel).toContain('className="canvas-workspace-shell" style={{ ...canvasDockStyle(theme)');
+    expect(panel).toContain('className={`canvas-workspace-shell ${open && screens.lg ? "is-expanded" : ""}`} style={{ ...canvasDockStyle(theme)');
     expect(panel).toContain("background: undefined");
     expect(panel).not.toContain('boxShadow: "none"');
     const railCss = component("canvas-workspace-panel.css").split(".canvas-workspace-rail {")[1];
@@ -93,7 +97,7 @@ test("editor rail and expanded panel share one restrained glass surface without 
     const page = readFileSync(new URL("../src/pages/canvas/project.tsx", import.meta.url), "utf8");
     const panel = component("canvas-workspace-panel.tsx");
     const styles = component("canvas-workspace-panel.css");
-    expect(page).toContain('<CanvasViewport');
+    expect(page).toContain("<CanvasViewport");
     expect(page).not.toContain("canvas-workspace-backdrop");
     expect(page).toContain("canvas-main-with-workspace");
     expect(styles).toContain(".canvas-main-with-workspace .canvas-editor-shell {\n    z-index: 0;");
@@ -102,9 +106,13 @@ test("editor rail and expanded panel share one restrained glass surface without 
     expect(styles).toContain(".canvas-workspace-zoom-controls");
     expect(styles).toContain(".canvas-main-with-workspace > .canvas-project-sidebar {\n        margin-left: var(--space-16);");
     expect(styles).toContain(".canvas-main-with-workspace:has(> .canvas-project-sidebar) .canvas-topbar");
-    expect(panel).not.toContain("canvas-workspace-rail-divider");
+    // 只允许“主页”与“展开”前的短分隔，不能回到整列硬分隔线。
+    expect(panel).toContain('<span className="canvas-workspace-rail-divider" aria-hidden />');
+    expect(panel).toContain('<span className="canvas-workspace-rail-divider is-end" aria-hidden />');
     expect(panel).not.toContain("<strong>工作区</strong>");
-    expect(styles).not.toContain(".canvas-workspace-rail-divider");
+    const dividerCss = styles.split(".canvas-workspace-rail-divider {")[1]?.split("}")[0] ?? "";
+    expect(dividerCss).toContain("width: var(--space-6)");
+    expect(dividerCss).toContain("background: color-mix(in srgb, currentColor 12%, transparent)");
     expect(styles).not.toContain("border-right: 1px solid var(--dock-border)");
     expect(styles).not.toContain('canvas-workspace-rail-button[aria-pressed="true"]::before');
     expect(styles).toContain("margin: var(--space-2) 0 var(--space-2) var(--space-2)");
@@ -116,6 +124,7 @@ test("editor rail and expanded panel share one restrained glass surface without 
     expect(styles).toContain("border-radius: var(--r-2xl)");
     expect(styles).not.toContain("border-radius: calc(var(--radius) * 3.5)");
     expect(page).toContain('workspaceOpen ? "canvas-workspace-expanded" : ""');
+    // 轨道与展开面板保持玻璃材质；无底板的视图控制条样式在 canvas-zoom-controls.css，不在这里关闭模糊。
     expect(styles).not.toContain("backdrop-filter: none");
     expect(styles).not.toContain("box-shadow: none");
 });

@@ -8,9 +8,11 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"yingce/backend/internal/canvas/capability"
 	"yingce/backend/internal/model"
+	"yingce/backend/internal/skills"
 )
 
 func TestCloudAgentMixedCanvasReadsUnsupportedNodesWithoutGrantingCapabilities(t *testing.T) {
@@ -100,9 +102,9 @@ func TestCloudAgentCanvasSummaryIsACatalogNotNodeBodies(t *testing.T) {
 func TestCloudAgentCanvasSummaryUsesSelectedNodeNeighborhood(t *testing.T) {
 	doc := map[string]any{
 		"nodes": []map[string]any{
-			{"id": "focus", "type": "text", "title": "主体"},
-			{"id": "neighbor", "type": "image", "title": "关联素材"},
-			{"id": "unrelated", "type": "text", "title": "无关内容"},
+			{"id": "focus", "type": "text", "title": "主体", "metadata": map[string]any{"content": strings.Repeat("主体设定", 200), "status": "success", "taskStatus": "succeeded"}},
+			{"id": "neighbor", "type": "image", "title": "关联素材", "metadata": map[string]any{"status": "loading"}},
+			{"id": "unrelated", "type": "text", "title": "无关内容", "metadata": map[string]any{"content": "不应被摘要"}},
 		},
 		"connections": []map[string]any{{"fromNodeId": "focus", "toNodeId": "neighbor"}},
 	}
@@ -122,12 +124,47 @@ func TestCloudAgentCanvasSummaryUsesSelectedNodeNeighborhood(t *testing.T) {
 	if strings.Contains(string(encoded), "unrelated") || !strings.Contains(string(encoded), "focus") || !strings.Contains(string(encoded), "neighbor") {
 		t.Fatalf("focused catalog did not include exactly the local graph neighborhood: %s", encoded)
 	}
+	foundFocus := false
+	for _, rawNode := range result["nodes"].([]any) {
+		node := rawNode.(map[string]any)
+		if node["id"] != "focus" {
+			continue
+		}
+		foundFocus = true
+		preview, _ := node["preview"].(string)
+		if utf8.RuneCountInString(preview) > 243 || !strings.Contains(preview, "主体设定") || node["status"] != "success" || node["taskStatus"] != "succeeded" {
+			t.Fatalf("focus facts should be bounded and accurate: %+v", node)
+		}
+	}
+	if !foundFocus {
+		t.Fatalf("focus node missing from selection catalog: %s", encoded)
+	}
 	selection := result["selection"].(map[string]any)
 	if selection["includedNeighbors"] != float64(1) || selection["nextReadDepth"] != float64(1) {
 		t.Fatalf("focused catalog metadata is incorrect: %+v", selection)
 	}
 	if _, err := cloudAgentCanvasSummary(&model.CanvasProject{PayloadJSON: string(raw)}, "deleted"); err == nil {
 		t.Fatal("stale selected node was accepted")
+	}
+}
+
+func TestCloudAgentCanvasSummaryReportsOmittedFocusedNodes(t *testing.T) {
+	doc := map[string]any{"nodes": []map[string]any{{"id": "focus", "type": "text", "title": "主体"}}}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := cloudAgentCanvasSummaryWithOmitted(&model.CanvasProject{PayloadJSON: string(raw)}, 4, "focus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(summary), &result); err != nil {
+		t.Fatal(err)
+	}
+	selection := result["selection"].(map[string]any)
+	if selection["omittedFocusCount"] != float64(4) || !strings.Contains(stringValue(selection["note"]), "4 个节点未附带") {
+		t.Fatalf("selection overflow count was not disclosed: %+v", selection)
 	}
 }
 
@@ -146,8 +183,10 @@ func TestCloudAgentToolsFollowCanvasCapabilityRegistry(t *testing.T) {
 		t.Fatal("canvas write tool is missing")
 	}
 	ops := apply["properties"].(map[string]any)["ops"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
-	if got := ops["nodeType"].(map[string]any)["enum"]; !reflect.DeepEqual(got, canvasCapabilityRegistry.Types()) {
-		t.Fatalf("node types differ from registry: %v", got)
+	gotNodeTypes, _ := json.Marshal(ops["nodeType"].(map[string]any)["enum"])
+	wantNodeTypes, _ := json.Marshal(canvasCapabilityRegistry.Types())
+	if string(gotNodeTypes) != string(wantNodeTypes) {
+		t.Fatalf("node types differ from registry: %s", gotNodeTypes)
 	}
 	patch := ops["patch"].(map[string]any)["properties"].(map[string]any)
 	nodeTypes := cloudAgentNodeTypes()["nodes"].([]map[string]any)
@@ -184,8 +223,18 @@ func TestCloudAgentToolsFollowCanvasCapabilityRegistry(t *testing.T) {
 	if accepted, _ := script["acceptedInputKinds"].([]string); !reflect.DeepEqual(accepted, []string{"audio", "character", "image", "text", "video"}) {
 		t.Fatalf("script accepted input kinds are incomplete: %#v", script["acceptedInputKinds"])
 	}
-	if got := functions["generate_media"]["properties"].(map[string]any)["mode"].(map[string]any)["enum"]; !reflect.DeepEqual(got, cloudAgentGenerationModeNames()) {
-		t.Fatalf("generation modes differ from implemented adapters: %v", got)
+	gotModes, _ := json.Marshal(functions["generate_media"]["properties"].(map[string]any)["mode"].(map[string]any)["enum"])
+	wantModes, _ := json.Marshal(cloudAgentGenerationModeNames())
+	if string(gotModes) != string(wantModes) {
+		t.Fatalf("generation modes differ from implemented adapters: %s", gotModes)
+	}
+	sizeDescription, _ := functions["generate_media"]["properties"].(map[string]any)["size"].(map[string]any)["description"].(string)
+	if !strings.Contains(sizeDescription, "imageSize/image.size.parameter") || !strings.Contains(sizeDescription, "allowCustom=true") {
+		t.Fatalf("generation size schema does not explain model-specific parameters: %q", sizeDescription)
+	}
+	splitProperties := functions["image_layer_split"]["properties"].(map[string]any)
+	if _, ok := splitProperties["size"]; !ok {
+		t.Fatal("image_layer_split is missing the shared image size field")
 	}
 	if got := CloudAgentCapabilitySetInfo(); got.Hash != canvasCapabilityRegistry.Hash() || got.Version != capability.SetVersion || !reflect.DeepEqual(got.Nodes, canvasCapabilityRegistry.Types()) {
 		t.Fatalf("capability endpoint info differs from registry: %+v", got)
@@ -266,26 +315,31 @@ func TestCloudAgentAnnotationRenderFeedsControlledTransientReference(t *testing.
 	}
 }
 
-func TestCloudAgentPolicyPublishesSkillManifestWithoutInliningSkillBody(t *testing.T) {
-	skill := cloudAgentSkill{ID: "skill-1", Name: "任务技能", Description: "当用户要写短剧剧本时调用", Version: "v1", Hash: agentProfileHash("skill"), Instruction: "PRIVATE_SKILL_BODY", Files: map[string]string{"references/a.md": "A"}}
-	text, _, err := compileCloudAgentPolicies(agentTestRequest(), defaultCanvasAppearance().AgentName, []cloudAgentSkill{skill}, "", cloudAgentProfileSnapshot{Revision: agentProfileRevision(nil), Hash: agentProfileHash("")})
+func TestCloudAgentPolicyPublishesSkillCatalogWithoutBodyOrFileLists(t *testing.T) {
+	catalog := buildCloudAgentSkillCatalog([]skills.AgentSkillCatalogEntry{
+		{SkillID: "skill-1", Name: "任务技能", Description: "当用户要写短剧剧本时调用", Tag: "drama", VersionID: "v1", FileCount: 3},
+	}, 2000)
+	text, _, err := compileCloudAgentPolicies(agentTestRequest(), defaultCanvasAppearance().AgentName, &catalog, "", cloudAgentProfileSnapshot{Revision: agentProfileRevision(nil), Hash: agentProfileHash("")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(text, skill.Instruction) || !strings.Contains(text, `"entryPath":"SKILL.md"`) || !strings.Contains(text, `"files":["SKILL.md","references/a.md"]`) || !strings.Contains(text, `"description":"当用户要写短剧剧本时调用"`) {
-		t.Fatalf("compiled policy did not publish a safe on-demand skill manifest: %s", text)
+	if !strings.Contains(text, "## 已安装技能目录") || !strings.Contains(text, "任务技能 [skill-1]：当用户要写短剧剧本时调用（另有 2 个文件）") {
+		t.Fatalf("compiled policy did not publish the skill catalog: %s", text)
+	}
+	if strings.Contains(text, `"files":`) || strings.Contains(text, `"entryPath"`) {
+		t.Fatalf("catalog must not inline per-skill file lists: %s", text)
 	}
 }
 
-func TestCloudAgentPolicyTruncatesOversizedSkillDescription(t *testing.T) {
+func TestCloudAgentPolicyTrimsLongSkillDescriptionInCatalog(t *testing.T) {
 	long := strings.Repeat("描", 600)
-	skill := cloudAgentSkill{ID: "skill-2", Name: "长描述技能", Description: long, Version: "v1", Hash: agentProfileHash("skill2")}
-	text, _, err := compileCloudAgentPolicies(agentTestRequest(), defaultCanvasAppearance().AgentName, []cloudAgentSkill{skill}, "", cloudAgentProfileSnapshot{Revision: agentProfileRevision(nil), Hash: agentProfileHash("")})
+	catalog := buildCloudAgentSkillCatalog([]skills.AgentSkillCatalogEntry{{SkillID: "skill-2", Name: "长描述技能", Description: long, VersionID: "v1"}}, 2000)
+	text, _, err := compileCloudAgentPolicies(agentTestRequest(), defaultCanvasAppearance().AgentName, &catalog, "", cloudAgentProfileSnapshot{Revision: agentProfileRevision(nil), Hash: agentProfileHash("")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(text, long) || !strings.Contains(text, strings.Repeat("描", 500)+"…") {
-		t.Fatalf("oversized skill description was not capped at 500 runes: %s", text)
+	if strings.Contains(text, strings.Repeat("描", cloudAgentSkillCatalogSummaryRunes+1)) || !strings.Contains(text, strings.Repeat("描", cloudAgentSkillCatalogSummaryRunes)+"…") {
+		t.Fatalf("catalog description was not trimmed to %d runes", cloudAgentSkillCatalogSummaryRunes)
 	}
 }
 

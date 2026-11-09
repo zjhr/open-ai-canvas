@@ -32,12 +32,17 @@ function emit(event, payload = {}) {
 
 function createMessage(model, result) {
   const content = [];
+  // 思考回传内容（签名、reasoning_content）由 Go 端打包，只经 thinkingSignature 往返，运行时不解读。
+  if (result.reasoningPassback) {
+    content.push({ type: "thinking", thinking: result.reasoning || "", thinkingSignature: result.reasoningPassback });
+  }
   if (result.text) content.push({ type: "text", text: result.text });
   for (const call of result.toolCalls ?? []) {
     content.push({
       type: "toolCall",
       id: call.id,
       ...(call.item_id ? { itemId: call.item_id } : {}),
+      ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
       name: call.name,
       arguments: call.arguments ?? {},
     });
@@ -119,6 +124,7 @@ async function run() {
       name: request.model.name || request.model.id,
       api,
       reasoning: Boolean(request.model.reasoning),
+      // 档位由 Go 按运行策略和模型能力决定；这里只声明支持思考，避免 SDK 按自身档位表裁剪。
       input: request.model.input?.length ? request.model.input : ["text", "image"],
       cost: request.model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: Math.max(1, Number(request.model.contextWindow || 128000)),
@@ -164,17 +170,30 @@ async function run() {
             thinkingLevel: options?.reasoning ?? "off",
             contextUsage: session.getContextUsage(),
           }, options?.signal);
+          if (result.pause === true && result.reason === "awaiting_approval") {
+            pausedForApproval = true;
+            emit("approval_wait", { reason: result.reason });
+            stream.push({ type: "error", reason: "aborted", error: { ...partial, stopReason: "aborted", errorMessage: "paused for approval" } });
+            stream.end();
+            return;
+          }
           for (const text of result.steeringMessages ?? []) {
             await session.steer(text);
           }
           const message = createMessage(model, result);
+          let contentIndex = 0;
+          const thinking = message.content.find((item) => item.type === "thinking");
+          if (thinking) {
+            partial.content.push(thinking);
+            contentIndex++;
+          }
           if (result.text) {
             partial.content.push({ type: "text", text: result.text });
-            stream.push({ type: "text_start", contentIndex: 0, partial });
-            stream.push({ type: "text_delta", contentIndex: 0, delta: result.text, partial });
-            stream.push({ type: "text_end", contentIndex: 0, content: result.text, partial });
+            stream.push({ type: "text_start", contentIndex, partial });
+            stream.push({ type: "text_delta", contentIndex, delta: result.text, partial });
+            stream.push({ type: "text_end", contentIndex, content: result.text, partial });
+            contentIndex++;
           }
-          let contentIndex = result.text ? 1 : 0;
           for (const call of result.toolCalls ?? []) {
             const toolCall = message.content.find((item) => item.type === "toolCall" && item.id === call.id);
             partial.content.push(toolCall);
@@ -203,6 +222,7 @@ async function run() {
   let session;
   // 工具进入审批时主动中止本轮；这是暂停，不是失败。
   let pausedForApproval = false;
+  const executedToolCalls = new Set();
   const tools = (request.tools ?? []).map((tool) => ({
     name: tool.name,
     label: tool.label || tool.name,
@@ -210,6 +230,9 @@ async function run() {
     parameters: Type.Unsafe(tool.parameters ?? { type: "object", properties: {} }),
     executionMode: tool.executionMode || "sequential",
     async execute(toolCallId, params, signal) {
+      // SDK 在 execute 之前拒绝的调用也要先写回 Go 的调用游标。
+      await eventChain.current;
+      executedToolCalls.add(toolCallId);
       const result = await bridge(request, "/tool", {
         callId: toolCallId,
         name: tool.name,
@@ -283,20 +306,6 @@ async function run() {
       hash: request.profile.hash,
       layers: request.profile.layers || [],
     };
-  }
-
-  if (request.memory?.enabled) {
-    sessionConfig.memory = {
-      enabled: true,
-      storePath: request.memory.storePath,
-      userId: request.userId,
-      canvasId: request.canvasId,
-      maxEntries: request.memory.maxEntries || 1000,
-    };
-  }
-
-  if (request.canvas) {
-    sessionConfig.canvas = request.canvas;
   }
 
   if (request.features) {
@@ -381,6 +390,17 @@ async function run() {
       });
     } else if (event.type === "message_end") {
       const message = event.message;
+      if (message?.role === "toolResult" && message.isError && !pausedForApproval && !executedToolCalls.has(message.toolCallId)) {
+        const error = message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+        if (error.startsWith("Validation failed for tool ")) {
+          enqueueEvent({
+            type: "tool_validation_failed",
+            callId: message.toolCallId,
+            toolName: message.toolName,
+            error: error.split("\n\nReceived arguments:")[0],
+          });
+        }
+      }
       if (message?.role !== "assistant") return;
       if (pausedForApproval || message.stopReason === "aborted") return;
       if (message.stopReason === "error" || message.errorMessage) {

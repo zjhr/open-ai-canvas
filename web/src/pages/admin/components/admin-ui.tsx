@@ -27,7 +27,7 @@ export function AdminStatTile({ label, value, detail, trend }: { label: string; 
             {trend || detail ? (
                 <div className="admin-stat-tile-detail">
                     {trend ? <AdminStatusBadge label={trend.value} tone={trend.tone || "neutral"} /> : null}
-                    {trend && detail ? <span className="mx-1.5">·</span> : null}
+                    {trend && detail ? <span className="mx-2">·</span> : null}
                     {detail ? <span>{detail}</span> : null}
                 </div>
             ) : null}
@@ -317,7 +317,8 @@ export type AdminRowAction = {
 
 export function AdminRowActions({ primary, actions, visibleActionCount }: { primary?: { label: ReactNode; icon?: ReactNode; onClick: () => void | Promise<void>; disabled?: boolean }; actions: AdminRowAction[]; visibleActionCount?: number }) {
     const { modal } = App.useApp();
-    const resolvedVisibleActionCount = visibleActionCount ?? (actions.length <= 1 ? actions.length : 1);
+    // 行内操作默认全部外露；只有超过 3 个次要操作时才把其余收进“更多”，避免只藏一两个按钮。
+    const resolvedVisibleActionCount = visibleActionCount ?? (actions.length <= 3 ? actions.length : 2);
     const visibleActions = actions.slice(0, Math.max(0, resolvedVisibleActionCount));
     const menuActions = actions.slice(Math.max(0, resolvedVisibleActionCount));
     const items: MenuProps["items"] = menuActions.map((action) => ({

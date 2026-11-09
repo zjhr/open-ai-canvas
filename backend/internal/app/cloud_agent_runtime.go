@@ -61,9 +61,10 @@ type CloudAgentEvent struct {
 }
 
 type cloudAgentCall struct {
-	ID       string `json:"id"`
-	ItemID   string `json:"item_id,omitempty"`
-	Function struct {
+	ID               string `json:"id"`
+	ItemID           string `json:"item_id,omitempty"`
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
+	Function         struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
@@ -116,14 +117,19 @@ type cloudAgentApproval struct {
 }
 
 type cloudAgentRuntime struct {
-	RuntimeRunID       string                                `json:"-"`
-	Request            CloudAgentRequest                     `json:"request"`
-	Policy             cloudAgentPolicySnapshot              `json:"policy"`
-	ParentID           string                                `json:"parentId,omitempty"`
-	Fingerprint        string                                `json:"fingerprint,omitempty"`
-	CreativeAnchor     cloudAgentCreativeAnchor              `json:"creativeAnchor,omitempty"`
-	TextHistory        []providerTextMessage                 `json:"textHistory,omitempty"`
-	Skills             []cloudAgentSkill                     `json:"skills"`
+	RuntimeRunID   string                   `json:"-"`
+	Request        CloudAgentRequest        `json:"request"`
+	Policy         cloudAgentPolicySnapshot `json:"policy"`
+	ParentID       string                   `json:"parentId,omitempty"`
+	Fingerprint    string                   `json:"fingerprint,omitempty"`
+	CreativeAnchor cloudAgentCreativeAnchor `json:"creativeAnchor,omitempty"`
+	TextHistory    []providerTextMessage    `json:"textHistory,omitempty"`
+	Skills         []cloudAgentSkill        `json:"skills"`
+	// SkillVersions 是本轮可读技能（自动发现 + 固定）的冻结版本；SkillHints / Memory 是每次
+	// 模型请求前重新插入的冻结数据消息。
+	SkillVersions      map[string]string                     `json:"skillVersions,omitempty"`
+	SkillHints         string                                `json:"skillHints,omitempty"`
+	Memory             cloudAgentMemorySnapshot              `json:"memory,omitempty"`
 	Profile            cloudAgentProfileSnapshot             `json:"profile"`
 	ProfileReads       map[string]bool                       `json:"profileReads,omitempty"`
 	ToolReadResults    map[string]cloudAgentCachedToolResult `json:"toolReadResults,omitempty"`
@@ -133,14 +139,16 @@ type cloudAgentRuntime struct {
 	ActiveTaskID       string                                `json:"activeTaskId"`
 	ActiveTextDraft    string                                `json:"activeTextDraft,omitempty"`
 	MediaTaskID        string                                `json:"mediaTaskId,omitempty"`
-	TaskIDs            []string                              `json:"taskIds"`
-	Step               int                                   `json:"step"`
-	Generations        int                                   `json:"generations"`
-	VideoSeconds       int                                   `json:"videoSeconds"`
-	Calls              []cloudAgentCall                      `json:"calls"`
-	CallIndex          int                                   `json:"callIndex"`
-	ToolRepairs        map[string]cloudAgentToolRepair       `json:"toolRepairs,omitempty"`
-	Approval           *cloudAgentApproval                   `json:"approval,omitempty"`
+	// MediaBatch 是 generate_media_batch 的批次状态；与 MediaTaskID 互斥（见 validateCloudAgentMediaBatch）。
+	MediaBatch   *cloudAgentMediaBatch           `json:"mediaBatch,omitempty"`
+	TaskIDs      []string                        `json:"taskIds"`
+	Step         int                             `json:"step"`
+	Generations  int                             `json:"generations"`
+	VideoSeconds int                             `json:"videoSeconds"`
+	Calls        []cloudAgentCall                `json:"calls"`
+	CallIndex    int                             `json:"callIndex"`
+	ToolRepairs  map[string]cloudAgentToolRepair `json:"toolRepairs,omitempty"`
+	Approval     *cloudAgentApproval             `json:"approval,omitempty"`
 	// AutoPreparedMedia is the durable admission checkpoint for permissionMode=auto.
 	// It prevents a worker restart between dry admission and billed submission from
 	// re-running admission or creating the draft node a second time.
@@ -169,11 +177,14 @@ type cloudAgentRuntime struct {
 	// PiAssistantResponses counts successful assistant message_end events from
 	// the Pi runtime. Completion must not be inferred from a clean Node exit:
 	// a provider/session error can otherwise be reported as a successful run.
-	PiAssistantResponses        int    `json:"piAssistantResponses,omitempty"`
-	LessonEligibleToolSuccesses int    `json:"lessonEligibleToolSuccesses,omitempty"`
-	RememberLessonSuccesses     int    `json:"rememberLessonSuccesses,omitempty"`
-	IsGenerating                bool   `json:"isGenerating,omitempty"`
-	LastError                   string `json:"lastError,omitempty"`
+	PiAssistantResponses int `json:"piAssistantResponses,omitempty"`
+	// MemoryWriteCalls / SkillRecommendations 是本轮记忆写入与技能推荐的次数上限计数；
+	// MarketSuggestions 是技能市场检索返回过的候选，skill_recommend 只能从中选择。
+	MemoryWriteCalls     int                          `json:"memoryWriteCalls,omitempty"`
+	SkillRecommendations int                          `json:"skillRecommendations,omitempty"`
+	MarketSuggestions    []cloudAgentMarketSuggestion `json:"marketSuggestions,omitempty"`
+	IsGenerating         bool                         `json:"isGenerating,omitempty"`
+	LastError            string                       `json:"lastError,omitempty"`
 	// EmptyOutputEscalated 记录"空输出已经升级重试过几次"（关思考 + 放大输出预算）。
 	EmptyOutputEscalated int `json:"emptyOutputEscalated,omitempty"`
 	// StepTimeoutEscalated 记录"单步墙钟到点后已经关思考重试过几次"。
@@ -186,13 +197,11 @@ type cloudAgentRuntime struct {
 	// StepLimits 是本步实际生效的执行边界（管理员策略解析结果），只用于构造请求：
 	// 不进状态 JSON——每次推进都按当时的策略重新解析，改配置无需重发本轮。
 	StepLimits cloudAgentStepLimits `json:"-"`
-	// ImageInspectCounts 记录本轮内每张图被查看的次数，用于"同一张图不要反复看"的护栏。
+	// ImageInspectCounts 记录本轮内每张图的观察次数，用于回执标注重复观察；不阻止补充观察。
 	ImageInspectCounts map[string]int `json:"imageInspectCounts,omitempty"`
-	// ImageInspectionReads 以“节点 + 资源 + 画布 revision”为 key，避免同一张图在
-	// 同一版本的画布里反复触发视觉输入。画布内容变化后 key 自然变化，允许重新识别。
+	// ImageInspectionReads 以“节点 + 资源 + 画布 revision”为 key，记录同一图片是否在本轮交付过。
 	ImageInspectionReads map[string]int `json:"imageInspectionReads,omitempty"`
-	// ImageInspectCalls 记录本轮所有图片识别工具调用次数（包括只回执文字的重复调用）。
-	// 它与 ImageInspectCounts 一起进检查点，防止模型通过 refresh 或切换节点绕过总预算。
+	// ImageInspectCalls 记录本轮附送的图片数，批量调用按图片逐张计入总预算。
 	ImageInspectCalls int `json:"imageInspectCalls,omitempty"`
 	// ReadToolCalls 记录本轮会读取运行时只读快照的工具调用次数。除了同参缓存护栏，
 	// 还需要一个跨参数的总上限，防止模型通过不断变化 offset/nodeIds 绕过重复读取保护。
@@ -259,19 +268,22 @@ func (s *Service) ensureCloudAgentExecution(task *model.Task, initial cloudAgent
 	// not an active model task; validation and recovery use TaskIDs as the run's
 	// immutable task-history anchor. Leaving this nil makes every new Pi run
 	// fail its first checkpoint with "Agent runtime task history is invalid".
-	state := cloudAgentRuntime{Request: initial.Request, Policy: initial.Policy, ParentID: initial.ParentID, Fingerprint: initial.Fingerprint, CreativeAnchor: initial.CreativeAnchor, TextHistory: input.TextHistory, Skills: initial.Skills, Profile: initial.Profile, Canonical: canonical, ActiveTaskID: "", TaskIDs: []string{task.ID}, Step: 0, Decisions: map[string]string{}, Plan: initial.Plan, ConfirmationRounds: initial.ConfirmationRounds, ConfirmationFingerprints: append([]string(nil), initial.ConfirmationFingerprints...), PendingConfirmationFingerprint: "", Events: []CloudAgentEvent{}, StepLimits: limits}
+	state := cloudAgentRuntime{Request: initial.Request, Policy: initial.Policy, ParentID: initial.ParentID, Fingerprint: initial.Fingerprint, CreativeAnchor: initial.CreativeAnchor, TextHistory: input.TextHistory, Skills: initial.Skills, SkillVersions: initial.SkillVersions, SkillHints: initial.SkillHints, Memory: initial.Memory, Profile: initial.Profile, Canonical: canonical, ActiveTaskID: "", TaskIDs: []string{task.ID}, Step: 0, Decisions: map[string]string{}, Plan: initial.Plan, ConfirmationRounds: initial.ConfirmationRounds, ConfirmationFingerprints: append([]string(nil), initial.ConfirmationFingerprints...), PendingConfirmationFingerprint: "", Events: []CloudAgentEvent{}, StepLimits: limits}
 	if !carrier {
 		state.ActiveTaskID = task.ID
 		state.Step = 1
 	}
-	if len(initial.Skills) > 0 {
-		// skillIds makes the enablement auditable: usage telemetry can attribute a
-		// run to the skills it actually loaded instead of only counting the total.
+	if len(initial.SkillVersions) > 0 {
+		// skillIds 只列用户固定的技能，便于使用统计归因；availableCount 是本轮可自动发现的技能总数。
 		skillIDs := make([]string, 0, len(initial.Skills))
 		for _, skill := range initial.Skills {
 			skillIDs = append(skillIDs, skill.ID)
 		}
-		state.event(task.ID, "tool_completed", map[string]any{"toolName": "skills_load", "skillIds": skillIDs, "text": fmt.Sprintf("已启用 %d 个技能，正文将按需读取", len(initial.Skills))})
+		text := fmt.Sprintf("可自动发现 %d 个已安装技能，正文按需读取", len(initial.SkillVersions))
+		if len(skillIDs) > 0 {
+			text = fmt.Sprintf("可自动发现 %d 个已安装技能（固定 %d 个），正文按需读取", len(initial.SkillVersions), len(skillIDs))
+		}
+		state.event(task.ID, "tool_completed", map[string]any{"toolName": "skills_load", "skillIds": skillIDs, "availableCount": len(initial.SkillVersions), "text": text})
 	}
 	if len(state.Plan) > 0 {
 		// 继承的待办清单必须挂到本轮：前端按 plan-<runId> 展示清单，不发这条事件时

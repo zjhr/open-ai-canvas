@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { App, Button, Input, Segmented } from "antd";
 import { AppModal } from "@/components/ui/product/app-modal";
-import { Braces, Image, Layers3, Save, Sparkles } from "lucide-react";
+import { Braces, Image, Layers3, Save, Check, Palette } from "lucide-react";
 
 import { StyleAssetBindingModal } from "@/components/canvas/style-asset-binding-modal";
 import { createStyleProfileSnapshot, styleProfileValidationMessage, type StyleProfileSnapshot } from "@/lib/canvas/style-profile";
@@ -68,7 +68,7 @@ export function StyleProfileEditorModal({ open, initialProfile, saving = false, 
                     <header className="flex min-h-16 items-center border-b border-border px-4 pr-12 sm:px-5 sm:pr-14">
                         <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                                <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-foreground/5"><Sparkles className="size-3.5" /></span>
+                                <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-foreground/5"><Palette className="size-3.5" /></span>
                                 <div>
                                     <h2 className="text-sm font-semibold">风格编辑器</h2>
                                     <p className="mt-0.5 truncate text-[var(--fs-tiny)] text-foreground/45">{draft.title || "未命名风格"} · 我的风格</p>
@@ -97,7 +97,7 @@ export function StyleProfileEditorModal({ open, initialProfile, saving = false, 
                         <div className="flex shrink-0 flex-wrap justify-end gap-2">
                             <Button onClick={requestClose}>取消</Button>
                             <Button icon={<Save className="size-3.5" />} disabled={Boolean(validationMessage)} loading={saving} onClick={() => submit(false)}>保存到我的风格</Button>
-                            <Button type="primary" icon={<Sparkles className="size-3.5" />} disabled={Boolean(validationMessage)} loading={saving} onClick={() => submit(true)}>保存并应用</Button>
+                            <Button type="primary" icon={<Check className="size-3.5" />} disabled={Boolean(validationMessage)} loading={saving} onClick={() => submit(true)}>保存并应用</Button>
                         </div>
                     </footer>
                 </div>
@@ -124,8 +124,8 @@ function StylePreview({ profile }: { profile: StyleProfileSnapshot }) {
             </div>
             <div className="p-4 sm:p-5">
                 <h3 className="text-base font-semibold">{profile.title || "未命名风格"}</h3>
-                <p className="mt-1.5 text-xs leading-5 text-foreground/48">{profile.description || "填写简介，让风格库中更容易判断它适合什么项目。"}</p>
-                <div className="mt-3 flex flex-wrap gap-1.5">
+                <p className="mt-2 text-xs leading-5 text-foreground/48">{profile.description || "填写简介，让风格库中更容易判断它适合什么项目。"}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
                     {profile.tags.length ? profile.tags.map((tag) => <span key={tag} className="rounded bg-foreground/10 px-2 py-1 text-[var(--fs-tiny)] text-foreground/58">{tag}</span>) : <span className="text-[var(--fs-tiny)] text-foreground/35">暂无标签</span>}
                 </div>
                 <dl className="mt-5 grid grid-cols-2 border-y border-border py-3 text-[var(--fs-tiny)]">
@@ -209,7 +209,7 @@ function SectionHeading({ title, description }: { title: string; description: st
 }
 
 function Field({ label, className = "", children }: { label: string; className?: string; children: ReactNode }) {
-    return <label className={`grid gap-1.5 text-xs ${className}`}><span className="font-medium text-foreground/62">{label}</span>{children}</label>;
+    return <label className={`grid gap-2 text-xs ${className}`}><span className="font-medium text-foreground/62">{label}</span>{children}</label>;
 }
 
 function Metric({ label, value }: { label: string; value: string }) {

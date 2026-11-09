@@ -1,23 +1,28 @@
 import { canvasNodeToAsset, declaredCanvasNodeAssetCategory, findCanvasNodeAsset, requiresMaterializedCanvasAsset, type CanvasAssetSource } from "@/lib/canvas/canvas-node-asset";
 import { canvasVideoAssetPreviewUrl } from "@/lib/canvas/canvas-media-preview";
 import { readImageMeta } from "@/lib/image-utils";
+import { parseAssetStorageDocumentRecovering } from "@/lib/asset-storage-revision";
 import { parseBackendGenerationResult, type BackendGenerationResult } from "@/services/api/generation-task";
 import { ApiError } from "@/services/api/request";
 import { linkProjectAsset, moveProjectAsset, updateProjectAssetCategory } from "@/services/api/projects";
 import type { GenerationTask, GenerationTaskOutput } from "@/services/api/task-center";
 import { getMediaBlob, resolveMediaUrl, setMediaBlob } from "@/services/file-storage";
-import { createGenerationTaskMaterializer, createIdempotentMaterializeOutput, type MaterializeGenerationTaskOutput } from "@/services/generation-task-materializer";
+import { createGenerationTaskMaterializer, createIdempotentMaterializeOutput, materializeEffectKey, type MaterializeGenerationTaskOutput } from "@/services/generation-task-materializer";
 import { withGenerationArtifactCommitLock } from "@/services/generation-asset-repository";
 import { uploadGeneratedAssetToConfiguredSources } from "@/services/external-asset-sources";
 import { getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
 import { generationArtifactStorageKey, loadOrStoreGenerationArtifact } from "@/services/generation-artifact-sink";
 import { createProviderNeutralGenerationTaskEffectStore } from "@/services/provider-neutral-generation-effects";
 import { getCachedResourceBlob } from "@/services/resource-blob-cache";
-import { hasRemoteUserDataSyncSession, loadAssetsForUse, saveRemoteUserDataNow } from "@/services/user-data-sync";
+import { localForageStorageForScope } from "@/lib/localforage-storage";
+import { CanvasSyncPendingError } from "@/lib/canvas/sync-recovery";
+import { createCanvasProjectAssetLinkQueue, type PendingCanvasProjectAssetLink } from "@/lib/canvas/project-asset-link-queue";
+import { appQueryClient } from "@/lib/query-client";
+import { hasRemoteUserDataSyncSession, loadAssetsForUse, saveRemoteUserDataNow, subscribeRemoteUserDataReady } from "@/services/user-data-sync";
 import { getActiveUserScope } from "@/lib/user-scope";
 import { normalizeAssetCategory } from "@/lib/asset-category";
 import { runGenerationConsumer } from "@/services/generation-consumer-lifecycle";
-import { useAssetStore, type AssetCategory, type AssetStatus, type NewAsset } from "@/stores/use-asset-store";
+import { ASSET_STORE_KEY, flushAssetStorePersistence, generationAssetId, useAssetStore, type AssetCategory, type AssetStatus, type NewAsset } from "@/stores/use-asset-store";
 import type { CanvasNodeData } from "@/types/canvas";
 
 function throwIfAborted(signal?: AbortSignal) {
@@ -39,11 +44,19 @@ export type CanvasNodeAssetResult = {
     assetId: string;
     created: boolean;
     linkedToProject: boolean;
+    syncPending: boolean;
 };
 
 const pendingAssetSyncs = new Map<string, Promise<CanvasNodeAssetResult>>();
+const projectAssetLinkQueueKey = "yingce:pending-canvas-project-asset-links";
+const projectAssetLinkRetryDelays = [2_000, 4_000, 8_000, 16_000, 30_000] as const;
+const projectAssetLinkQueues = new Map<string, ReturnType<typeof createCanvasProjectAssetLinkQueue>>();
+const projectAssetLinkFlights = new Map<string, Promise<{ linked: boolean; pending: boolean }>>();
+const projectAssetLinkTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const projectAssetLinkFailureListeners = new Set<(failure: { domainProjectId: string; message: string }) => void>();
 const DEFAULT_RATE_LIMIT_RETRY_MS = 60_000;
 const MAX_RATE_LIMIT_RETRY_MS = 5 * 60_000;
+const BLOCKED_PROJECT_ASSET_LINK_RETRY_AT = Number.MAX_SAFE_INTEGER;
 
 type CanvasAssetSyncRetryOptions = {
     signal?: AbortSignal;
@@ -87,13 +100,20 @@ export async function retryCanvasAssetSyncAfterRateLimit<T>(operation: () => Pro
 export function ensureCanvasNodeAsset(options: EnsureCanvasNodeAssetOptions) {
     const scope = getActiveUserScope();
     const taskIdentity = options.taskId || options.node.metadata?.taskId || options.node.metadata?.storageKey || options.node.id;
-    const identity = options.node.metadata?.imageLayerGroup || options.node.metadata?.layerExtraction ? `${taskIdentity}:${options.node.metadata.storageKey || ""}` : taskIdentity;
+    const identity = options.node.metadata?.imageLayerGroup || options.node.metadata?.layerExtraction || options.node.metadata?.emotionEdit?.editRegion ? `${taskIdentity}:${options.node.metadata.storageKey || ""}` : taskIdentity;
     const key = [scope, options.domainProjectId || "personal", options.canvasId, options.node.id, identity].join(":");
     const pending = pendingAssetSyncs.get(key);
     if (pending) return pending;
     const request = runGenerationConsumer(options.signal, (signal) => persistCanvasNodeAsset({ ...options, signal })).finally(() => pendingAssetSyncs.delete(key));
     pendingAssetSyncs.set(key, request);
     return request;
+}
+
+export function subscribeCanvasProjectAssetLinkFailures(listener: (failure: { domainProjectId: string; message: string }) => void) {
+    projectAssetLinkFailureListeners.add(listener);
+    return () => {
+        projectAssetLinkFailureListeners.delete(listener);
+    };
 }
 
 async function persistCanvasNodeAsset(options: EnsureCanvasNodeAssetOptions): Promise<CanvasNodeAssetResult> {
@@ -123,50 +143,210 @@ async function persistCanvasNodeAsset(options: EnsureCanvasNodeAssetOptions): Pr
     }
     // 生成结果先以本地资产完成闭环；未建立云端同步会话时，后续登录同步会
     // 继续上传素材和画布，不能把一个可恢复的本地成功报告成失败。
-    if (!hasRemoteUserDataSyncSession()) return { assetId: asset.id, created, linkedToProject: false };
-    if (!options.domainProjectId) {
-        await saveRemoteUserDataNow();
-        throwIfAborted(options.signal);
-        return { assetId: asset.id, created, linkedToProject: false };
+    if (!options.domainProjectId && !hasRemoteUserDataSyncSession()) return { assetId: asset.id, created, linkedToProject: false, syncPending: false };
+    if (options.domainProjectId) {
+        const sync = await syncAssetToProject(asset.id, options.domainProjectId, declaredCategory, options.folderId, options.signal);
+        return { assetId: asset.id, created, linkedToProject: sync.linked, syncPending: sync.pending };
     }
-    await syncAssetToProject(asset.id, options.domainProjectId, declaredCategory, options.folderId, options.signal);
-    return { assetId: asset.id, created, linkedToProject: true };
+    try {
+        await saveRemoteUserDataNow([]);
+        throwIfAborted(options.signal);
+        return { assetId: asset.id, created, linkedToProject: false, syncPending: false };
+    } catch (error) {
+        if (!isRetryableCanvasAssetSyncError(error)) throw error;
+        return { assetId: asset.id, created, linkedToProject: false, syncPending: true };
+    }
 }
 
-async function syncAssetToProject(assetId: string, domainProjectId: string, category?: AssetCategory, folderId?: string, signal?: AbortSignal) {
-    throwIfAborted(signal);
-    const asset = useAssetStore.getState().assets.find((candidate) => candidate.id === assetId);
+function projectAssetLinkQueueForScope(scope: string) {
+    let queue = projectAssetLinkQueues.get(scope);
+    if (!queue) {
+        queue = createCanvasProjectAssetLinkQueue(localForageStorageForScope(scope), projectAssetLinkQueueKey);
+        projectAssetLinkQueues.set(scope, queue);
+    }
+    return queue;
+}
+
+function projectAssetLinkFlightKey(scope: string, job: PendingCanvasProjectAssetLink) {
+    return `${scope}\0${job.domainProjectId}\0${job.assetId}`;
+}
+
+function isRetryableCanvasAssetSyncError(error: unknown) {
+    if (error instanceof DOMException && error.name === "AbortError") return false;
+    if (error instanceof CanvasSyncPendingError) return true;
+    if (error instanceof ApiError) return error.retryable || error.status === undefined;
+    if (typeof error === "object" && error !== null && "permanent" in error) return (error as { permanent?: unknown }).permanent !== true;
+    return true;
+}
+
+function isOnline() {
+    return typeof navigator === "undefined" || navigator.onLine !== false;
+}
+
+function projectAssetLinkRetryDelay(job: PendingCanvasProjectAssetLink, error: unknown) {
+    const index = Math.min(job.attempts, projectAssetLinkRetryDelays.length - 1);
+    const delay = projectAssetLinkRetryDelays[index];
+    const retryAfterMs = error instanceof ApiError ? error.retryAfterMs || 0 : 0;
+    return Math.max(delay, retryAfterMs);
+}
+
+function scheduleCanvasProjectAssetLinkRetry(scope: string, delayMs = 0) {
+    const current = projectAssetLinkTimers.get(scope);
+    if (current) clearTimeout(current);
+    const timer = setTimeout(
+        () => {
+            projectAssetLinkTimers.delete(scope);
+            void retryPendingCanvasProjectAssetLinks(scope).catch((error) => console.warn("云端项目资产关联重试失败", error));
+        },
+        Math.max(0, delayMs),
+    );
+    projectAssetLinkTimers.set(scope, timer);
+}
+
+async function scheduleNextCanvasProjectAssetLinkRetry(scope: string) {
+    if (scope !== getActiveUserScope() || !hasRemoteUserDataSyncSession() || !isOnline()) return;
+    const entries = await projectAssetLinkQueueForScope(scope).list();
+    const nextAttemptAt = entries.reduce((next, entry) => Math.min(next, entry.nextAttemptAt), BLOCKED_PROJECT_ASSET_LINK_RETRY_AT);
+    if (nextAttemptAt === BLOCKED_PROJECT_ASSET_LINK_RETRY_AT) {
+        const timer = projectAssetLinkTimers.get(scope);
+        if (timer) clearTimeout(timer);
+        projectAssetLinkTimers.delete(scope);
+        return;
+    }
+    scheduleCanvasProjectAssetLinkRetry(scope, Math.max(0, nextAttemptAt - Date.now()));
+}
+
+async function attemptCanvasProjectAssetLink(job: PendingCanvasProjectAssetLink, scope: string, signal?: AbortSignal) {
+    const key = projectAssetLinkFlightKey(scope, job);
+    const existing = projectAssetLinkFlights.get(key);
+    if (existing) return existing;
+    const queue = projectAssetLinkQueueForScope(scope);
+    const operation = (async () => {
+        if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        if (scope !== getActiveUserScope()) throw new DOMException("The operation was aborted", "AbortError");
+        if (!hasRemoteUserDataSyncSession() || !isOnline()) return { linked: false, pending: true };
+        try {
+            await performCanvasProjectAssetLink(job, scope, signal);
+            const removed = await queue.remove(job);
+            if (!removed) {
+                scheduleCanvasProjectAssetLinkRetry(scope);
+                return { linked: false, pending: true };
+            }
+            void appQueryClient.invalidateQueries({ queryKey: ["project", job.domainProjectId] });
+            void scheduleNextCanvasProjectAssetLinkRetry(scope).catch((error) => console.warn("读取项目资产重试队列失败", error));
+            return { linked: true, pending: false };
+        } catch (error) {
+            if ((error instanceof DOMException && error.name === "AbortError") || scope !== getActiveUserScope()) throw error;
+            if (isRetryableCanvasAssetSyncError(error)) {
+                await queue.update(job, {
+                    attempts: job.attempts + 1,
+                    nextAttemptAt: Date.now() + projectAssetLinkRetryDelay(job, error),
+                });
+                await scheduleNextCanvasProjectAssetLinkRetry(scope);
+                return { linked: false, pending: true };
+            }
+            await queue.update(job, { attempts: job.attempts, nextAttemptAt: BLOCKED_PROJECT_ASSET_LINK_RETRY_AT });
+            await scheduleNextCanvasProjectAssetLinkRetry(scope);
+            throw error;
+        }
+    })();
+    projectAssetLinkFlights.set(key, operation);
+    try {
+        return await operation;
+    } finally {
+        if (projectAssetLinkFlights.get(key) === operation) projectAssetLinkFlights.delete(key);
+    }
+}
+
+async function performCanvasProjectAssetLink(job: PendingCanvasProjectAssetLink, scope: string, signal?: AbortSignal) {
+    const ensureCurrentScope = () => {
+        throwIfAborted(signal);
+        if (scope !== getActiveUserScope()) throw new DOMException("The operation was aborted", "AbortError");
+    };
+    ensureCurrentScope();
+    let asset = useAssetStore.getState().assets.find((candidate) => candidate.id === job.assetId);
+    if (!asset) {
+        await loadAssetsForUse([job.assetId]);
+        ensureCurrentScope();
+        asset = useAssetStore.getState().assets.find((candidate) => candidate.id === job.assetId);
+    }
     if (!asset) throw new Error("素材写入本地失败");
+    const category = job.category as AssetCategory | undefined;
     const linkedProjectIds = Array.isArray(asset.metadata?.projectIds) ? asset.metadata.projectIds.filter((id): id is string => typeof id === "string") : [];
-    if (linkedProjectIds.includes(domainProjectId)) {
-        if (folderId !== undefined) await moveProjectAsset(domainProjectId, asset.id, folderId, signal);
+    if (linkedProjectIds.includes(job.domainProjectId)) {
+        if (job.folderId !== undefined) await moveProjectAsset(job.domainProjectId, asset.id, job.folderId, signal);
+        ensureCurrentScope();
         return;
     }
 
     // 项目关联依赖后端 assets 记录，先强制完成素材同步，不能依赖延迟自动同步的时序。
-    await saveRemoteUserDataNow();
-    throwIfAborted(signal);
+    await saveRemoteUserDataNow([]);
+    ensureCurrentScope();
     const { asset: linkedAsset } = await linkProjectAsset(
-        domainProjectId,
+        job.domainProjectId,
         {
             assetId: asset.id,
             category: normalizeAssetCategory(category || asset.category),
-            folderId,
+            folderId: job.folderId,
         },
         signal,
     );
-    throwIfAborted(signal);
-    let linked = category && linkedAsset.category !== category ? (await updateProjectAssetCategory(domainProjectId, asset.id, category, signal)).asset : linkedAsset;
-    if (folderId !== undefined && (linked.folderId || "") !== folderId) linked = (await moveProjectAsset(domainProjectId, asset.id, folderId, signal)).asset;
-    throwIfAborted(signal);
+    ensureCurrentScope();
+    let linked = category && linkedAsset.category !== category ? (await updateProjectAssetCategory(job.domainProjectId, asset.id, category, signal)).asset : linkedAsset;
+    if (job.folderId !== undefined && (linked.folderId || "") !== job.folderId) linked = (await moveProjectAsset(job.domainProjectId, asset.id, job.folderId, signal)).asset;
+    ensureCurrentScope();
     useAssetStore.getState().updateAsset(asset.id, {
         category: normalizeAssetCategory(linked.category),
         status: linked.status as AssetStatus,
         primaryVersionId: linked.primaryVersionId,
-        metadata: { ...asset.metadata, projectIds: [...new Set([...linkedProjectIds, domainProjectId])] },
+        metadata: { ...asset.metadata, projectIds: [...new Set([...linkedProjectIds, job.domainProjectId])] },
     });
-    await saveRemoteUserDataNow();
+    await saveRemoteUserDataNow([]);
+    ensureCurrentScope();
+}
+
+async function retryPendingCanvasProjectAssetLinks(scope = getActiveUserScope()) {
+    if (scope !== getActiveUserScope() || !hasRemoteUserDataSyncSession() || !isOnline()) return;
+    const queue = projectAssetLinkQueueForScope(scope);
+    const entries = await queue.list();
+    for (const entry of entries) {
+        if (scope !== getActiveUserScope()) return;
+        if (entry.nextAttemptAt > Date.now()) continue;
+        try {
+            await attemptCanvasProjectAssetLink(entry, scope);
+        } catch (error) {
+            console.warn("云端项目资产关联需要处理", error);
+            if (!isRetryableCanvasAssetSyncError(error)) {
+                for (const listener of projectAssetLinkFailureListeners) {
+                    listener({ domainProjectId: entry.domainProjectId, message: error instanceof Error ? error.message : "未知错误" });
+                }
+            }
+        }
+    }
+    await scheduleNextCanvasProjectAssetLinkRetry(scope);
+}
+
+async function resumePendingCanvasProjectAssetLinks(scope = getActiveUserScope()) {
+    if (scope !== getActiveUserScope() || !hasRemoteUserDataSyncSession()) return;
+    const queue = projectAssetLinkQueueForScope(scope);
+    for (const entry of await queue.list()) {
+        if (entry.nextAttemptAt !== BLOCKED_PROJECT_ASSET_LINK_RETRY_AT) continue;
+        await queue.update(entry, { attempts: 0, nextAttemptAt: Date.now() });
+    }
+    await retryPendingCanvasProjectAssetLinks(scope);
+}
+
+subscribeRemoteUserDataReady(() => resumePendingCanvasProjectAssetLinks());
+if (typeof window !== "undefined") {
+    window.addEventListener("online", () => retryPendingCanvasProjectAssetLinks());
+}
+
+async function syncAssetToProject(assetId: string, domainProjectId: string, category?: AssetCategory, folderId?: string, signal?: AbortSignal) {
     throwIfAborted(signal);
+    const scope = getActiveUserScope();
+    const job = await projectAssetLinkQueueForScope(scope).upsert({ assetId, domainProjectId, category, folderId });
+    if (job.nextAttemptAt > Date.now() && job.nextAttemptAt !== BLOCKED_PROJECT_ASSET_LINK_RETRY_AT) return { linked: false, pending: true };
+    return attemptCanvasProjectAssetLink(job, scope, signal);
 }
 
 function generationTaskResult(task: GenerationTask): BackendGenerationResult {
@@ -279,9 +459,10 @@ async function storedGenerationMedia(dataUrl: string, effectKey: string, mediaTy
 async function cachedRemoteGenerationVideo(video: NonNullable<BackendGenerationResult["video"]>, signal?: AbortSignal) {
     if (!video.storageKey) throw new Error("生成视频缺少云端资源标识");
     throwIfAborted(signal);
-    const blob = await getCachedResourceBlob(video.storageKey);
-    throwIfAborted(signal);
-    if (!blob) throw new Error("生成视频资源缓存失败，未标记为成功");
+    // 后端任务成功即代表视频已作为资源持久化；登记素材只需要可用的展示地址。
+    // 整段下载到浏览器只是本地缓存加速层：大视频超时或跨域下载失败不能让已落库的作品在页面上“消失”，
+    // 所以缓存放到后台预热，不阻塞素材登记或画布节点回写。
+    void getCachedResourceBlob(video.storageKey).catch(() => undefined);
     const url = await resolveMediaUrl(video.storageKey, video.dataUrl);
     throwIfAborted(signal);
     if (!url) throw new Error("生成视频资源地址为空，未标记为成功");
@@ -291,8 +472,8 @@ async function cachedRemoteGenerationVideo(video: NonNullable<BackendGenerationR
         width: video.width || 0,
         height: video.height || 0,
         durationMs: video.durationMs,
-        bytes: video.bytes || blob.size,
-        mimeType: video.mimeType || blob.type || "video/mp4",
+        bytes: video.bytes || 0,
+        mimeType: video.mimeType || "video/mp4",
     };
 }
 
@@ -449,7 +630,7 @@ const materializeGenerationOutput: MaterializeGenerationTaskOutput = createIdemp
 function remoteGenerationTaskMaterializer() {
     return createGenerationTaskMaterializer({
         // 每个页面实例持有自己的租约；共享浏览器 storage + Web Lock 提供跨标签原子权威。
-        effects: createProviderNeutralGenerationTaskEffectStore(),
+        effects: createProviderNeutralGenerationTaskEffectStore({ requireCrossRealmLock: true }),
         materializeOutput: materializeGenerationOutput,
     });
 }
@@ -458,8 +639,74 @@ function generationTaskMaterializer(task: GenerationTask) {
     return remoteGenerationTaskMaterializer();
 }
 
+/** 生成结果对应的素材已被用户从素材库删除：这是终态，重新获取不会恢复，也不能复活素材。 */
+export class GenerationOutputAssetDeletedError extends Error {
+    constructor() {
+        super("生成任务输出素材已被用户删除");
+        this.name = "GenerationOutputAssetDeletedError";
+    }
+}
+
+export function isGenerationOutputAssetDeletedError(error: unknown): boolean {
+    for (let current = error, depth = 0; current && depth < 5; current = (current as { cause?: unknown }).cause, depth += 1) {
+        if (current instanceof GenerationOutputAssetDeletedError) return true;
+        if (current instanceof Error && (current.message === "生成任务输出素材已被用户删除" || current.message === "生成素材已被用户删除")) return true;
+    }
+    return false;
+}
+
 export async function materializeGenerationTaskAssets(task: GenerationTask, signal?: AbortSignal): Promise<GenerationTask> {
-    return generationTaskMaterializer(task).materialize(projectGenerationTaskResult(task), signal);
+    const scope = getActiveUserScope();
+    const ensureCurrentScope = () => {
+        throwIfAborted(signal);
+        if (scope !== getActiveUserScope()) throw new DOMException("账号已切换，无法恢复生成素材", "AbortError");
+    };
+    const projected = projectGenerationTaskResult(task);
+    const materialized = await generationTaskMaterializer(task).materialize(projected, signal);
+    ensureCurrentScope();
+    const assetIds = [...new Set((materialized.outputs || []).map((output) => output.materializedAssetId).filter((id): id is string => Boolean(id)))];
+    if (!assetIds.length) return materialized;
+    const readTombstones = async () => {
+        await flushAssetStorePersistence();
+        ensureCurrentScope();
+        const document = parseAssetStorageDocumentRecovering(await localForageStorageForScope(scope).getItem(ASSET_STORE_KEY)).document;
+        ensureCurrentScope();
+        return document.tombstones.assets;
+    };
+
+    const initialTombstones = await readTombstones();
+    if (assetIds.some((id) => Boolean(initialTombstones[id]))) throw new GenerationOutputAssetDeletedError();
+
+    const loadedIds = new Set(useAssetStore.getState().assets.map((asset) => asset.id));
+    const missingIds = assetIds.filter((id) => !loadedIds.has(id));
+    if (missingIds.length) {
+        try {
+            await loadAssetsForUse(missingIds);
+        } catch (error) {
+            // 本机与云端都找不到时不立即报错：物化记录可能早于素材落盘，或素材从未同步成功。
+            // 下面按任务结果重新登记同一 ID 的素材；用户删除的素材有墓碑，不会被复活。
+            if (error instanceof Error && error.name === "AbortError") throw error;
+        }
+    }
+    ensureCurrentScope();
+    const tombstones = await readTombstones();
+    if (assetIds.some((id) => Boolean(tombstones[id]))) throw new GenerationOutputAssetDeletedError();
+
+    const availableIds = new Set(useAssetStore.getState().assets.map((asset) => asset.id));
+    for (const output of materialized.outputs || []) {
+        if (!output.materializedAssetId || availableIds.has(output.materializedAssetId)) continue;
+        // 物化 effect 已完成但素材缺失：按同一 effectKey 重新登记。只在素材 ID 正是该 effectKey 派生的 ID 时补登，
+        // 结果与原记录一致；来历不明的 ID 不重建，避免凭空生成新素材。
+        const effectKey = materializeEffectKey(task.id, output.outputIndex);
+        if ((await generationAssetId(effectKey)) !== output.materializedAssetId) throw new Error("生成任务输出素材不存在");
+        const result = await materializeGenerationOutput({ task: projected, output, effectKey, signal });
+        ensureCurrentScope();
+        if (result.materializedAssetId !== output.materializedAssetId) throw new Error("生成任务输出素材不存在");
+        availableIds.add(result.materializedAssetId);
+    }
+    const unavailableId = assetIds.find((id) => !new Set(useAssetStore.getState().assets.map((asset) => asset.id)).has(id));
+    if (unavailableId) throw new Error("生成任务输出素材不存在");
+    return materialized;
 }
 
 export function attachGenerationTaskNode(task: GenerationTask, nodeId: string, outputIndex: number, consumer: Parameters<ReturnType<typeof generationTaskMaterializer>["attachNode"]>[3], signal?: AbortSignal) {

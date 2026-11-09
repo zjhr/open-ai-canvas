@@ -1,7 +1,6 @@
 import { ApiError, http, apiBaseURL, compactApiParams, serializeApiParams, type ApiParams } from "@/services/api/request";
 import { getActiveUserScope } from "@/lib/user-scope";
 
-
 let addedSkillsRequest: { scope: string; promise: Promise<{ skills: Skill[] }> } | null = null;
 let addedSkillsCache: { scope: string; value: { skills: Skill[] }; expiresAt: number } | null = null;
 let addedSkillsCacheVersion = 0;
@@ -56,13 +55,47 @@ export type Skill = {
     isAdded: boolean;
     isOwner: boolean;
     libraryCategoryId?: string;
+    /** 已安装或自建技能的 Agent 使用方式：auto 可被 Agent 自动发现，manual 只在点名或固定时使用。 */
+    agentMode?: SkillAgentMode;
 };
 
+export type SkillAgentMode = "auto" | "manual";
+
 /** /skills/added 只返回运行时目录需要的引用字段，不携带编辑器和同步详情。 */
-export type AddedSkillReference = Pick<Skill, "skillId" | "skillName" | "description" | "versionId" | "version" | "tag" | "isLike" | "isAdded" | "isOwner" | "libraryCategoryId">;
+export type AddedSkillReference = Pick<Skill, "skillId" | "skillName" | "description" | "versionId" | "version" | "tag" | "isLike" | "isAdded" | "isOwner" | "libraryCategoryId" | "agentMode">;
+
+/** 按行业推荐的内置技能（GET /skills/recommendations）。 */
+export type SkillRecommendationItem = {
+    skillId: string;
+    skillName: string;
+    description: string;
+    tag: string;
+    reason: string;
+    isAdded: boolean;
+};
+
+export type SkillRecommendationIndustry = {
+    industryId: string;
+    name: string;
+    description: string;
+    icon: string;
+    skills: SkillRecommendationItem[];
+    installedCount: number;
+};
+
+export type SkillRecommendationList = {
+    industries: SkillRecommendationIndustry[];
+    /** 用户技能库里可用技能总数，前端据此决定是否主动展示推荐入口。 */
+    installedTotal: number;
+};
+
+export type SkillRecommendationInstallResult = {
+    industryId: string;
+    installed: string[];
+    skipped: string[];
+};
 
 export type SkillCategory = { value: string; label: string; count?: number };
-
 
 export type SkillLibraryCategory = {
     id: string;
@@ -177,12 +210,10 @@ export type InstallGitHubSkillInput = {
     autoUpdate?: boolean;
 };
 
-
 export function listSkills(input: ListSkillsInput = {}) {
     const params = serializeApiParams(compactApiParams(input as ApiParams));
     return http.get<SkillList>(`/skills?${params.toString()}`);
 }
-
 
 export function listSkillLibraryCategories(scope: "mine" | "created" = "mine") {
     return http.get<SkillLibraryCategoryList>("/skills/library-categories", { params: { scope } });
@@ -280,10 +311,12 @@ function normalizeAddedSkillReference(skill: AddedSkillReference): Skill {
         isAdded: skill.isAdded,
         isOwner: skill.isOwner,
         libraryCategoryId: skill.libraryCategoryId || "",
+        agentMode: skill.agentMode,
     };
 }
 
-function invalidateAddedSkillsCache() {
+/** 技能写入后清空已加入技能缓存并通知页面刷新；后台技能管理同样需要调用。 */
+export function invalidateAddedSkillsCache() {
     addedSkillsCacheVersion += 1;
     addedSkillsCache = null;
     addedSkillsRequest = null;
@@ -321,6 +354,23 @@ export function getSkillBundle(id: string) {
     return http.get<{ bundle: SkillPackageBundle }>(`/skills/${encodeURIComponent(id)}/bundle`);
 }
 
+export type SkillFileOperationInput = { op: "write"; path: string; content: string } | { op: "rename"; path: string; to: string } | { op: "delete"; path: string };
+
+export type SaveSkillFilesInput = {
+    /** 编辑开始时的 versionId；服务端版本已前进时返回 409 skill_version_conflict。 */
+    baseVersionId: string;
+    operations: SkillFileOperationInput[];
+};
+
+export type SaveSkillFilesResult = { skill: Skill; files: SkillPackageFile[]; changed: boolean };
+
+export const SKILL_VERSION_CONFLICT_REASON = "skill_version_conflict";
+
+/** 作者批量保存技能包文件：后端按顺序应用操作并原子生成新版本。 */
+export function saveSkillFiles(id: string, input: SaveSkillFilesInput) {
+    return http.put<SaveSkillFilesResult>(`/skills/${encodeURIComponent(id)}/files`, input).finally(invalidateAddedSkillsCache);
+}
+
 export function searchSkillFiles(id: string, query: string) {
     return http.get<{ results: SkillFileSearchResult[] }>(`/skills/${encodeURIComponent(id)}/search`, { params: { q: query } });
 }
@@ -356,4 +406,18 @@ export function likeSkill(id: string) {
 
 export function unlikeSkill(id: string) {
     return http.delete<{ skill: Skill }>(`/skills/${encodeURIComponent(id)}/like`);
+}
+
+/** 设置已安装技能是否允许 Agent 自动发现。 */
+export function setSkillAgentMode(id: string, mode: SkillAgentMode) {
+    return http.patch<{ skill: Skill }>(`/skills/${encodeURIComponent(id)}/agent-mode`, { mode }).finally(invalidateAddedSkillsCache);
+}
+
+export function listSkillRecommendations(signal?: AbortSignal) {
+    return http.get<SkillRecommendationList>("/skills/recommendations", { signal });
+}
+
+/** 安装某个行业的推荐技能；skillIds 为空时安装该行业全部推荐。 */
+export function installSkillRecommendations(industryId: string, skillIds: string[] = []) {
+    return http.post<SkillRecommendationInstallResult>(`/skills/recommendations/${encodeURIComponent(industryId)}/install`, { skillIds }).finally(invalidateAddedSkillsCache);
 }

@@ -121,7 +121,8 @@ func validateCloudAgentRuntime(run *model.CloudAgentExecution, state *cloudAgent
 		// execution identity. Durable rows are always validated below.
 		return nil
 	}
-	if state.Request.CanvasID == "" || state.Request.Prompt == "" || state.Request.PermissionMode == "" {
+	// CanvasID 可为空（平台级对话），由 validateCloudAgentRequest 保证无画布时不带画布上下文。
+	if state.Request.Prompt == "" || state.Request.PermissionMode == "" {
 		return errors.New("Agent runtime request is incomplete")
 	}
 	if err := validateCloudAgentRequest(&state.Request); err != nil {
@@ -145,8 +146,19 @@ func validateCloudAgentRuntime(run *model.CloudAgentExecution, state *cloudAgent
 	if state.Step < 0 || state.Generations < 0 || state.VideoSeconds < 0 {
 		return errors.New("Agent runtime budget or step is invalid")
 	}
-	if state.LessonEligibleToolSuccesses < 0 || state.RememberLessonSuccesses < 0 {
-		return errors.New("Agent lesson success counters are invalid")
+	if state.MemoryWriteCalls < 0 || state.SkillRecommendations < 0 || len(state.MarketSuggestions) > cloudAgentMarketSuggestionsMax {
+		return errors.New("Agent memory or skill counters are invalid")
+	}
+	if len(state.SkillVersions) > cloudAgentSkillPoolMax+cloudAgentSkillPinnedMax {
+		return errors.New("Agent runtime skill pool is invalid")
+	}
+	if utf8.RuneCountInString(state.Memory.Text) > agentMemorySnapshotMaxRunes || utf8.RuneCountInString(state.SkillHints) > agentMemorySnapshotMaxRunes {
+		return errors.New("Agent runtime context snapshot is invalid")
+	}
+	switch state.Memory.Mode {
+	case "", model.AgentMemoryDocumentModeAuto, model.AgentMemoryDocumentModeReview, model.AgentMemoryDocumentModeOff:
+	default:
+		return errors.New("Agent runtime memory mode is invalid")
 	}
 	if state.ConfirmationRounds < 0 || state.ConfirmationRounds > cloudAgentMaxConfirmationRounds {
 		return errors.New("Agent runtime confirmation round is invalid")
@@ -234,6 +246,9 @@ func validateCloudAgentRuntime(run *model.CloudAgentExecution, state *cloudAgent
 			return errors.New("Agent runtime media task is not attached to current call")
 		}
 	}
+	if err := validateCloudAgentMediaBatch(state); err != nil {
+		return err
+	}
 	if state.AutoPreparedMedia != nil {
 		if state.AutoPreparedCallHash == "" || state.CallIndex < 0 || state.CallIndex >= len(state.Calls) {
 			return errors.New("Agent runtime auto media preparation is invalid")
@@ -308,7 +323,7 @@ func validateCloudAgentPolicySnapshot(snapshot cloudAgentPolicySnapshot) error {
 	if snapshot.CapabilitySetVersion != cloudAgentCapabilitySetVersion {
 		return errors.New("Agent runtime capability contract is unsupported")
 	}
-	if snapshot.ReasoningMode != "off" && snapshot.ReasoningMode != "auto" && snapshot.ReasoningMode != "deep" {
+	if !validCloudAgentReasoningMode(snapshot.ReasoningMode) {
 		return errors.New("Agent runtime reasoning mode is invalid")
 	}
 	system, media, err := prompts.LoadAgentPolicies()
@@ -347,7 +362,7 @@ func validateCloudAgentPolicySnapshotStructure(snapshot cloudAgentPolicySnapshot
 	if snapshot.SystemPolicyVersion <= 0 || snapshot.MediaPolicyVersion <= 0 {
 		return errors.New("Agent runtime policy version is invalid")
 	}
-	if snapshot.ReasoningMode != "off" && snapshot.ReasoningMode != "auto" && snapshot.ReasoningMode != "deep" {
+	if !validCloudAgentReasoningMode(snapshot.ReasoningMode) {
 		return errors.New("Agent runtime reasoning mode is invalid")
 	}
 	for _, field := range []struct {

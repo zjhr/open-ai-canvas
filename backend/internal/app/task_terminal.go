@@ -60,6 +60,10 @@ type audioDurationTaskOutput interface {
 	AudioOutputDurationMs(task model.Task) (int64, error)
 }
 
+type videoProcessingTaskSettlement interface {
+	settleVideoProcessingBilling(task model.Task, providerRequestID string) (bool, error)
+}
+
 func newTaskTerminalCoordinator(s *Service) *taskTerminalCoordinator {
 	return &taskTerminalCoordinator{
 		repo:              s.repo,
@@ -224,6 +228,12 @@ func (c *taskTerminalCoordinator) ensureFailedAttemptLogged(task *model.Task, er
 }
 
 func (c *taskTerminalCoordinator) handleSuccess(task *model.Task) error {
+	return c.handleSuccessWithSettlement(task, nil)
+}
+
+// handleSuccessWithSettlement 与 handleSuccess 相同；settle 非 nil 时替换常规结算，
+// 用于订单已退款后再交付作品的场景。
+func (c *taskTerminalCoordinator) handleSuccessWithSettlement(task *model.Task, settle func() error) error {
 	c.finalizeReplay(task, model.TaskStatusSucceeded, "文本回放窗口更新失败")
 	var completionErr error
 	completedTask, fetchErr := c.repo.Task(task.ID)
@@ -238,6 +248,12 @@ func (c *taskTerminalCoordinator) handleSuccess(task *model.Task) error {
 		}
 	}
 	settleBilling := func() error {
+		// 视频处理（画质增强等）按秒订单按实际输出时长结算；拿不到时长时返回错误进入待核对。
+		if processing, ok := c.outputs.(videoProcessingTaskSettlement); ok && completedTask != nil && capabilityFromTaskType(task.Type) == "video" {
+			if handled, err := processing.settleVideoProcessingBilling(*completedTask, ""); handled || err != nil {
+				return err
+			}
+		}
 		if audioBilling, ok := c.billing.(audioDurationTaskBilling); ok && capabilityFromTaskType(task.Type) == "audio" {
 			orderReader, readerOK := c.billing.(billingOrderReader)
 			if readerOK {
@@ -265,6 +281,9 @@ func (c *taskTerminalCoordinator) handleSuccess(task *model.Task) error {
 			}
 		}
 		return c.billing.SettleBilling(task.BillingOrderID, "")
+	}
+	if settle != nil {
+		settleBilling = settle
 	}
 	if err := settleBilling(); err != nil {
 		uncertainErr := c.billing.MarkBillingUncertain(task.BillingOrderID, "生成成功但积分结算失败："+err.Error())

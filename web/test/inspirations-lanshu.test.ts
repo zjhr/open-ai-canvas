@@ -72,11 +72,12 @@ describe("无封面来源的渲染兜底", () => {
         const page = readFileSync(resolve(import.meta.dir, "../src/pages/inspirations/index.tsx"), "utf8");
         const detail = readFileSync(resolve(import.meta.dir, "../src/pages/inspirations/inspiration-detail-modal.tsx"), "utf8");
 
-        // 卡片：有图渲染 img，无图走文字分支（分类 + 规格 + 来源名）。
-        expect(page).toContain("{item.image ? (");
+        // 封面统一交给 InspirationCover：有图渲染 img，缺图或加载失败渲染占位，不留空破图框。
+        expect(page).toContain("<InspirationCover");
         expect(page).toContain("{item.ratio ? <span");
-        // 详情弹窗：没有封面就整块不渲染，不能留一个空的破图框。
-        expect(detail).toContain("{item.image ? (");
+        expect(detail).toContain("<InspirationCover");
+        // 兜底在组件内部实现，两处调用都因此覆盖无图来源（蓝书只有文字清单）。
+        expect(detail).toContain("if (!image || failed) return");
 
         // 来源筛选顺序必须覆盖新来源，否则条目筛不到。
         expect(page).toContain('"lanshu"');

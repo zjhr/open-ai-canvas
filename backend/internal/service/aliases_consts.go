@@ -3,6 +3,7 @@ package service
 import "yingce/backend/internal/app"
 
 const (
+	AgentAvatarBundleMaxBytes          = app.AgentAvatarBundleMaxBytes
 	Live2DMaxBytes                     = app.Live2DMaxBytes
 	AnnouncementImageMaxBytes          = app.AnnouncementImageMaxBytes
 	AppearanceAssetDarkLogo            = app.AppearanceAssetDarkLogo
@@ -47,6 +48,8 @@ const (
 	FeatureTaskCenter                  = app.FeatureTaskCenter
 	FeatureTimelineTranscription       = app.FeatureTimelineTranscription
 	FeatureVideoWorkbench              = app.FeatureVideoWorkbench
+	FeatureEcommerce                   = app.FeatureEcommerce
+	FeatureEcommerceVideo              = app.FeatureEcommerceVideo
 	ModelCatalogSourceSystem           = app.ModelCatalogSourceSystem
 	PaymentPluginAlipayPage            = app.PaymentPluginAlipayPage
 	PaymentPluginWeChatNative          = app.PaymentPluginWeChatNative
@@ -85,5 +88,6 @@ const (
 	ReasonUnavailable                  = app.ReasonUnavailable
 	SessionCookieName                  = app.SessionCookieName
 	SkillPackageUploadMaxBytes         = app.SkillPackageUploadMaxBytes
+	SkillPackageEditMaxBytes           = app.SkillPackageEditMaxBytes
 	WorkflowPluginRunningHub           = app.WorkflowPluginRunningHub
 )

@@ -1,6 +1,6 @@
 import { Vector3 } from "three";
 
-import { previsActorProfileForArchetype } from "@/lib/canvas/previs/previs-scene";
+import { previsMannequinExtents, resolvePrevisMannequinProfile } from "@/lib/canvas/previs/previs-mannequin";
 import type { PrevisObject } from "@/types/previs";
 
 export type PrevisFrameBounds = {
@@ -20,12 +20,14 @@ export function resolvePrevisObjectBox(object: PrevisObject): { min: Vector3; ma
     const [sx, sy, sz] = object.transform.scale;
     const actor = object.kind === "actor" || object.primitive === "character";
     if (actor) {
-        const profile = { ...previsActorProfileForArchetype(object.archetype || "adult"), ...(object.actorProfile || {}) };
-        const actorScaleY = Math.max(0.1, Math.abs(sy) * profile.height);
-        const actorHeight = object.pose === "sit" || object.pose === "squat" ? 2.05 : profile.accessory === "horns" ? 2.8 : 2.45;
-        const halfWidth = 0.78 * Math.max(0.8, profile.shoulderWidth) * Math.max(0.1, Math.abs(sx));
-        const halfDepth = 0.72 * Math.max(0.1, Math.abs(sz));
-        return { min: new Vector3(x - halfWidth, y - 0.12 * actorScaleY, z - halfDepth), max: new Vector3(x + halfWidth, y + actorHeight * actorScaleY, z + halfDepth) };
+        // 与标准人偶实际尺寸一致（成人约 1.83m）；坐/蹲降低，留出手臂伸展的余量。
+        const profile = resolvePrevisMannequinProfile(object.archetype || "adult", object.actorProfile);
+        const extents = previsMannequinExtents(profile);
+        const lowered = object.pose === "sit" || object.pose === "squat" || object.pose === "kneel_double" ? 0.68 : 1;
+        const height = extents.height * lowered * Math.max(0.1, Math.abs(sy));
+        const halfWidth = Math.max(extents.halfWidth, 0.35 * profile.height) * Math.max(0.1, Math.abs(sx));
+        const halfDepth = Math.max(extents.halfDepth, 0.3 * profile.height) * Math.max(0.1, Math.abs(sz));
+        return { min: new Vector3(x - halfWidth, y, z - halfDepth), max: new Vector3(x + halfWidth, y + height, z + halfDepth) };
     }
     const primitiveBounds: [number, number, number] = object.primitive === "sphere" ? [0.6, 0.6, 0.6] : object.primitive === "cylinder" ? [0.55, 0.8, 0.55] : object.primitive === "plane" ? [1.2, 0.05, 1.2] : [0.6, 0.6, 0.6];
     const half = new Vector3(primitiveBounds[0] * Math.max(0.1, Math.abs(sx)), primitiveBounds[1] * Math.max(0.1, Math.abs(sy)), primitiveBounds[2] * Math.max(0.1, Math.abs(sz)));
@@ -49,6 +51,23 @@ export function resolvePrevisZoomMinDistance(objects: PrevisObject[], target: Ve
         minDistance = Math.max(minDistance, farthest.length() + 0.35);
     });
     return minDistance;
+}
+
+/** 首次取景的默认留白倍数；只框一个非演员主体时收紧一些，主体不至于显得太小。 */
+export const PREVIS_INITIAL_FRAME_PADDING = 1.18;
+export const PREVIS_INITIAL_SINGLE_SUBJECT_PADDING = 1.05;
+
+/**
+ * 首次取景对准谁：有可见演员时只框演员；没有演员时排除背景板、地面这类平面（它们会撑大包围盒，
+ * 让产品主体显得很小），排除后为空则框全部可见对象（ids 为 undefined）。
+ */
+export function resolvePrevisInitialFrame(objects: PrevisObject[]): { ids?: Set<string>; padding: number } {
+    const visible = objects.filter((object) => object.visible);
+    const actors = visible.filter((object) => object.kind === "actor" || object.primitive === "character");
+    if (actors.length) return { ids: new Set(actors.map((object) => object.id)), padding: PREVIS_INITIAL_FRAME_PADDING };
+    const subjects = visible.filter((object) => object.primitive !== "plane");
+    if (!subjects.length) return { padding: PREVIS_INITIAL_FRAME_PADDING };
+    return { ids: new Set(subjects.map((object) => object.id)), padding: subjects.length === 1 ? PREVIS_INITIAL_SINGLE_SUBJECT_PADDING : PREVIS_INITIAL_FRAME_PADDING };
 }
 
 /** 可见对象（可选限定 ids）的联合包围盒，以及在给定 aspect/fov 下完整入画所需的距离。 */

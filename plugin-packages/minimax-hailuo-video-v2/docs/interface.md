@@ -22,9 +22,9 @@
 | `images` | media[] | 否 | image content blocks | 图片按显式 role 与 order 映射，不使用数组下标猜测。 |
 | `videos` | media[] | 否 | video content blocks | 参考视频按 role 与 order 映射。 |
 | `audios` | media[] | 否 | audio content blocks | 参考音频或声音按 role 与 order 映射。 |
-| `duration` | integer | 是 | `request.duration` | 4-15 秒。 |
+| `duration` | integer | 是 | `request.duration` | 4-30 秒。 |
 | `resolution` | string | 否 | `request.resolution` | 默认 `768P`；实际枚举按模型 profile。 |
-| `ratio` | string | 否 | `request.aspectRatio` | 首尾帧模式为 `adaptive`，其余默认 `16:9`。 |
+| `ratio` | string | 否 | `request.aspectRatio` | 只有首尾帧、没有其他参考图时为 `adaptive`；首尾帧混用参考图时用请求比例，未传则为 `adaptive`；其余默认 `16:9`。 |
 | `aigc_watermark` | boolean | 否 | `request.watermark` | 是否带 AIGC 水印。 |
 | `generate_audio` | boolean | 否 | `request.generateAudio` | 模型支持时生成音频。 |
 | `seed` | integer | 否 | `providerOptions.minimax-video.seed` | 随机种子。 |
@@ -34,8 +34,8 @@
 
 - 图片最多 9 张、视频最多 3 个、音频最多 3 个。
 - 首帧和尾帧各最多 1 张；尾帧不能脱离首帧。
-- 首尾帧模式不能混入 `reference_image/subject_reference/style_reference`。
-- duration 超出 4-15 秒直接失败，不静默裁剪。
+- 首帧、尾帧可以与 `reference_image/subject_reference/style_reference` 同时提交（H3 按 role 区分，秘塔等中转同样支持）；混用时 `ratio` 使用请求比例，避免上游按横版参考图出片。
+- duration 超出 4-30 秒直接失败，不静默裁剪。
 
 ## 中转兼容边界
 
@@ -62,7 +62,7 @@
   "apiVersion": "yingce.plugin/v2",
   "id": "minimax-hailuo-video-v2",
   "name": "MiniMax Hailuo Video V2 / H3",
-  "version": "2.0.1",
+  "version": "2.0.4",
   "author": "MiniMax / 影策",
   "description": "MiniMax / Hailuo V2 视频生成协议，保留首帧、尾帧、参考图、视频和音频角色语义。",
   "documentation": "<当前插件的完整 documentation，由 README.md 与 docs/interface.md 拼接而成；为避免 JSON 递归，此处不重复展开正文。>",
@@ -150,10 +150,25 @@
               "12",
               "13",
               "14",
-              "15"
+              "15",
+              "16",
+              "17",
+              "18",
+              "19",
+              "20",
+              "21",
+              "22",
+              "23",
+              "24",
+              "25",
+              "26",
+              "27",
+              "28",
+              "29",
+              "30"
             ],
             "mapping": "duration",
-            "description": "4-15 秒。"
+            "description": "4-30 秒。"
           },
           {
             "name": "resolution",
@@ -165,7 +180,7 @@
             "name": "aspectRatio",
             "type": "string",
             "mapping": "ratio",
-            "description": "首尾帧模式自动使用 adaptive；其他模式使用用户比例。"
+            "description": "只有首尾帧、没有其他参考图时使用 adaptive；首尾帧混用参考图或其他模式使用请求比例。"
           },
           {
             "name": "watermark",
@@ -248,12 +263,12 @@
                     {
                       "$ref": "request.duration"
                     },
-                    15
+                    30
                   ]
                 }
               ]
             },
-            "message": "MiniMax H3 duration 必须在 4-15 秒之间"
+            "message": "MiniMax H3 duration 必须在 4-30 秒之间"
           },
           {
             "assert": {
@@ -359,68 +374,6 @@
               ]
             },
             "message": "MiniMax H3 使用尾帧时必须同时提供首帧"
-          },
-          {
-            "assert": {
-              "$not": {
-                "$and": [
-                  {
-                    "$gt": [
-                      {
-                        "$len": {
-                          "$filter": {
-                            "from": {
-                              "$ref": "request.images"
-                            },
-                            "as": "image",
-                            "where": {
-                              "$in": [
-                                {
-                                  "$ref": "image.role"
-                                },
-                                [
-                                  "first_frame",
-                                  "last_frame"
-                                ]
-                              ]
-                            }
-                          }
-                        }
-                      },
-                      0
-                    ]
-                  },
-                  {
-                    "$gt": [
-                      {
-                        "$len": {
-                          "$filter": {
-                            "from": {
-                              "$ref": "request.images"
-                            },
-                            "as": "image",
-                            "where": {
-                              "$in": [
-                                {
-                                  "$ref": "image.role"
-                                },
-                                [
-                                  "reference_image",
-                                  "subject_reference",
-                                  "style_reference"
-                                ]
-                              ]
-                            }
-                          }
-                        }
-                      },
-                      0
-                    ]
-                  }
-                ]
-              }
-            },
-            "message": "MiniMax H3 首尾帧模式不能混入普通角色或风格参考图"
           }
         ],
         "create": {
@@ -535,29 +488,63 @@
             "ratio": {
               "$if": {
                 "condition": {
-                  "$gt": [
+                  "$and": [
                     {
-                      "$len": {
-                        "$filter": {
-                          "from": {
-                            "$ref": "request.images"
-                          },
-                          "as": "image",
-                          "where": {
-                            "$in": [
-                              {
-                                "$ref": "image.role"
+                      "$gt": [
+                        {
+                          "$len": {
+                            "$filter": {
+                              "from": {
+                                "$ref": "request.images"
                               },
-                              [
-                                "first_frame",
-                                "last_frame"
-                              ]
-                            ]
+                              "as": "image",
+                              "where": {
+                                "$in": [
+                                  {
+                                    "$ref": "image.role"
+                                  },
+                                  [
+                                    "first_frame",
+                                    "last_frame"
+                                  ]
+                                ]
+                              }
+                            }
+                          }
+                        },
+                        0
+                      ]
+                    },
+                    {
+                      "$eq": [
+                        {
+                          "$len": {
+                            "$ref": "request.images"
+                          }
+                        },
+                        {
+                          "$len": {
+                            "$filter": {
+                              "from": {
+                                "$ref": "request.images"
+                              },
+                              "as": "image",
+                              "where": {
+                                "$in": [
+                                  {
+                                    "$ref": "image.role"
+                                  },
+                                  [
+                                    "first_frame",
+                                    "last_frame"
+                                  ]
+                                ]
+                              }
+                            }
                           }
                         }
-                      }
-                    },
-                    0
+                      ]
+                    }
                   ]
                 },
                 "then": "adaptive",
@@ -566,7 +553,38 @@
                     {
                       "$ref": "request.aspectRatio"
                     },
-                    "16:9"
+                    {
+                      "$if": {
+                        "condition": {
+                          "$gt": [
+                            {
+                              "$len": {
+                                "$filter": {
+                                  "from": {
+                                    "$ref": "request.images"
+                                  },
+                                  "as": "image",
+                                  "where": {
+                                    "$in": [
+                                      {
+                                        "$ref": "image.role"
+                                      },
+                                      [
+                                        "first_frame",
+                                        "last_frame"
+                                      ]
+                                    ]
+                                  }
+                                }
+                              }
+                            },
+                            0
+                          ]
+                        },
+                        "then": "adaptive",
+                        "else": "16:9"
+                      }
+                    }
                   ]
                 }
               }

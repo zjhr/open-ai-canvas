@@ -99,8 +99,13 @@ func (s *Service) enqueueCloudAgentTask(run *model.CloudAgentExecution, state *c
 	}
 	if media != nil {
 		requested, _ := req.Input["config"].(map[string]any)
-		resolved, _ := input["config"].(map[string]any)
-		if err := validateCloudAgentResolvedMediaOptions(requested, resolved); err != nil {
+		if cloudAgentPreparedSpecUnchanged(prepared, task) {
+			// 解析结果与批准时固定的 ResolvedHash 一致，说明提交的规格就是用户批准的规格。
+			// 此时再逐字段比较，比的只是"批准参数→任务配置"的二次换算，换算不对称就会误报，
+			// 让模型重新申请、用户重复审批。哈希未覆盖的参考图同步开关仍单独核对。
+			requested = map[string]any{"videoArkPrivateAssetUpload": requested["videoArkPrivateAssetUpload"]}
+		}
+		if err := validateCloudAgentResolvedMediaOptions(requested, input); err != nil {
 			return s.cloudAgentMediaError(run, state, "admission", false, false, err)
 		}
 	}
@@ -427,6 +432,16 @@ func (s *Service) DecideCloudAgentApproval(userID, id, approvalID, decision, rea
 	if run.Status != "waiting_approval" || state.Approval == nil || state.Approval.ID != approvalID {
 		return creationConflict("审批不存在或已过期")
 	}
+	// 批准后的收尾由本请求负责，先登记再落库：决定一落库运行就是 running，Pi 会话据登记
+	// 让出执行权，不会抢在收尾前用原始提示词另起一轮。同一审批的并发请求只有一个能登记，
+	// 其余只记录决定。见 cloud_agent_approval_followup.go。
+	followUp := false
+	if decision == "approve" {
+		key := cloudAgentApprovalFollowUpKey(id, approvalID)
+		if followUp = s.claimCloudAgentApprovalFollowUp(key); followUp {
+			defer s.releaseCloudAgentApprovalFollowUp(key)
+		}
+	}
 	// 只在记录审批决定的这次写入期间持锁：随后的工具执行（advanceCloudAgentTool）
 	// 会自己获取 storageMu，持锁到函数返回会造成自锁。旧 Pi 会话退出前仍可能
 	// 写入最后一个事件，因此审批决定采用重读后 CAS 重试。
@@ -443,7 +458,9 @@ func (s *Service) DecideCloudAgentApproval(userID, id, approvalID, decision, rea
 			}
 			if previous, ok := state.Decisions[approvalID]; ok {
 				if previous == decision && (settings == nil || state.DecisionSettings[approvalID] == creationHash(settings)) {
-					return nil
+					// 并发的同一决定已经先落库：决定不再重写，收尾仍由登记方完成。
+					err = nil
+					break
 				}
 				return cloudAgentDecisionConflict(previous)
 			}
@@ -478,15 +495,25 @@ func (s *Service) DecideCloudAgentApproval(userID, id, approvalID, decision, rea
 				// invocation. Make it terminal before the scheduler can advance the
 				// pending call; no tool result, canvas mutation, generation task or
 				// follow-up model request may be produced from this decision.
+				rejectionText := "已拒绝本次操作，本次操作未执行。"
+				rejectionEndText := "本轮已结束：已拒绝本次操作"
+				if state.Approval != nil && cloudAgentMediaTool(state.Approval.Call.Function.Name) {
+					rejectionText = "已拒绝本次生成，草稿节点仍保留在画布中；未提交任务、未产生扣费。你可以继续编辑后重新申请。"
+					rejectionEndText = "本轮已结束：已拒绝本次生成"
+				}
 				current.Status = "rejected"
 				current.FailureMessage = ""
 				state.Approval = nil
-				cloudAgentDropInterjections(id, "本轮已结束：已拒绝本次生成", &state)
+				if state.MediaBatch != nil && state.MediaBatch.ID == approvalID {
+					// 被拒绝的批次从未提交任务；草稿节点保留在画布上，批次状态直接丢弃。
+					state.MediaBatch = nil
+				}
+				cloudAgentDropInterjections(id, rejectionEndText, &state)
 				state.event(id, "approval_decided", map[string]any{
 					"approvalId": approvalID,
 					"decision":   decision,
 					"reason":     reason,
-					"text":       "已拒绝本次生成，草稿节点仍保留在画布中；未提交任务、未产生扣费。你可以继续编辑后重新申请。",
+					"text":       rejectionText,
 				})
 				if err := repo.ReleaseCloudAgentResourceLeases(userID, approvalID); err != nil {
 					return err
@@ -507,43 +534,10 @@ func (s *Service) DecideCloudAgentApproval(userID, id, approvalID, decision, rea
 			break
 		}
 	}
-	if err != nil || decision != "approve" {
+	if err != nil || decision != "approve" || !followUp {
 		return err
 	}
-	// Approval only releases the paused tool. Execute it once in the Go business
-	// executor, then give the durable result back to Pi; Go never asks a model
-	// what to do next.
-	var mediaTaskID string
-	for attempt := 0; attempt < 8; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 20 * time.Millisecond)
-		}
-		latest, err := s.repo.CloudAgent(userID, id)
-		if err != nil {
-			return err
-		}
-		state, err = cloudAgentDecode(latest)
-		if err != nil {
-			return err
-		}
-		err = s.advanceCloudAgentTool(latest, &state)
-		if !errors.Is(err, repository.ErrCreationConflict) {
-			if err != nil {
-				return err
-			}
-			mediaTaskID = state.MediaTaskID
-			break
-		}
-		if attempt == 7 {
-			return err
-		}
-	}
-	if mediaTaskID == "" {
-		return s.resumeCloudAgentAfterApproval(userID, id, &state)
-	}
-	// 媒体生成可能要几分钟：审批请求立即返回，等待与回写在后台完成后再恢复运行。
-	s.startApprovedCloudAgentMediaWaiter(userID, id, mediaTaskID)
-	return nil
+	return s.continueApprovedCloudAgentCall(userID, id, approvalID)
 }
 
 func (s *Service) finishApprovedCloudAgentMedia(ctx context.Context, userID, id, mediaTaskID string) error {
@@ -585,6 +579,14 @@ func (s *Service) finishApprovedCloudAgentMedia(ctx context.Context, userID, id,
 // 直接装进恢复提示，模型就有了继续操作所需的最新状态；同批排在审批之后被中止的调用也
 // 一并说明，避免恢复后发出空回合。
 func cloudAgentApprovalResumePrompt(state *cloudAgentRuntime) string {
+	if reason, ok := cloudAgentLastAdmissionFailure(state); ok {
+		prompt := "用户已批准刚才等待审批的生成，但提交前校验未通过：" + reason +
+			"\n这次没有提交任务，也没有扣费。需要继续时按原因修正参数或重新读取后再调用一次，新的调用仍会等用户审批；不再需要就向用户说明原因。"
+		if state.CallIndex < len(state.Calls) {
+			prompt += " 你上一步同批发出的其余调用未被执行，仍需要请重发。"
+		}
+		return prompt
+	}
 	if receipt, ok := cloudAgentLastToolReceipt(state); ok {
 		prompt := "用户已批准刚才等待审批的操作，已执行完成，结果如下：\n" + receipt +
 			"\n该操作不要重复调用。结果里是目标对象的最新状态（含 snapshotHash）；继续写同一对象必须基于它，否则会因快照过期被拒绝。"
@@ -594,6 +596,27 @@ func cloudAgentApprovalResumePrompt(state *cloudAgentRuntime) string {
 		return prompt
 	}
 	return "用户已批准刚才等待审批的操作。业务执行器已执行一次；请根据最新工具结果继续，不要重复调用该操作。"
+}
+
+// cloudAgentLastAdmissionFailure 在历史末尾是"提交前就被拒绝"的工具结果时返回原因。
+// 这种结果没有创建任务，不能套用"已执行一次、不要重复调用"的通用恢复提示。
+func cloudAgentLastAdmissionFailure(state *cloudAgentRuntime) (string, bool) {
+	if state == nil || len(state.Canonical.Messages) == 0 {
+		return "", false
+	}
+	message := state.Canonical.Messages[len(state.Canonical.Messages)-1]
+	if stringField(message, "role") != "tool" {
+		return "", false
+	}
+	var result map[string]any
+	if json.Unmarshal([]byte(stringField(message, "content")), &result) != nil {
+		return "", false
+	}
+	reason := strings.TrimSpace(stringValue(result["error"]))
+	if submitted, ok := result["taskSubmitted"].(bool); reason == "" || !ok || submitted || stringValue(result["phase"]) != "admission" {
+		return "", false
+	}
+	return truncateRunes(reason, 240), true
 }
 
 // cloudAgentLastToolReceipt 取 canonical 历史末尾最近一条工具结果的可读摘要。
@@ -764,6 +787,12 @@ func (s *Service) CancelCloudAgent(ctx context.Context, userID, id string) error
 		// Persist intent independently of the transcript. Retrying also repairs
 		// legacy cancelled rows that crashed before cancelling their children.
 		state, decodeErr := cloudAgentDecode(run)
+		mediaContinues := false
+		if decodeErr == nil && state.MediaTaskID != "" {
+			if mediaTask, readErr := s.repo.TaskForUser(userID, state.MediaTaskID); readErr == nil {
+				mediaContinues = s.cloudAgentMediaContinuesAfterStop(&model.CloudAgentExecution{Status: "cancelled"}, mediaTask)
+			}
+		}
 		err = s.repo.MutateCloudAgent(userID, id, run.Revision, func(current *model.CloudAgentExecution, _ *repository.Repository) error {
 			firstCancellation := current.Status != "cancelled"
 			current.Status = "cancelled"
@@ -771,7 +800,11 @@ func (s *Service) CancelCloudAgent(ctx context.Context, userID, id string) error
 			if decodeErr == nil {
 				current.CanvasID, current.ActiveTaskID, current.MediaTaskID = state.Request.CanvasID, state.ActiveTaskID, state.MediaTaskID
 				if firstCancellation {
-					state.event(id, "run_cancelled", map[string]any{"source": "user_request", "activeTaskId": state.ActiveTaskID, "mediaTaskId": state.MediaTaskID, "text": "用户取消接口已接收请求，正在取消关联任务"})
+					text := "已停止本轮，正在取消尚未提交的任务"
+					if mediaContinues {
+						text = "已停止本轮，Agent 不再继续操作；已提交的生成任务已开始计费，会继续完成并回写画布"
+					}
+					state.event(id, "run_cancelled", map[string]any{"source": "user_request", "activeTaskId": state.ActiveTaskID, "mediaTaskId": state.MediaTaskID, "mediaContinues": mediaContinues, "text": text})
 					cloudAgentDropInterjections(id, "本轮已结束：用户已取消本轮", &state)
 					if saveErr := cloudAgentSave(current, &state); saveErr != nil {
 						// Cancellation must still work if the transcript is oversized.

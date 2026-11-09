@@ -58,6 +58,106 @@ describe("canvas generation copy metadata", () => {
         expect(source.metadata?.generationEffectKeys).toEqual(["attach-node:source-task:source:0"]);
     });
 
+    test("视频参数变体清除旧视频和结果附属字段，但保留生成参数与引用", () => {
+        const source: CanvasNodeData = {
+            id: "source",
+            type: CanvasNodeType.Video,
+            title: "镜头",
+            position: { x: 0, y: 0 },
+            width: 340,
+            height: 240,
+            metadata: {
+                content: "video-url",
+                previewContent: "preview-url",
+                videoPreview: { content: "video-preview", storageKey: "resource:preview" },
+                storageKey: "resource:video",
+                mimeType: "video/mp4",
+                bytes: 1024,
+                durationMs: 5000,
+                waveform: [0.1, 0.8],
+                waveformVersion: 1,
+                hasAudio: true,
+                naturalWidth: 1280,
+                naturalHeight: 720,
+                assetId: "asset-video",
+                producedModel: "model-used",
+                producedModelCandidate: "model-pending",
+                subtitleEntries: [{ index: 0, startMs: 0, endMs: 1000, text: "旧字幕" }],
+                subtitleHighlights: [{ entryIndex: 0, start: 0, end: 1, highlightText: "旧", sourceText: "旧字幕" }],
+                subtitleUpdatedAt: "2026-11-01T00:00:00Z",
+                prompt: "保留这个提示词",
+                composerContent: "保留编辑器内容",
+                model: "model-next",
+                size: "1280x720",
+                seconds: "5",
+                vquality: "720p",
+                generateAudio: "true",
+                watermark: "false",
+                references: ["resource:reference"],
+                referenceAssetNodeIds: ["reference-node"],
+                videoStartFrameNodeId: "start-frame",
+                videoEndFrameNodeId: "end-frame",
+                dramaRef: { projectId: "drama", kind: "segment", id: "segment-1" },
+                versionOfNodeId: "source-root",
+                versionLabel: "B",
+                versionPrimary: false,
+                generationResultPlacement: "new-version",
+                generationEffectKeys: ["old-effect"],
+                status: "success",
+            },
+        };
+
+        const metadata = isolateCopiedNodeMetadata(source, new Map([[source.id, "copy"]]), { clearMediaResult: true, preserveExternalReferences: true, clearDramaBinding: true });
+
+        expect(metadata).toMatchObject({
+            prompt: "保留这个提示词",
+            composerContent: "保留编辑器内容",
+            model: "model-next",
+            size: "1280x720",
+            seconds: "5",
+            vquality: "720p",
+            generateAudio: "true",
+            watermark: "false",
+            references: ["resource:reference"],
+            referenceAssetNodeIds: ["reference-node"],
+            videoStartFrameNodeId: "start-frame",
+            videoEndFrameNodeId: "end-frame",
+            copiedFromNodeId: "source",
+            generationResultPlacement: "replace-node",
+            status: "idle",
+        });
+        for (const field of [
+            "content",
+            "previewContent",
+            "videoPreview",
+            "storageKey",
+            "mimeType",
+            "bytes",
+            "durationMs",
+            "waveform",
+            "waveformVersion",
+            "hasAudio",
+            "naturalWidth",
+            "naturalHeight",
+            "assetId",
+            "producedModel",
+            "producedModelCandidate",
+            "subtitleEntries",
+            "subtitleHighlights",
+            "subtitleUpdatedAt",
+        ] as const) {
+            expect(metadata[field]).toBeUndefined();
+        }
+        expect(metadata.generationEffectKeys).toBeUndefined();
+        expect(metadata.dramaRef).toBeUndefined();
+        expect(metadata.versionOfNodeId).toBeUndefined();
+        expect(metadata.versionLabel).toBeUndefined();
+        expect(metadata.versionPrimary).toBeUndefined();
+        expect(source.metadata?.content).toBe("video-url");
+        expect(source.metadata?.dramaRef?.id).toBe("segment-1");
+        expect(source.metadata?.subtitleEntries).toHaveLength(1);
+    });
+
     test("复制到副本的入边继续解析为同一张参考图", () => {
         const reference: CanvasNodeData = {
             id: "reference",
@@ -82,5 +182,110 @@ describe("canvas generation copy metadata", () => {
 
         expect(context.prompt).toBe("保持角色一致");
         expect(context.referenceImages.map((image) => image.id)).toEqual([reference.id]);
+    });
+});
+
+describe("batch table copy references", () => {
+    const table: CanvasNodeData = {
+        id: "table",
+        type: CanvasNodeType.BatchTable,
+        title: "批量创作",
+        position: { x: 0, y: 0 },
+        width: 1280,
+        height: 560,
+        metadata: {
+            batchTable: {
+                operation: "creative",
+                concurrency: 2,
+                referenceMode: "cells",
+                aiGenerated: true,
+                referenceColumns: [
+                    { id: "portrait", label: "人物" },
+                    { id: "scene", label: "场景" },
+                    { id: "style", label: "风格" },
+                ],
+                textColumns: [{ id: "requirements", label: "要求", type: "text" }],
+                rows: [
+                    {
+                        id: "row-1",
+                        enabled: true,
+                        inputNodeIds: ["portrait-image", "", "portrait-image"],
+                        textNodeIds: ["note"],
+                        prompt: "保持人物一致",
+                        outputNodeId: "result",
+                        generatedInputSignature: "old-generation",
+                        cells: { requirements: "近景" },
+                    },
+                ],
+            },
+        },
+    };
+
+    test("只复制表格保留外部素材及空列，但不接管原表的生成结果", () => {
+        const metadata = isolateCopiedNodeMetadata(table, new Map([["table", "table-copy"]]));
+        const copied = metadata.batchTable!;
+
+        expect(copied.referenceMode).toBe("cells");
+        expect(copied.rows[0].inputNodeIds).toEqual(["portrait-image", "", "portrait-image"]);
+        expect(copied.rows[0].textNodeIds).toEqual(["note"]);
+        expect(copied.rows[0].outputNodeId).toBeUndefined();
+        expect(copied.rows[0].generatedInputSignature).toBeUndefined();
+        expect(table.metadata?.batchTable?.rows[0].outputNodeId).toBe("result");
+        expect(table.metadata?.batchTable?.rows[0].generatedInputSignature).toBe("old-generation");
+    });
+
+    test("同时复制表、素材和结果后，列位置、格子与输出归属全部指向同组副本", () => {
+        const idMap = new Map([
+            ["table", "table-copy"],
+            ["portrait-image", "portrait-copy"],
+            ["note", "note-copy"],
+            ["result", "result-copy"],
+        ]);
+        const copied = isolateCopiedNodeMetadata(table, idMap).batchTable!;
+        const result: CanvasNodeData = {
+            id: "result",
+            type: CanvasNodeType.Image,
+            title: "成品",
+            position: { x: 1400, y: 0 },
+            width: 340,
+            height: 240,
+            metadata: { content: "result.png", batchSourceNodeId: "table", batchRowId: "row-1", batchOperation: "creative", batchInputNodeIds: ["portrait-image", "", "portrait-image"] },
+        };
+        const copiedResult = isolateCopiedNodeMetadata(result, idMap);
+
+        expect(copied.rows[0].id).toBe("row-1");
+        expect(copied.referenceColumns?.map((column) => column.id)).toEqual(["portrait", "scene", "style"]);
+        expect(copied.rows[0].inputNodeIds).toEqual(["portrait-copy", "", "portrait-copy"]);
+        expect(copied.rows[0].textNodeIds).toEqual(["note-copy"]);
+        expect(copied.rows[0].outputNodeId).toBe("result-copy");
+        expect(copiedResult.batchSourceNodeId).toBe("table-copy");
+        expect(copiedResult.batchRowId).toBe("row-1");
+        expect(copiedResult.batchInputNodeIds).toEqual(["portrait-copy", "", "portrait-copy"]);
+
+        copied.referenceColumns![0].label = "副本人物";
+        copied.rows[0].cells!.requirements = "远景";
+        copied.rows[0].inputNodeIds[0] = "new-image";
+        expect(table.metadata?.batchTable?.referenceColumns?.[0].label).toBe("人物");
+        expect(table.metadata?.batchTable?.rows[0].cells?.requirements).toBe("近景");
+        expect(table.metadata?.batchTable?.rows[0].inputNodeIds[0]).toBe("portrait-image");
+    });
+
+    test("单独复制成品不再归属原任务行，仍保留素材引用", () => {
+        const result: CanvasNodeData = {
+            id: "result",
+            type: CanvasNodeType.Image,
+            title: "成品",
+            position: { x: 0, y: 0 },
+            width: 340,
+            height: 240,
+            metadata: { content: "result.png", batchSourceNodeId: "table", batchRowId: "row-1", batchOperation: "creative", batchInputNodeIds: ["portrait-image"] },
+        };
+        const copied = isolateCopiedNodeMetadata(result, new Map([["result", "result-copy"]]));
+
+        expect(copied.batchSourceNodeId).toBeUndefined();
+        expect(copied.batchRowId).toBeUndefined();
+        expect(copied.batchOperation).toBeUndefined();
+        expect(copied.batchInputNodeIds).toEqual(["portrait-image"]);
+        expect(copied.content).toBe("result.png");
     });
 });

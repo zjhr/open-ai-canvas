@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
-import { AlertCircle, BookOpenCheck, CheckCircle2, ChevronRight, Clapperboard, Copy, Download, Image as ImageIcon, Lock, Maximize2, Music2, Pencil, RefreshCw, ScanSearch, Settings2, Star, Trash2, Type, UserRound, Video, WandSparkles } from "lucide-react";
+import type { CSSProperties, ReactNode } from "react";
+import { agentNodeEntranceDelay } from "@/lib/canvas/agent-canvas-entrance";
+import { AlertCircle, BookOpenCheck, Check, ChevronRight, Clapperboard, Copy, Download, History, Image as ImageIcon, Lock, Maximize2, Music2, Pencil, RefreshCw, RotateCcw, ScanSearch, Settings2, ShieldAlert, ShieldCheck, Star, Trash2, Type, UserRound, Video } from "lucide-react";
+import { translate } from "@/i18n";
+import { arkAssetMatchesImage, arkCertificationBadgeKey, arkCertificationExpired } from "@/lib/ark-assets";
+import { useAssetStore } from "@/stores/use-asset-store";
 
 import { useCanvasNodeActions } from "./canvas-node-action-context";
 import { CanvasImageLayerControls } from "./canvas-image-layer-controls";
@@ -9,6 +13,7 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import type { CanvasNodeRenderLOD } from "@/lib/canvas/canvas-node-lod";
 import { canvasConnectionTilt } from "@/lib/canvas/canvas-connection-tilt";
 import { storyboardMinNodeHeight } from "@/lib/canvas/canvas-storyboard-layout";
+import { currentMediaVersion, hasMediaVersionHistory } from "@/lib/canvas/canvas-media-versions";
 import { resourceStorageLabel, resourceStorageLocation, resourceStorageTitle } from "@/lib/canvas/resource-storage-status";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
 import { CanvasNodeType, type CanvasNodeData, type CanvasNodeTypeId, type Position } from "@/types/canvas";
@@ -17,7 +22,10 @@ import { ART_CRITIQUE_NODE_TYPE } from "@/lib/art-critique/contracts";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import type { NodeResizeCorner } from "@/lib/canvas/node-resize-geometry";
 import { useCanvasNodeResize } from "./use-canvas-node-resize";
-import { CanvasNodeContent, CanvasNodeImageInfo, CanvasNodeProducedModel } from "./canvas-node-content";
+import { useCanvasConnectionTilt } from "./use-canvas-connection-tilt";
+import { useCanvasNodeResizeStyle } from "./canvas-node-resize-motion";
+import { canvasNodeRendersStatusContent, canvasNodeUsesCustomContent, CanvasNodeContent, CanvasNodeImageInfo, CanvasNodeProducedModel } from "./canvas-node-content";
+import { canvasNodeCanResyncTask } from "@/lib/canvas/canvas-task-state";
 
 type CanvasTheme = (typeof canvasThemes)[keyof typeof canvasThemes];
 
@@ -31,8 +39,9 @@ type CanvasNodeProps = {
     isRelated: boolean;
     isFocusRelated: boolean;
     isConnectionTarget: boolean;
+    isConnecting?: boolean;
     connectionApproach?: Position;
-    forceInputVisible?: boolean;
+    forceInputMounted?: boolean;
     showImageInfo: boolean;
     disableMediaEffects?: boolean;
     readOnly?: boolean;
@@ -79,8 +88,9 @@ export const CanvasNode = React.memo(function CanvasNode({
     isRelated,
     isFocusRelated,
     isConnectionTarget,
+    isConnecting = false,
     connectionApproach,
-    forceInputVisible = false,
+    forceInputMounted = false,
     showImageInfo,
     disableMediaEffects = false,
     readOnly = false,
@@ -120,7 +130,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     const [isEditingContent, setIsEditingContent] = useState(false);
     const [isEditingTitle, setIsEditingTitle] = useState(false);
     const [titleDraft, setTitleDraft] = useState(data.title);
-    const { download: downloadNode, duplicate: duplicateNode, deleteNode } = useCanvasNodeActions();
+    const { download: downloadNode, duplicate: duplicateNode, deleteNode, openMediaVersions, dramaStaleNodeIds, refreshFromDrama } = useCanvasNodeActions();
     const hasImageContent = data.type === CanvasNodeType.Image && Boolean(data.metadata?.content);
     const hasVideoContent = data.type === CanvasNodeType.Video && Boolean(data.metadata?.content);
     const hasAudioContent = data.type === CanvasNodeType.Audio && Boolean(data.metadata?.content || data.metadata?.storageKey);
@@ -131,8 +141,11 @@ export const CanvasNode = React.memo(function CanvasNode({
     const showProducedModel = showImageInfo && hasMediaContent && Boolean(producedModelStored);
     const isBatchRoot = data.type === CanvasNodeType.Image && Boolean(data.metadata?.isBatchRoot) && (batchCount > 1 || Boolean(data.metadata?.imageLayerGroup));
     const isBatchChild = data.type === CanvasNodeType.Image && Boolean(data.metadata?.batchRootId);
-    const showStatusTrack = Boolean(resourceLabel || data.metadata?.locked || isBatchRoot || (isBatchChild && !readOnly) || (hasMediaContent && !readOnly));
+    const showVersionBadge = !readOnly && Boolean(openMediaVersions) && hasMediaVersionHistory(data);
+    const dramaStale = !readOnly && Boolean(dramaStaleNodeIds?.has(data.id));
+    const showStatusTrack = Boolean(resourceLabel || data.metadata?.locked || isBatchRoot || (isBatchChild && !readOnly) || (hasMediaContent && !readOnly) || showVersionBadge || dramaStale);
     const isActive = isConnectionTarget || isSelected || isFocusRelated;
+    const showConnectionRails = !isConnecting && (hovered || isSelected || isFocusRelated);
     const effectiveRenderLOD: CanvasNodeRenderLOD = renderLOD === "full" || hovered || isEditingContent || isEditingTitle || mediaActive ? "full" : renderLOD;
     const showChrome = effectiveRenderLOD === "full";
     const nodeState = isFocusRelated ? "focus" : isConnectionTarget ? "target" : isSelected ? "selected" : isRelated && !isBatchChild ? "related" : "idle";
@@ -140,7 +153,15 @@ export const CanvasNode = React.memo(function CanvasNode({
     const assetTags = data.metadata?.assetTags?.filter((tag) => tag.trim()) || [];
     const scriptMinHeight = data.type === CanvasNodeType.Script ? storyboardMinNodeHeight(data.metadata?.storyboardComposerHeight) : null;
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const nodeRef = useRef<HTMLDivElement>(null);
+    const shellRef = useRef<HTMLDivElement>(null);
+    const resizeMotion = useCanvasNodeResizeStyle(nodeRef, data, dragOffset);
     const handleResizePointerDown = useCanvasNodeResize(data, scale, scriptMinHeight, onResize, readOnly);
+    const generationStatus = data.metadata?.status;
+    const generationRevealing = useGenerationReveal(generationStatus, disableMediaEffects);
+    const statusShownInContent = canvasNodeRendersStatusContent(data, { isBatchRoot, isEditingContent, hasCustomRenderer: Boolean(renderNodeContent) });
+    const statusBadge = generationStatus === "success" ? (generationRevealing ? generationStatus : undefined) : (generationStatus === "loading" || generationStatus === "error") && !statusShownInContent ? generationStatus : undefined;
+    const canResyncTask = canvasNodeCanResyncTask(data.metadata);
 
     useEffect(() => {
         const textarea = textareaRef.current;
@@ -189,18 +210,25 @@ export const CanvasNode = React.memo(function CanvasNode({
 
     const connectionTilt = isConnectionTarget && !disableMediaEffects && !dragOffset
         ? canvasConnectionTilt(data, connectionApproach) : undefined;
+    useCanvasConnectionTilt(nodeRef, shellRef, connectionTilt);
+    // 只在挂载时读一次：Agent 刚建的节点带着错开的延迟入场，之后的重渲染不再重放。
+    const [entranceDelay] = useState(() => agentNodeEntranceDelay(data.id));
 
     return (
         <div
+            ref={nodeRef}
             data-node-id={data.id}
+            data-popover-anchor-container
             data-node-lod={effectiveRenderLOD}
+            data-agent-enter={entranceDelay === null ? undefined : "true"}
             className={`node-element absolute flex select-none flex-col ${dragOffset ? "cursor-grabbing" : data.type === CanvasNodeType.Drawing ? "cursor-pointer" : "cursor-default"} ${isSelected && data.type === CanvasNodeType.Video ? "z-[var(--z-node-toolbar)]" : isSelected || isFocusRelated || isConnectionTarget ? "z-[var(--z-node-active)]" : "z-[var(--z-node)]"}`}
             style={{
                 transform: `translate(${data.position.x + (dragOffset?.x || 0)}px, ${data.position.y + (dragOffset?.y || 0)}px)`,
                 width: data.width,
                 height: data.height,
                 contain: "layout style",
-            }}
+                ...(entranceDelay === null ? {} : { "--agent-enter-delay": `${entranceDelay}ms` }),
+            } as CSSProperties}
             onMouseEnter={() => {
                 setHovered(true);
                 onHoverStart(data.id);
@@ -210,6 +238,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                 onHoverEnd(data.id);
             }}
             onContextMenu={(event) => onContextMenu(event, data.id)}
+            onPointerDownCapture={() => resizeMotion?.finishAll()}
         >
             {showChrome ? <NodeExternalHeader
                 node={data}
@@ -220,14 +249,16 @@ export const CanvasNode = React.memo(function CanvasNode({
                 editing={isEditingTitle}
                 draft={titleDraft}
                 theme={theme}
-                onDraftChange={setTitleDraft}
+                onDraftChange={(value) => { setTitleDraft(value); onTitleChange?.(data.id, value); }}
                 onEdit={() => setIsEditingTitle(true)}
                 onCommit={commitTitle}
                 onCancel={() => { setTitleDraft(data.title); setIsEditingTitle(false); }}
             /> : null}
             <div
+                ref={shellRef}
                 className="canvas-node-shell relative h-full w-full overflow-visible rounded-[var(--node-radius)]"
                 data-node-state={nodeState}
+                data-generation-reveal={generationRevealing ? "true" : undefined}
                 data-connection-tilt={connectionTilt ? "true" : undefined}
                 data-state={data.metadata?.status || (isActive ? "active" : isRelated ? "related" : "idle")}
                 style={{
@@ -236,9 +267,6 @@ export const CanvasNode = React.memo(function CanvasNode({
                     border: isComposerNode ? "0" : "1px solid transparent",
                     boxShadow: isComposerNode || !showChrome ? "none" : isSelected || isFocusRelated ? theme.node.hoverShadow : theme.node.shadow,
                     outline: !showChrome && isActive ? `1px solid ${theme.node.activeStroke}` : undefined,
-                    "--connection-tilt-x": `${connectionTilt?.rotateX || 0}deg`,
-                    "--connection-tilt-y": `${connectionTilt?.rotateY || 0}deg`,
-                    transformOrigin: connectionTilt?.origin,
                 } as React.CSSProperties}
                 onMouseDown={(event) => onMouseDown(event, data.id)}
                 onDoubleClick={(event) => {
@@ -272,7 +300,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                         onOpenTextEditor?.(data);
                         return;
                     }
-                    if (readOnly || data.type !== CanvasNodeType.Text) return;
+                    if (readOnly || data.metadata?.locked || data.type !== CanvasNodeType.Text) return;
                     event.stopPropagation();
                     setIsEditingContent(true);
                 }}
@@ -290,15 +318,14 @@ export const CanvasNode = React.memo(function CanvasNode({
                         } as React.CSSProperties
                     }
                 >
-                    {/* 节点状态徽章（对应 #97 决策2：左上角 loading/success/error，近距离确认信号）*/}
-                    {showChrome && data.metadata?.status && data.metadata.status !== "idle" && data.type !== CanvasNodeType.Frame ? (
-                        <NodeStatusBadge status={data.metadata.status} />
-                    ) : null}
+                    {/* 节点状态徽章（对应 #97 决策2）：内容区已展示生成中/失败时不重复；完成徽章只在本次刚生成完时短暂出现。 */}
+                    {showChrome && statusBadge && data.type !== CanvasNodeType.Frame ? <NodeStatusBadge status={statusBadge} /> : null}
                     <CanvasNodeContent
                         node={data}
                         theme={theme}
                         renderLOD={effectiveRenderLOD}
                         isEditingContent={isEditingContent}
+                        contentReadOnly={readOnly || Boolean(data.metadata?.locked)}
                         textareaRef={textareaRef}
                         isBatchRoot={isBatchRoot}
                         batchCount={batchCount}
@@ -343,10 +370,13 @@ export const CanvasNode = React.memo(function CanvasNode({
                 {showChrome && showStatusTrack ? (
                     <div className="absolute right-3 top-3 z-[var(--node-z-overlay)] flex min-w-0 items-center justify-end gap-1 max-w-[calc(100%-24px)]">
                         {resourceLabel && data.type !== CanvasNodeType.Image ? <ResourceLabelBadge reference={resourceLabel} theme={theme} /> : null}
+                        {data.type === CanvasNodeType.Image && hasImageContent && data.metadata?.assetId ? <ArkCertificationBadge assetId={data.metadata.assetId} storageKey={data.metadata.storageKey} /> : null}
                         {hasMediaContent && !readOnly ? <ResourceStorageBadge storageKey={data.metadata?.storageKey} active={isActive} theme={theme} /> : null}
                         {isBatchRoot ? <BatchToggleBadge count={batchCount} expanded={batchExpanded} theme={theme} onToggle={() => onToggleBatch?.(data.id)} /> : null}
                         {data.metadata?.imageLayerGroup && !readOnly ? <CanvasImageLayerControls node={data} /> : null}
                         {isBatchChild && !data.metadata?.imageLayer && !data.metadata?.layerExtraction && !readOnly ? <BatchPrimaryBadge visible={batchPrimary || hovered || isSelected} selected={batchPrimary} theme={theme} onSelect={() => onSetBatchPrimary?.(data)} /> : null}
+                        {dramaStale ? <DramaStaleBadge theme={theme} onRefresh={refreshFromDrama ? () => refreshFromDrama(data) : undefined} /> : null}
+                        {showVersionBadge ? <MediaVersionBadge node={data} theme={theme} onOpen={() => openMediaVersions?.(data)} /> : null}
                         {data.metadata?.locked ? <NodeLockBadge theme={theme} /> : null}
                     </div>
                 ) : null}
@@ -363,8 +393,8 @@ export const CanvasNode = React.memo(function CanvasNode({
                             {hasImageContent && !data.metadata?.imageLayer && !data.metadata?.layerExtraction ? (
                                 <BatchChildActionButton theme={theme} label={batchPrimary ? "当前主图" : "设为主图"} icon={<Star className={`size-3.5 ${batchPrimary ? "fill-current" : ""}`} style={{ color: theme.accent.primary }} />} onClick={() => onSetBatchPrimary?.(data)} />
                             ) : null}
-                            {data.metadata?.status === "error" && data.metadata.resourceReloadAvailable ? <BatchChildActionButton theme={theme} label="重新加载资源" icon={<Download className="size-3.5" />} onClick={() => onReloadResource?.(data)} /> : null}
-                            {data.metadata?.status === "error" ? <BatchChildActionButton theme={theme} label={data.metadata?.taskCanRecoverMedia ? "重试保存" : "重新生成"} icon={<RefreshCw className="size-3.5" />} onClick={() => onRetry?.(data)} /> : null}
+                            {data.metadata?.status === "error" && canResyncTask ? <BatchChildActionButton theme={theme} label="重新获取结果" icon={<RefreshCw className="size-3.5" />} onClick={() => onReloadResource?.(data)} /> : null}
+                            {data.metadata?.status === "error" ? <BatchChildActionButton theme={theme} label={data.metadata?.taskCanRecoverMedia ? "重新保存" : "重新生成"} icon={<RotateCcw className="size-3.5" />} onClick={() => onRetry?.(data)} /> : null}
                             {data.metadata?.status === "error" ? <BatchChildActionButton theme={theme} label="删除" icon={<Trash2 className="size-3.5" />} danger onClick={() => deleteNode?.(data)} /> : null}
                         </div>
                     </div>
@@ -393,8 +423,8 @@ export const CanvasNode = React.memo(function CanvasNode({
                 </> : null}
             </div>
 
-            {(showChrome || forceInputVisible) && !readOnly && data.type !== CanvasNodeType.Script && data.type !== CanvasNodeType.BatchTable ? <ConnectionSideRail side="left" scale={scale} theme={theme} visible={hovered || forceInputVisible} onPointerDown={(event, anchorRatio) => onConnectStart(event, data.id, "target", undefined, anchorRatio)} /> : null}
-            {showChrome && !readOnly && data.type !== CanvasNodeType.Script && data.type !== CanvasNodeType.Config && showOutputConnection ? <ConnectionSideRail side="right" scale={scale} theme={theme} visible={hovered} onPointerDown={(event, anchorRatio) => onConnectStart(event, data.id, "source", undefined, anchorRatio)} /> : null}
+            {(showChrome || forceInputMounted) && !readOnly && data.type !== CanvasNodeType.Script && data.type !== CanvasNodeType.BatchTable ? <ConnectionSideRail side="left" scale={scale} theme={theme} visible={showConnectionRails} onPointerDown={(event, anchorRatio) => onConnectStart(event, data.id, "target", undefined, anchorRatio)} /> : null}
+            {showChrome && !readOnly && data.type !== CanvasNodeType.Script && data.type !== CanvasNodeType.Config && showOutputConnection ? <ConnectionSideRail side="right" scale={scale} theme={theme} visible={showConnectionRails} onPointerDown={(event, anchorRatio) => onConnectStart(event, data.id, "source", undefined, anchorRatio)} /> : null}
 
         </div>
     );
@@ -412,15 +442,17 @@ function areCanvasNodePropsEqual(previous: CanvasNodeProps, next: CanvasNodeProp
         previous.isRelated === next.isRelated &&
         previous.isFocusRelated === next.isFocusRelated &&
         previous.isConnectionTarget === next.isConnectionTarget &&
+        previous.isConnecting === next.isConnecting &&
         previous.connectionApproach?.x === next.connectionApproach?.x &&
         previous.connectionApproach?.y === next.connectionApproach?.y &&
-        previous.forceInputVisible === next.forceInputVisible &&
+        previous.forceInputMounted === next.forceInputMounted &&
         previous.showImageInfo === next.showImageInfo &&
         previous.disableMediaEffects === next.disableMediaEffects &&
         previous.readOnly === next.readOnly &&
         previous.resourceLabel === next.resourceLabel &&
         previous.mentionReferences === next.mentionReferences &&
-        previous.renderNodeContent === next.renderNodeContent &&
+        // 页面级 renderNodeContent 随任意业务状态重建；图片/视频/文本节点不调用它，比较它会让整屏节点陪跑重渲染。
+        (previous.renderNodeContent === next.renderNodeContent || !canvasNodeUsesCustomContent(next.data)) &&
         previous.drawingProjectId === next.drawingProjectId &&
         previous.batchCount === next.batchCount &&
         previous.batchPreviewNodes === next.batchPreviewNodes &&
@@ -455,8 +487,23 @@ function areCanvasNodePropsEqual(previous: CanvasNodeProps, next: CanvasNodeProp
 
 function ResourceLabelBadge({ reference, theme }: { reference: CanvasResourceReference; theme: CanvasTheme }) {
     return (
-        <span className="pointer-events-none min-w-0 max-w-28 truncate rounded-md px-1.5 py-1 text-[var(--fs-tiny)] font-medium leading-none" style={{ background: reference.active ? theme.accent.primary : "rgba(0,0,0,.35)", color: reference.active ? theme.accent.onPrimary : "#ffffff", opacity: reference.active ? 1 : 0.75 }} title={reference.title || reference.label}>
+        <span className="pointer-events-none min-w-0 max-w-28 truncate rounded-md px-2 py-1 text-[var(--fs-tiny)] font-medium leading-none" style={{ background: reference.active ? theme.accent.primary : "rgba(0,0,0,.35)", color: reference.active ? theme.accent.onPrimary : "#ffffff", opacity: reference.active ? 1 : 0.75 }} title={reference.title || reference.label}>
             {reference.label}
+        </span>
+    );
+}
+
+/** 图片节点绑定的素材库图片已通过方舟认证时显示【方舟真人认证】等标识；节点换过图片后认证不再对应，标识随之消失。 */
+function ArkCertificationBadge({ assetId, storageKey }: { assetId: string; storageKey?: string }) {
+    const asset = useAssetStore((state) => state.assets.find((item) => item.id === assetId));
+    const certification = asset?.arkCertification;
+    if (!asset || asset.kind !== "image" || !certification || !asset.arkAssetId || !arkAssetMatchesImage(asset, storageKey)) return null;
+    const expired = arkCertificationExpired(certification);
+    const title = `${translate("library.ark.canvas.tooltip", { group: certification.groupName || "", id: asset.arkAssetId })}\n${translate("library.ark.canvas.usage")}`;
+    return (
+        <span className="pointer-events-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[var(--fs-tiny)] font-medium leading-none" style={{ background: "rgba(0,0,0,.55)", color: "#ffffff" }} title={title}>
+            {expired ? <ShieldAlert aria-hidden className="size-3" style={{ color: "var(--status-warning)" }} /> : <ShieldCheck aria-hidden className="size-3" style={{ color: "var(--status-success)" }} />}
+            {translate(arkCertificationBadgeKey(certification))}
         </span>
     );
 }
@@ -465,9 +512,32 @@ function ResourceStorageBadge({ storageKey, active, theme }: { storageKey?: stri
     const location = resourceStorageLocation(storageKey);
     const background = active ? (location === "local" ? "rgba(245,158,11,.9)" : theme.accent.primary) : "rgba(0,0,0,.35)";
     return (
-        <span className="pointer-events-auto shrink-0 rounded-md px-1.5 py-1 text-[var(--fs-tiny)] font-medium leading-none" style={{ background, color: active && location !== "local" ? theme.accent.onPrimary : "#ffffff", opacity: active ? 1 : 0.75 }} title={resourceStorageTitle(storageKey)}>
+        <span className="pointer-events-auto shrink-0 rounded-md px-2 py-1 text-[var(--fs-tiny)] font-medium leading-none" style={{ background, color: active && location !== "local" ? theme.accent.onPrimary : "#ffffff", opacity: active ? 1 : 0.75 }} title={resourceStorageTitle(storageKey)}>
             {resourceStorageLabel(storageKey)}
         </span>
+    );
+}
+
+function MediaVersionBadge({ node, theme, onOpen }: { node: CanvasNodeData; theme: CanvasTheme; onOpen: () => void }) {
+    const total = node.metadata?.mediaVersions?.length || 0;
+    const current = currentMediaVersion(node);
+    const label = current ? `当前 V${current.number}，共 ${total} 个版本，打开版本历史` : `共 ${total} 个历史版本，打开版本历史`;
+    return (
+        <button type="button" className="canvas-node-tool-button inline-flex h-7 shrink-0 items-center gap-1 rounded-md border px-2 text-[var(--fs-tiny)] font-semibold tabular-nums backdrop-blur-md" style={{ background: `${theme.toolbar.panel}d9`, borderColor: `${theme.toolbar.border}cc`, color: theme.node.text }} title={label} aria-label={label} onClick={(event) => { event.stopPropagation(); onOpen(); }} onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+            <History className="size-3 opacity-70" />
+            <span className="leading-none">{current ? `V${current.number}` : "V–"}<span className="opacity-50">/{total}</span></span>
+        </button>
+    );
+}
+
+// 精修画布：短剧侧已有更新的版本（例如流水线重新生成或在制作台上传），点击换成短剧当前的媒体。
+function DramaStaleBadge({ theme, onRefresh }: { theme: CanvasTheme; onRefresh?: () => void }) {
+    const label = "短剧侧已更新，点击同步最新版本";
+    return (
+        <button type="button" className="canvas-node-tool-button inline-flex h-7 shrink-0 items-center gap-1 rounded-md border px-2 text-[var(--fs-tiny)] font-semibold backdrop-blur-md disabled:cursor-default" style={{ background: `${theme.toolbar.panel}d9`, borderColor: "color-mix(in srgb, var(--status-warning) 45%, transparent)", color: theme.node.text }} title={label} aria-label={label} disabled={!onRefresh} onClick={(event) => { event.stopPropagation(); onRefresh?.(); }} onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+            <span className="size-1.5 rounded-full" style={{ background: "var(--status-warning)" }} aria-hidden />
+            <span className="leading-none">短剧已更新</span>
+        </button>
     );
 }
 
@@ -517,7 +587,7 @@ function AssetTagBadges({ tags, theme }: { tags: string[]; theme: (typeof canvas
             {tags.map((tag, index) => (
                 <span
                     key={`${tag}-${index}`}
-                    className="max-w-full truncate rounded-md border px-1.5 py-1 text-[var(--fs-tiny)] font-medium leading-none backdrop-blur-sm"
+                    className="max-w-full truncate rounded-md border px-2 py-1 text-[var(--fs-tiny)] font-medium leading-none backdrop-blur-sm"
                     style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
                 >
                     {tag.trim()}
@@ -590,7 +660,8 @@ function NodeExternalHeader({ node, scale, dimensionLabel, active, editable, edi
                     <input
                         autoFocus
                         value={draft}
-                        className="h-6 min-w-20 max-w-[190px] flex-1 truncate rounded bg-transparent px-1.5 text-xs font-medium outline-none"
+                        readOnly={!editable}
+                        className="h-6 min-w-20 max-w-[190px] flex-1 truncate rounded bg-transparent px-2 text-xs font-medium outline-none"
                         style={{ background: "transparent", color: theme.node.text }}
                         onChange={(event) => onDraftChange(event.target.value)}
                         onFocus={(event) => event.currentTarget.select()}
@@ -629,46 +700,55 @@ function nodeTypeIcon(node: CanvasNodeData) {
     return Type;
 }
 
-// 节点状态徽章（对应 #97 决策2：左上角状态指示，loading/success/error）
+// 刚生成完成的出现动画窗口：覆盖图片解码等待和完成徽章的停留，过后撤掉标记，避免重复播放。
+const GENERATION_REVEAL_MS = 2600;
+
+/**
+ * 只有本次挂载期间亲眼看到“生成中 → 完成”的节点才播放出现动画与完成徽章；
+ * 刷新页面、滚动回视口或切换 LOD 重新挂载的已完成节点保持静止。
+ */
+function useGenerationReveal(status: string | undefined, disabled: boolean) {
+    const [observedStatus, setObservedStatus] = useState(status);
+    const [revealing, setRevealing] = useState(false);
+    if (observedStatus !== status) {
+        setObservedStatus(status);
+        if (observedStatus === "loading" && status === "success" && !disabled) setRevealing(true);
+    }
+    useEffect(() => {
+        if (!revealing) return;
+        const timer = window.setTimeout(() => setRevealing(false), GENERATION_REVEAL_MS);
+        return () => window.clearTimeout(timer);
+    }, [revealing]);
+    return revealing;
+}
+
+// 节点状态徽章（对应 #97 决策2：左上角状态指示）。生成中/失败只用于内容区不自带状态的节点。
 function NodeStatusBadge({ status }: { status: "loading" | "success" | "error" }) {
     if (status === "loading") {
         return (
-            <div
-                className="pointer-events-none absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full px-2 py-0.5 backdrop-blur-sm"
-                style={{ background: "color-mix(in oklch, var(--status-loading) 20%, transparent)", color: "var(--status-loading)" }}
-                aria-label="生成中"
-            >
-                <span className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--status-loading)" }} />
-                <span className="text-[var(--fs-micro)] font-medium leading-none">生成中</span>
+            <div className="canvas-node-status-chip" data-tone="loading" role="status">
+                <span className="canvas-node-status-chip-dot" aria-hidden="true" />
+                生成中
             </div>
         );
     }
     if (status === "error") {
         return (
-            <div
-                className="pointer-events-none absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full px-2 py-0.5 backdrop-blur-sm"
-                style={{ background: "color-mix(in oklch, var(--status-error) 20%, transparent)", color: "var(--status-error)" }}
-                aria-label="生成失败"
-            >
-                <AlertCircle className="size-3" strokeWidth={2} />
-                <span className="text-[var(--fs-micro)] font-medium leading-none">失败</span>
+            <div className="canvas-node-status-chip" data-tone="error">
+                <AlertCircle aria-hidden="true" strokeWidth={2} />
+                生成失败
             </div>
         );
     }
-    // success：短暂闪现后淡出（由 CSS animation 控制，2s 后消失）
     return (
-        <div
-            className="pointer-events-none absolute left-2 top-2 z-20 flex items-center gap-1 rounded-full px-2 py-0.5 backdrop-blur-sm"
-            style={{ background: "color-mix(in oklch, var(--status-success) 20%, transparent)", color: "var(--status-success)", animation: "canvas-status-success-fade 2s ease-out forwards" }}
-            aria-label="生成完成"
-        >
-            <CheckCircle2 className="size-3" strokeWidth={2} />
-            <span className="text-[var(--fs-micro)] font-medium leading-none">完成</span>
+        <div className="canvas-node-status-chip" data-tone="success" role="status">
+            <Check aria-hidden="true" strokeWidth={2.5} />
+            已完成
         </div>
     );
 }
 
-function ConnectionSideRail({ side, scale, theme, visible = false, onPointerDown }: { side: "left" | "right"; scale: number; theme: CanvasTheme; visible?: boolean; onPointerDown: (event: React.PointerEvent, anchorRatio: number) => void }) {
+function ConnectionSideRail({ side, scale, theme, visible, onPointerDown }: { side: "left" | "right"; scale: number; theme: CanvasTheme; visible: boolean; onPointerDown: (event: React.PointerEvent, anchorRatio: number) => void }) {
     const handleRef = useRef<HTMLSpanElement>(null);
     const [railHovered, setRailHovered] = useState(false);
     const inverseScale = 1 / Math.max(scale, 0.05);
@@ -708,7 +788,7 @@ function ConnectionSideRail({ side, scale, theme, visible = false, onPointerDown
         <button
             type="button"
             data-canvas-connection-rail={side}
-            className={`group pointer-events-auto absolute top-1/2 z-[var(--node-z-overlay)] flex -translate-y-1/2 items-center justify-center touch-none cursor-crosshair rounded-full outline-none transition-opacity duration-150 ${visible || railHovered ? "opacity-100" : "opacity-0"}`}
+            className={`group pointer-events-auto absolute top-1/2 z-[var(--node-z-overlay)] flex -translate-y-1/2 items-center justify-center touch-none cursor-crosshair rounded-full outline-none transition-opacity duration-150 focus-visible:opacity-100 ${visible || railHovered ? "opacity-100" : "opacity-0"}`}
             style={{ width: railSize, height: `min(100%, ${railSize}px)`, cursor: "crosshair", ...(side === "left" ? { right: "100%" } : { left: "100%" }) }}
             onPointerEnter={(event) => {
                 setRailHovered(true);
@@ -724,7 +804,7 @@ function ConnectionSideRail({ side, scale, theme, visible = false, onPointerDown
         >
             <span
                 ref={handleRef}
-                className="absolute left-1/2 top-1/2 block transition-transform duration-[80ms] ease-out group-hover:brightness-125 group-focus-visible:brightness-125"
+                className="absolute left-1/2 top-1/2 block transition-transform duration-150 ease-out group-hover:brightness-125 group-focus-visible:brightness-125"
                 style={{
                     width: handleSize,
                     height: handleSize,

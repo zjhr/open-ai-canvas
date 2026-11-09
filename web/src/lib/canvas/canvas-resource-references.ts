@@ -50,6 +50,15 @@ export function canvasToolMentionToken(toolId: number, label: string, type: stri
 
 const TOOL_REF_PATTERN = /@\[tool:(\w+):(\d+):([^:\]]+):([^\]]+)\]/g;
 
+function decodeToolMentionLabel(label: string) {
+    try {
+        return decodeURIComponent(label);
+    } catch {
+        // Keep readable text for malformed imported labels.
+        return label;
+    }
+}
+
 /** 从文本中解析所有 @[tool:type:ID:label:icon] 令牌，返回去重的工具引用。 */
 export function parseToolMentionTokens(text: string): { type: string; toolId: number; label: string; icon: string }[] {
     const results: { type: string; toolId: number; label: string; icon: string }[] = [];
@@ -59,11 +68,21 @@ export function parseToolMentionTokens(text: string): { type: string; toolId: nu
         const identity = `${match[1]}:${toolId}`;
         if (seen.has(identity)) continue;
         seen.add(identity);
-        let label = match[3];
-        try { label = decodeURIComponent(label); } catch { /* Keep readable text for malformed imported labels. */ }
-        results.push({ type: match[1], toolId, label, icon: match[4] });
+        results.push({ type: match[1], toolId, label: decodeToolMentionLabel(match[3]), icon: match[4] });
     }
     return results;
+}
+
+/**
+ * 提示词的单行可读摘要，用于节点标题等展示：工具标签换成名称，节点、素材、技能、附件这类只含内部 ID 的令牌去掉。
+ * 提交生成仍使用原提示词。
+ */
+export function canvasPromptSummaryText(prompt: string) {
+    return prompt
+        .replace(TOOL_REF_PATTERN, (_token, _type: string, _id: string, label: string) => ` ${decodeToolMentionLabel(label)} `)
+        .replace(/@\[(?:node|asset|skill|attachment):[^\]]*\]/gu, " ")
+        .replace(/\s+/gu, " ")
+        .trim();
 }
 
 export function removeToolMentions(prompt: string, type: string) {
@@ -80,6 +99,27 @@ export function applyToolMention(prompt: string, tool: { id: number; type: strin
 
 export function canvasNodeMentionToken(nodeId: string) {
     return `@[node:${nodeId}]`;
+}
+
+const ASSET_MENTION_PATTERN = /@\[asset:([^\]]+)\]/g;
+const ASSET_ID_MAX_BYTES = 80;
+
+/**
+ * 提示词里 @[asset:ID] 只存在于字符串中，不会出现在 assetId 字段里。
+ * 打开画布和生成前据此按需拉取素材；超出服务端 ID 约束的令牌直接忽略，交给生成校验报错。
+ */
+export function canvasPromptAssetMentionIds(text: string): string[] {
+    if (!text.includes("@[asset:")) return [];
+    const encoder = new TextEncoder();
+    const ids = [...text.matchAll(ASSET_MENTION_PATTERN)]
+        .map((match) => match[1])
+        .filter((id) => id === id.trim() && encoder.encode(id).length <= ASSET_ID_MAX_BYTES);
+    return [...new Set(ids)];
+}
+
+/** 只有角色卡能作为生成引用；场景、道具设定尚无图片或角色合同。旧记录缺分类时与服务端一致按角色处理。 */
+export function isCharacterEntityAsset(asset: Asset) {
+    return asset.kind === "entity" && (asset.category ?? "character") === "character";
 }
 
 /** 这些工具类型的标签在提示词中唯一，再次选择时直接覆盖旧标签而不是追加。 */
@@ -259,7 +299,8 @@ function rewriteCanvasPromptAfterReferenceChange(prompt: string, previousReferen
     return value === prompt ? prompt : compactRemovedCanvasMentionPrompt(value);
 }
 
-export function applyCanvasConnectionPromptSync(previousNodes: CanvasNodeData[], previousConnections: CanvasConnection[], nextNodes: CanvasNodeData[], nextConnections: CanvasConnection[]) {
+export function applyCanvasConnectionPromptSync(previousNodes: CanvasNodeData[], previousConnections: CanvasConnection[], nextNodes: CanvasNodeData[], nextConnections: CanvasConnection[], options: { clearPromptTemplate?: boolean } = {}) {
+    nextNodes = detachRemovedBatchCellConnections(nextNodes, previousConnections, nextConnections);
     const previousMap = buildCanvasNodeMentionReferenceMap(previousNodes, previousConnections, nextNodes);
     const nextMap = buildCanvasNodeMentionReferenceMap(nextNodes, nextConnections, nextNodes);
     let changed = false;
@@ -268,7 +309,7 @@ export function applyCanvasConnectionPromptSync(previousNodes: CanvasNodeData[],
         const nextPrompt = rewriteCanvasPromptAfterReferenceChange(previousPrompt, previousMap.get(node.id) || [], nextMap.get(node.id) || []);
         if (nextPrompt === previousPrompt) return node;
         changed = true;
-        return writeCanvasNodePrompt(node, nextPrompt);
+        return writeCanvasNodePrompt(node, nextPrompt, options);
     });
     return changed ? mapped : nextNodes;
 }
@@ -336,7 +377,8 @@ function compactRemovedCanvasMentionPrompt(value: string) {
 
 export function buildAssetMentionReferences(assets: Asset[]): CanvasResourceReference[] {
     return assets.flatMap((asset): CanvasResourceReference[] => {
-        if (asset.kind === "model") return [];
+        // @ 菜单只列生成阶段能解析的素材，否则选中后必然报“没有对应的资源”。
+        if (asset.kind === "model" || (asset.kind === "entity" && !isCharacterEntityAsset(asset))) return [];
         const kind: CanvasResourceKind = asset.kind === "entity" ? "character" : asset.kind;
         const previewUrl = asset.kind === "image" ? asset.data.dataUrl : asset.kind === "video" ? canvasVideoAssetPreviewUrl(asset.data.url, asset.coverUrl) : asset.coverUrl;
         const text = asset.kind === "text" ? asset.data.content : undefined;
@@ -585,3 +627,4 @@ export function buildToolMentionReference(toolId: number, label: string, type: s
         mentionToken: canvasToolMentionToken(toolId, label, type, icon),
     };
 }
+import { detachRemovedBatchCellConnections } from "./canvas-batch-references";
