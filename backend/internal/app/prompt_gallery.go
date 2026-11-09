@@ -372,12 +372,21 @@ func mapPromptGalleryRow(descriptor promptGallerySourceDescriptor, item promptGa
 }
 
 // PromptGallerySearch 检索远端索引，并把来源/分类 facet 一起返回。
+//
+// facet 按同一份条件计算（每个维度排除自己），所以下拉里的数字等于“再选中它”能筛出的条数；
+// 前端不必为了拿到正确计数而多发一次请求。
 func (s *Service) PromptGallerySearch(req PromptGallerySearchRequest) (PromptGallerySearchResult, error) {
-	rows, total, err := s.repo.SearchPromptGalleryPrompts(repository.PromptGallerySearchQuery{
+	filters := repository.PromptGallerySearchQuery{
 		Keyword:  req.Keyword,
 		Mode:     req.Mode,
 		SourceID: req.SourceID,
 		Category: req.Category,
+	}
+	rows, total, err := s.repo.SearchPromptGalleryPrompts(repository.PromptGallerySearchQuery{
+		Keyword:  filters.Keyword,
+		Mode:     filters.Mode,
+		SourceID: filters.SourceID,
+		Category: filters.Category,
 		Limit:    req.Limit,
 		Offset:   req.Offset,
 	})
@@ -404,7 +413,7 @@ func (s *Service) PromptGallerySearch(req PromptGallerySearchRequest) (PromptGal
 	}
 
 	result := PromptGallerySearchResult{Items: items, Total: total}
-	sources, categories, err := s.repo.PromptGalleryFacets()
+	sources, categories, err := s.repo.PromptGalleryFacets(filters)
 	if err != nil {
 		return result, err
 	}

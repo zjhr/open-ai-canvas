@@ -361,8 +361,13 @@ export type PromptGallerySearchPlan = PromptGalleryQuery & {
 export type PromptGalleryProvider = {
     /** 按条件检索并分页；offset/limit 由调用方给。 */
     search: (query: PromptGalleryQuery) => Promise<PromptGallerySearchResult>;
-    /** 来源与分类筛选项。目录加载失败时抛错，由宿主显示错误态。 */
-    facets?: () => Promise<{ sources: PromptGalleryFacet[]; categories: PromptGalleryFacet[] }>;
+    /**
+     * 来源与分类筛选项。目录加载失败时抛错，由宿主显示错误态。
+     *
+     * 传入当前筛选时按筛选结果计数（每个维度排除自己），使下拉里的数字等于「再选中它」
+     * 能筛出的条数；不传则返回整库计数。宿主应在筛选变化时重新调用。
+     */
+    facets?: (query?: PromptGalleryQuery) => Promise<{ sources: PromptGalleryFacet[]; categories: PromptGalleryFacet[] }>;
     /**
      * 把自然语言需求解析成检索条件；没有 ai.text 权限时宿主会拒绝调用。
      * base 是用户当前已选条件，模型没给出的维度回落到它。

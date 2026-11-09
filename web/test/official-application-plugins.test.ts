@@ -28,6 +28,7 @@ describe("official application plugin classification", () => {
         const ids = [...OFFICIAL_APPLICATION_PLUGIN_IDS];
         expect(new Set(ids).size).toBe(ids.length);
         expect(ids).toHaveLength(7);
+        expect(ids).toContain("prompt-gallery");
         expect(ids).toContain("user-feedback");
     });
 

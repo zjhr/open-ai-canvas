@@ -63,12 +63,17 @@ function matchesQuery(item: PromptGalleryItem, query: PromptGalleryQuery, keywor
     return true;
 }
 
+/** 关键词归一化：检索与分面计数共用同一份口径，避免两处判断不一致。 */
+function galleryKeyword(query: PromptGalleryQuery | undefined): string {
+    return query?.keyword?.trim().toLocaleLowerCase() ?? "";
+}
+
 /**
  * 过滤 + 稳定排序 + 分页。
  * 收藏条目排在最前：用户收藏过的提示词通常就是要反复用的那几条。
  */
 export function searchPromptGalleryItems(items: PromptGalleryItem[], query: PromptGalleryQuery): { items: PromptGalleryItem[]; total: number } {
-    const keyword = query.keyword?.trim().toLocaleLowerCase() ?? "";
+    const keyword = galleryKeyword(query);
     const matched = items.filter((item) => matchesQuery(item, query, keyword));
     const sorted = [...matched].sort((left, right) => Number(Boolean(right.favorite)) - Number(Boolean(left.favorite)));
     const offset = Math.max(0, Math.floor(query.offset ?? 0));
@@ -96,21 +101,43 @@ export function planMergedPage(localTotal: number, offset: number, limit: number
     };
 }
 
-/** 来源与分类筛选项。只保留有条目的来源，避免下拉里出现选了必定空的选项。 */export function promptGalleryFacets(items: PromptGalleryItem[]): { sources: PromptGalleryFacet[]; categories: PromptGalleryFacet[] } {
-    const sourceCounts = new Map<string, PromptGalleryFacet>();
-    const categoryCounts = new Map<string, PromptGalleryFacet>();
+/**
+ * 分面计数的取样集合：按当前筛选过滤，但忽略正在统计的那个维度。
+ *
+ * 算来源时忽略已选来源、算分类时忽略已选分类：否则下拉里会只剩当前已选项，
+ * 用户也无法在两个维度之间来回切换。其余条件（类型/关键词/收藏）必须与检索一致，
+ * 否则就会出现「下拉标着 8000 条，选中后只出来 2000 条」。
+ */
+function facetSample(items: PromptGalleryItem[], query: PromptGalleryQuery | undefined, ignore: "sourceId" | "category"): PromptGalleryItem[] {
+    if (!query) return items;
+    const keyword = galleryKeyword(query);
+    const scoped: PromptGalleryQuery = { ...query, [ignore]: undefined };
+    return items.filter((item) => matchesQuery(item, scoped, keyword));
+}
+
+/** 统计单个维度的计数。只保留有条目的取值，避免下拉里出现选了必定空的选项。 */
+function countFacets(items: PromptGalleryItem[], dimension: "sourceId" | "category"): PromptGalleryFacet[] {
+    const counts = new Map<string, PromptGalleryFacet>();
     for (const item of items) {
-        if (item.sourceId) {
-            const current = sourceCounts.get(item.sourceId);
-            sourceCounts.set(item.sourceId, { id: item.sourceId, label: item.sourceLabel || item.sourceId, count: (current?.count ?? 0) + 1 });
-        }
-        if (item.category) {
-            const current = categoryCounts.get(item.category);
-            categoryCounts.set(item.category, { id: item.category, label: item.categoryLabel || item.category, count: (current?.count ?? 0) + 1 });
-        }
+        const id = dimension === "sourceId" ? item.sourceId : item.category;
+        if (!id) continue;
+        const label = (dimension === "sourceId" ? item.sourceLabel : item.categoryLabel) || id;
+        const current = counts.get(id);
+        counts.set(id, { id, label: current?.label ?? label, count: (current?.count ?? 0) + 1 });
     }
     const byCount = (left: PromptGalleryFacet, right: PromptGalleryFacet) => right.count - left.count || left.label.localeCompare(right.label, "zh-Hans-CN");
-    return { sources: [...sourceCounts.values()].sort(byCount), categories: [...categoryCounts.values()].sort(byCount) };
+    return [...counts.values()].sort(byCount);
+}
+
+/**
+ * 来源与分类筛选项。传入当前筛选时，计数按筛选后的结果计算（各维度排除自己），
+ * 使下拉里显示的数字等于「再选中它」能筛出的条数；不传则退化为整库计数。
+ */
+export function promptGalleryFacets(items: PromptGalleryItem[], query?: PromptGalleryQuery): { sources: PromptGalleryFacet[]; categories: PromptGalleryFacet[] } {
+    return {
+        sources: countFacets(facetSample(items, query, "sourceId"), "sourceId"),
+        categories: countFacets(facetSample(items, query, "category"), "category"),
+    };
 }
 
 function asTrimmedString(value: unknown): string | undefined {

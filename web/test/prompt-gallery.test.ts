@@ -99,6 +99,52 @@ describe("prompt gallery facets", () => {
     });
 });
 
+describe("prompt gallery facets follow the active filters", () => {
+    test("counts only the rows matching the other filters, not the whole catalog", () => {
+        // 只看视频：图片来源与图片分类都不该再出现在下拉里。
+        const video = promptGalleryFacets(items, { mode: "video" });
+        expect(video.sources.map((facet) => facet.id)).toEqual(["seedance"]);
+        expect(video.categories.map((facet) => facet.id)).toEqual(["handheld-ugc-vlog"]);
+
+        const image = promptGalleryFacets(items, { mode: "image" });
+        expect(image.sources.map((facet) => facet.id)).toEqual(["youmind"]);
+    });
+
+    test("ignores its own dimension so the current choice stays switchable", () => {
+        // 已在某个来源下：来源维度仍要列出全部来源，否则用户换不回去。
+        const bySource = promptGalleryFacets(items, { sourceId: "seedance" });
+        expect(bySource.sources.map((facet) => facet.id).sort()).toEqual(["original", "seedance", "youmind"]);
+        // 分类维度收窄到该来源。
+        expect(bySource.categories.map((facet) => facet.id)).toEqual(["handheld-ugc-vlog"]);
+
+        // 已在某个分类下：分类维度仍要列出全部分类，来源维度收窄到该分类。
+        const byCategory = promptGalleryFacets(items, { category: "portrait" });
+        expect(byCategory.categories.map((facet) => facet.id).sort()).toEqual(["handheld-ugc-vlog", "portrait"]);
+        expect(byCategory.sources.map((facet) => facet.id)).toEqual(["youmind"]);
+    });
+
+    test("keyword and favorites narrow the counts the same way as the search", () => {
+        const byKeyword = promptGalleryFacets(items, { keyword: "85mm" });
+        expect(byKeyword.sources.map((facet) => facet.id)).toEqual(["youmind"]);
+        expect(byKeyword.categories.map((facet) => facet.id)).toEqual(["portrait"]);
+
+        const favorites = promptGalleryFacets(items, { favoritesOnly: true });
+        expect(favorites.sources.map((facet) => facet.id)).toEqual(["youmind"]);
+    });
+
+    test("the number shown equals what the search returns once that value is selected", () => {
+        // 这条不变量就是回归本体：下拉标 8000、选中只出来 2000 的日子不能回来。
+        const video = promptGalleryFacets(items, { mode: "video" });
+        for (const facet of video.sources) {
+            expect(searchPromptGalleryItems(items, { mode: "video", sourceId: facet.id }).total).toBe(facet.count);
+        }
+        const image = promptGalleryFacets(items, { mode: "image" });
+        for (const facet of image.categories) {
+            expect(searchPromptGalleryItems(items, { mode: "image", category: facet.id }).total).toBe(facet.count);
+        }
+    });
+});
+
 describe("AI search plan normalization", () => {
     test("accepts keyword arrays and known filter ids", () => {
         const plan = normalizePromptGalleryPlan(
@@ -215,6 +261,21 @@ describe("prompt gallery provider over the shipped catalog", () => {
         expect(seedance?.count).toBe(catalogFileEntries("seedance.json").length);
         expect(seedance?.label).toContain("CC BY 4.0");
         expect(facets.categories.length).toBeGreaterThan(0);
+    });
+
+    test("counts follow the active filter over the shipped catalog", async () => {
+        // 真实目录上的同一条不变量：某个筛选下的来源计数之和 == 该筛选的结果总数，
+        // 且每个来源的计数 == 再加上该来源之后的结果数。
+        const provider = promptGalleryPlugin.createPromptGallery!(galleryContext());
+        const facets = await provider.facets!({ mode: "video" });
+        const searched = await provider.search({ mode: "video", limit: 1 });
+
+        expect(facets.sources.reduce((sum, facet) => sum + facet.count, 0)).toBe(searched.total);
+        expect(facets.sources.some((facet) => facet.id === "youmind")).toBe(false);
+        for (const facet of facets.sources) {
+            const scoped = await provider.search({ mode: "video", sourceId: facet.id, limit: 1 });
+            expect(scoped.total).toBe(facet.count);
+        }
     });
 
     test("keeps ordinary search working and surfaces a readable error without the text service", async () => {

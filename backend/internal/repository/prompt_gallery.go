@@ -62,35 +62,39 @@ func (r *Repository) DeletePromptGalleryPromptsStale(sourceID string, syncedAt t
 	return r.db.Where("source_id = ? AND synced_at < ?", sourceID, syncedAt).Delete(&model.PromptGalleryPrompt{}).Error
 }
 
+/**
+ * 把检索条件套到查询上。检索与分面计数共用这一份，避免两处口径不一致
+ * （口径不一致会表现为“下拉里标 8000 条，选中后只出来 2000 条”）。
+ */
+func applyPromptGalleryFilters(db *gorm.DB, query PromptGallerySearchQuery) *gorm.DB {
+	if keyword := trimSpace(query.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		db = db.Where("(title LIKE ? OR description LIKE ? OR prompt LIKE ? OR prompt_zh LIKE ? OR tags LIKE ? OR model LIKE ?)",
+			like, like, like, like, like, like)
+	}
+	if query.Mode != "" {
+		db = db.Where("mode = ?", query.Mode)
+	}
+	if query.SourceID != "" {
+		db = db.Where("source_id = ?", query.SourceID)
+	}
+	if query.Category != "" {
+		db = db.Where("category = ?", query.Category)
+	}
+	if query.HasFeatured {
+		db = db.Where("featured = ?", query.Featured)
+	}
+	return db
+}
+
 // SearchPromptGalleryPrompts 分页检索，返回命中行与总数。
 //
 // SQLite/PostgreSQL 的 LIKE 语义一致（ASCII 大小写不敏感、中文直接包含匹配），
 // 近三万条文本行全表扫描在两种数据库都是毫秒级，因此暂不引入 FTS/tsvector 的跨库抽象。
 // 用户输入里的 % 与 _ 按普通通配符处理，不额外转义。
 func (r *Repository) SearchPromptGalleryPrompts(query PromptGallerySearchQuery) ([]model.PromptGalleryPrompt, int64, error) {
-	apply := func(db *gorm.DB) *gorm.DB {
-		if keyword := trimSpace(query.Keyword); keyword != "" {
-			like := "%" + keyword + "%"
-			db = db.Where("(title LIKE ? OR description LIKE ? OR prompt LIKE ? OR prompt_zh LIKE ? OR tags LIKE ? OR model LIKE ?)",
-				like, like, like, like, like, like)
-		}
-		if query.Mode != "" {
-			db = db.Where("mode = ?", query.Mode)
-		}
-		if query.SourceID != "" {
-			db = db.Where("source_id = ?", query.SourceID)
-		}
-		if query.Category != "" {
-			db = db.Where("category = ?", query.Category)
-		}
-		if query.HasFeatured {
-			db = db.Where("featured = ?", query.Featured)
-		}
-		return db
-	}
-
 	var total int64
-	if err := apply(r.db.Model(&model.PromptGalleryPrompt{})).Count(&total).Error; err != nil {
+	if err := applyPromptGalleryFilters(r.db.Model(&model.PromptGalleryPrompt{}), query).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
@@ -103,7 +107,7 @@ func (r *Repository) SearchPromptGalleryPrompts(query PromptGallerySearchQuery) 
 		offset = 0
 	}
 	var rows []model.PromptGalleryPrompt
-	if err := apply(r.db.Model(&model.PromptGalleryPrompt{})).
+	if err := applyPromptGalleryFilters(r.db.Model(&model.PromptGalleryPrompt{}), query).
 		Order("featured desc, id asc").
 		Limit(limit).Offset(offset).
 		Find(&rows).Error; err != nil {
@@ -113,12 +117,21 @@ func (r *Repository) SearchPromptGalleryPrompts(query PromptGallerySearchQuery) 
 }
 
 // PromptGalleryFacets 返回来源与分类的计数，供前端筛选项渲染。
-func (r *Repository) PromptGalleryFacets() ([]FacetCount, []FacetCount, error) {
+//
+// 计数按当前筛选计算，但每个维度都排除自己：算来源时忽略已选来源、算分类时忽略已选分类。
+// 这样下拉里显示的数字就等于“再加上这个条件能筛出多少条”，两个维度都选也不会互相吃掉对方。
+func (r *Repository) PromptGalleryFacets(query PromptGallerySearchQuery) ([]FacetCount, []FacetCount, error) {
 	var sources, categories []FacetCount
-	if err := r.db.Model(&model.PromptGalleryPrompt{}).Select("source_id as key, count(*) as count").Group("source_id").Scan(&sources).Error; err != nil {
+	sourceFilter := query
+	sourceFilter.SourceID = ""
+	if err := applyPromptGalleryFilters(r.db.Model(&model.PromptGalleryPrompt{}), sourceFilter).
+		Select("source_id as key, count(*) as count").Group("source_id").Scan(&sources).Error; err != nil {
 		return nil, nil, err
 	}
-	if err := r.db.Model(&model.PromptGalleryPrompt{}).Select("category as key, count(*) as count").Where("category <> ''").Group("category").Order("count desc").Scan(&categories).Error; err != nil {
+	categoryFilter := query
+	categoryFilter.Category = ""
+	if err := applyPromptGalleryFilters(r.db.Model(&model.PromptGalleryPrompt{}), categoryFilter).
+		Select("category as key, count(*) as count").Where("category <> ''").Group("category").Order("count desc").Scan(&categories).Error; err != nil {
 		return nil, nil, err
 	}
 	return sources, categories, nil

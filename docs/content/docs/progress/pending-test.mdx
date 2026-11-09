@@ -5,6 +5,19 @@ description: 当前项目已实现功能的手工验证清单与未确认边界
 
 # 待测试
 
+## 提示词画廊筛选计数与结果对不上（分类 / 来源）
+
+- 症状：抽屉默认按当前输入框类型过滤（图片框只出图片、视频框只出视频），但来源/分类下拉里的计数此前是全库的，于是「标着 8000 条、选中只出来 2000 条」，还有些分类选中恒为 0。
+- 已修复：计数改按**当前筛选**计算，且每个维度排除自己——算来源时忽略已选来源、算分类时忽略已选分类。这样显示的数字就等于「再选中它」能筛出的条数，两个维度也都还能切回去。
+- 真实数据下的偏差（dev 库远端 29,946 条 + 站内目录 1,923 条）：图片框里 `Entertainment` 标 8832、实际只能筛出 2671，`Content Creation` 标 15889、实际 14071；视频框里 `Content Creation` 标 15889、实际 1818；图片框的下拉里还列着约 60 个纯视频分类（如 `handheld-ugc-vlog` 标 102、实际 0 条），视频框里反过来约 20 个纯图片分类。
+- 实现位置：`web/src/lib/inspirations/prompt-gallery.ts`（`promptGalleryFacets(items, query)`，按维度排除的分面取样）、`web/src/lib/plugins/builtin/prompt-gallery.ts`（`facets(query)` 把当前筛选发给远端，`remoteFacetQuery`）、`web/src/components/prompt-gallery/prompt-gallery-drawer.tsx`（拆出 `facetQuery`，筛选变化时重算计数）、`backend/internal/repository/prompt_gallery.go`（`PromptGalleryFacets(query)`，检索与计数共用同一份 `applyPromptGalleryFilters`）、`backend/internal/app/prompt_gallery.go`。
+- [x] 前端专项：`bun test test/prompt-gallery.test.ts` 25 项通过，新增 5 项覆盖「按其它筛选计数」「忽略自身维度」「关键词/收藏收窄」「计数 == 选中后可筛出条数」，并在真实目录上校验「同一筛选下来源计数之和 == 结果总数、每个来源计数 == 再选该来源的总数」。
+- [x] 后端专项：`go test ./internal/app/ -run PromptGallery` 通过，新增 `TestPromptGalleryFacetsFollowActiveFilters` 覆盖「无筛选 / 仅视频」×「来源 / 分类」四组不变量（下拉数字 == 选中后 `Total`）。
+- [x] 真实数据对账：按新口径复算 6 个筛选场景共 354 个分面值，计数与可筛出条数全部一致。
+- [ ] 未验收：真实浏览器里点一遍来源与分类下拉，确认计数与列表条数一致、选中后仍能切回其它分类（依赖「分面忽略自身维度」这条）。
+- [ ] 未验收：PostgreSQL 下的分面 SQL（`GROUP BY` + 同一份 WHERE）只在本机 SQLite 上验过。
+- 已知未修（不在本次范围）：① 远端 `Sports` 与站内 lanshu `sports` 是两个不同 id，同名不同大小写会并列出现；② `lanshu.json` 未登记进 `manifest.json`，导致其 37 个分类在 UI 上显示英文 slug（`cinematic` 等）而非中文；③ 打开「收藏」时远端条目不会被过滤（`favoritesOnly` 无法下推到远端接口），收藏态目前只对站内目录生效（计数与结果仍自洽，因为两侧口径都没过滤远端）。
+
 ## 提示词画廊插件（prompt-gallery）
 
 - 已实现：内置应用插件 `prompt-gallery`（`yingce.plugin/v1`，权限 `ai.text`，声明 `contributes.promptSources: ["inspiration-catalog"]` 与 `surfaces: ["prompt-gallery", "settings"]`）。图片、视频的提示词输入框旁新增「画廊」按钮：画布节点提示词面板、生成配置节点的「组装提示词」框、创作页输入框共三处，点击打开右侧抽屉。

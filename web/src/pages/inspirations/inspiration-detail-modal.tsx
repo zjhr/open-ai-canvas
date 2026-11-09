@@ -60,9 +60,11 @@ export function InspirationDetailModal({
         >
             {item ? (
                 <div className="flex max-h-[76vh] flex-col">
-                    <div className="inspiration-detail-cover">
-                        <InspirationCover key={item.image} image={item.image} />
-                    </div>
+                    {item.image ? (
+                        <div className="inspiration-detail-cover">
+                            <InspirationCover key={item.image} image={item.image} />
+                        </div>
+                    ) : null}
 
                     <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
                         <div className="flex flex-wrap items-start justify-between gap-3">

@@ -332,6 +332,7 @@ Schema 45 新增 `upload_reservations`：`id`、`user_id`、`size`、`day`、`ex
 ## 结构迁移与版本
 
 版本 93 `prompt_gallery_index` 创建 `prompt_gallery_sources` 与 `prompt_gallery_prompts`，把 HuggingFace 提示词大库（Seedance 2 约 8.8 千条、GPT Image 2 约 2.1 万条）流式同步成站内可检索索引，正文与元数据入库、封面只在浏览时按需代理并缓存到数据目录；来源以 `(source_id, external_id)` 唯一，重复同步按外部 ID 覆盖而不重复入库。
+版本 52 `user_avatar_presets` 为 `users` 新增 `avatar_preset`，保存系统头像的稳定标识：`person`、`director`、`camera`、`cat`、`rabbit`、`robot`、`rocket`、`sparkles`。系统头像由前端共享组件渲染；选择时原子更新 default 模式、预设标识并清除上传图片。上传个人头像保留上次系统头像偏好，后续可以再次选择；未知标识被拒绝，不保存客户端提供的任意图片地址。
 
 版本 51 `personal_profile_security` 增加个人信息与身份重新核验结构：`users.avatar_mode`（空字符串沿用第三方头像、`custom` 为个人上传、`default` 为系统头像）、`users.avatar_version`（仅用于头像地址，不作为用户 JSON 字段返回）；新增 `user_avatars`（主键 `user_id`、标准化 PNG `data`、`updated_at`）。头像图片与用户选择在同一事务保存或清除，独立于创作素材资源；数据库备份同时包含头像。上传最大 5 MiB、1600 万像素，服务端居中裁剪并缩小到不超过 512×512。
 

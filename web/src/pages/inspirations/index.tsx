@@ -580,18 +580,16 @@ function InspirationCard({
         <article className="inspiration-card">
             <button type="button" className="inspiration-card-open" aria-label={`查看灵感：${item.title}`} aria-haspopup="dialog" onClick={onOpen}>
                 <span className="inspiration-card-cover">
-                    {/* 无图（纯提示词清单）时用文字版式交代分类与规格，不放无关示意图。 */}
-                    <InspirationCover
-                        key={item.image}
-                        image={item.image}
-                        placeholder={
-                            <span className="flex size-full flex-col items-center justify-center gap-1 px-4 text-center">
-                                <span className="text-xs font-medium text-foreground/70">{categoryLabel}</span>
-                                {item.ratio ? <span className="text-[11px] text-foreground/50">{item.ratio}</span> : null}
-                                <span className="line-clamp-2 text-[10px] text-foreground/38">{inspirationSourceOf(item)?.name ?? "提示词配方"}</span>
-                            </span>
-                        }
-                    />
+                    {item.image ? (
+                        <InspirationCover key={item.image} image={item.image} />
+                    ) : (
+                        // 纯提示词清单没有配图：用文字版式交代「哪一类、什么规格、哪个来源」，不放无关示意图。
+                        <span className="flex size-full flex-col items-center justify-center gap-1 px-4 text-center">
+                            <span className="text-xs font-medium text-foreground/70">{categoryLabel}</span>
+                            {item.ratio ? <span className="text-[11px] text-foreground/50">{item.ratio}</span> : null}
+                            <span className="line-clamp-2 text-[10px] text-foreground/38">{inspirationSourceOf(item)?.name ?? "提示词配方"}</span>
+                        </span>
+                    )}
                     {isFreshInspiration(item, Date.now()) ? <span className="inspiration-card-new">新</span> : null}
                     {showSources ? <span className="inspiration-card-source">{inspirationSourceOf(item)?.label ?? "未标注来源"}</span> : null}
                 </span>

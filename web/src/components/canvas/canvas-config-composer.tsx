@@ -57,17 +57,17 @@ export function CanvasConfigComposer({ nodeId, canvasId, value, inputs, skillRef
     const insertAtCaret = (text: string) => {
         const position = caret.current || { start: prompt.length, end: prompt.length };
         const next = insertComposerPreset(prompt, position.start, position.end, text);
-        if (updatePrompt(next.text) === false) return;
+        if (updatePrompt(next.text) === false) return false;
         requestAnimationFrame(() => {
             const editor = container.current?.querySelector<HTMLElement>("[contenteditable='true'],textarea");
             editor?.focus();
             if (editor instanceof HTMLTextAreaElement) editor.setSelectionRange(next.caret, next.caret);
             else if (editor) setEditableSelection(editor, next.caret);
         });
+        return true;
     };
     const insertPreset = (preset: CanvasPromptPreset) => {
-        insertAtCaret(preset.prompt);
-        setPresetsOpen(false);
+        if (insertAtCaret(preset.prompt)) setPresetsOpen(false);
     };
     const frameOptions = references.filter((ref) => ref.kind === "image" && ref.previewUrl).map((ref) => ({ nodeId: ref.nodeId, label: ref.label, title: ref.title, previewUrl: ref.previewUrl }));
     return (

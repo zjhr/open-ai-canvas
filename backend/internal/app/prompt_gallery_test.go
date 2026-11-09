@@ -178,6 +178,123 @@ func TestPromptGallerySearchFiltersAndFacets(t *testing.T) {
 	}
 }
 
+// facet 计数必须跟着当前筛选走，否则下拉里标的数字会大于选中后真正能筛出的条数。
+// 每个维度排除自己：选着来源时来源列表仍要显示全部来源的计数。
+func TestPromptGalleryFacetsFollowActiveFilters(t *testing.T) {
+	svc := newPromptGalleryTestService(t)
+	syncedAt := time.Now().UTC()
+	rows := []model.PromptGalleryPrompt{
+		{ID: "hf-seedance-2:1", SourceID: "hf-seedance-2", ExternalID: "1", Mode: "video", Title: "空教室心跳", Category: "Entertainment", Prompt: "cinematic classroom", SyncedAt: syncedAt},
+		{ID: "hf-seedance-2:2", SourceID: "hf-seedance-2", ExternalID: "2", Mode: "video", Title: "海岸日落", Category: "Nature", Prompt: "ocean waves", SyncedAt: syncedAt},
+		{ID: "hf-gpt-image-2:1", SourceID: "hf-gpt-image-2", ExternalID: "1", Mode: "image", Title: "灵魂画手", Category: "Entertainment", Prompt: "redraw in MS Paint", SyncedAt: syncedAt},
+	}
+	if err := svc.repo.UpsertPromptGalleryPrompts(rows); err != nil {
+		t.Fatal(err)
+	}
+
+	facetCounts := func(result PromptGallerySearchResult) (map[string]int64, map[string]int64) {
+		sources := map[string]int64{}
+		categories := map[string]int64{}
+		for _, facet := range result.Sources {
+			sources[facet.ID] = facet.Count
+		}
+		for _, facet := range result.Categories {
+			categories[facet.ID] = facet.Count
+		}
+		return sources, categories
+	}
+
+	// 只看视频：来源与分类都只剩视频行，图片来源不该继续挂在列表里。
+	result, err := svc.PromptGallerySearch(PromptGallerySearchRequest{Mode: "video"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, categories := facetCounts(result)
+	if sources["hf-seedance-2"] != 2 {
+		t.Fatalf("video source facet wrong: %#v", sources)
+	}
+	if _, exists := sources["hf-gpt-image-2"]; exists {
+		t.Fatalf("image source should not appear under a video-only filter: %#v", sources)
+	}
+	if categories["Entertainment"] != 1 || categories["Nature"] != 1 {
+		t.Fatalf("video category facets wrong: %#v", categories)
+	}
+
+	// 选定来源：分类计数收窄到该来源，但来源维度要忽略“已选来源”，否则切不回去。
+	result, err = svc.PromptGallerySearch(PromptGallerySearchRequest{SourceID: "hf-gpt-image-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, categories = facetCounts(result)
+	if sources["hf-seedance-2"] != 2 || sources["hf-gpt-image-2"] != 1 {
+		t.Fatalf("source facet must ignore the active source filter: %#v", sources)
+	}
+	if categories["Entertainment"] != 1 || len(categories) != 1 {
+		t.Fatalf("category facet must follow the active source filter: %#v", categories)
+	}
+
+	// 选定分类：来源计数收窄到该分类，但分类维度要忽略“已选分类”。
+	result, err = svc.PromptGallerySearch(PromptGallerySearchRequest{Category: "Entertainment"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, categories = facetCounts(result)
+	if sources["hf-seedance-2"] != 1 || sources["hf-gpt-image-2"] != 1 {
+		t.Fatalf("source facet must follow the active category filter: %#v", sources)
+	}
+	if categories["Entertainment"] != 2 || categories["Nature"] != 1 {
+		t.Fatalf("category facet must ignore the active category filter: %#v", categories)
+	}
+
+	// 关键不变量：在同样的筛选下，下拉里标的数字 == 再加上那个条件之后能筛出的条数。
+	// 计数必须和它所属的那组筛选配成一对，跨组比较没有意义（facet 本身也带着筛选上下文）。
+	for _, tc := range []struct {
+		name      string
+		base      PromptGallerySearchRequest
+		dimension string
+	}{
+		{name: "无筛选/来源", base: PromptGallerySearchRequest{}, dimension: "source"},
+		{name: "无筛选/分类", base: PromptGallerySearchRequest{}, dimension: "category"},
+		{name: "仅视频/来源", base: PromptGallerySearchRequest{Mode: "video"}, dimension: "source"},
+		{name: "仅视频/分类", base: PromptGallerySearchRequest{Mode: "video"}, dimension: "category"},
+	} {
+		base, err := svc.PromptGallerySearch(tc.base)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		baseSources, baseCategories := facetCounts(base)
+		ids := make([]string, 0, len(baseSources))
+		if tc.dimension == "source" {
+			for id := range baseSources {
+				ids = append(ids, id)
+			}
+		} else {
+			for id := range baseCategories {
+				ids = append(ids, id)
+			}
+		}
+		for _, id := range ids {
+			scoped := tc.base
+			if tc.dimension == "source" {
+				scoped.SourceID = id
+			} else {
+				scoped.Category = id
+			}
+			result, err := svc.PromptGallerySearch(scoped)
+			if err != nil {
+				t.Fatalf("%s %s: %v", tc.name, id, err)
+			}
+			shown := baseSources[id]
+			if tc.dimension == "category" {
+				shown = baseCategories[id]
+			}
+			if result.Total != shown {
+				t.Fatalf("%s: %s 下拉标 %d，选中只筛出 %d", tc.name, id, shown, result.Total)
+			}
+		}
+	}
+}
+
 func TestPromptGallerySourcesReportSyncState(t *testing.T) {
 	svc := newPromptGalleryTestService(t)
 	syncedAt := time.Now().UTC()
