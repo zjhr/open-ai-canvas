@@ -81,16 +81,15 @@ describe("提示词输入框插槽注册表", () => {
         const builtin = readFileSync(resolve(root, "lib/plugins/builtin/index.ts"), "utf8");
 
         // 所有内置插件都经由 builtin/index 加载。
-        for (const plugin of ["eagle", "prompt-optimizer", "prompt-gallery", "workflows", "ai-art-critique", "media-conversion", "editor/editor-shell"]) {
+        for (const plugin of ["eagle", "prompt-optimizer", "prompt-gallery", "workflows", "ai-art-critique", "media-conversion"]) {
             expect(builtin).toContain(`import "./${plugin}";`);
         }
 
-        // 曾在页面里单独副作用 import 的三个插件，现在不得再出现裸 import。
+        // 曾在页面里单独副作用 import 的插件，现在不得再出现裸 import。
         // 允许 `import { ... } from "..."`（值/类型依赖），只禁止 `import "..."`（副作用依赖）。
         for (const [file, plugin] of [
             ["pages/canvas/project.tsx", "ai-art-critique"],
             ["pages/canvas/project.tsx", "media-conversion"],
-            ["pages/projects/detail.tsx", "editor/editor-shell"],
         ] as const) {
             const source = readFileSync(resolve(root, file), "utf8");
             expect(source).not.toContain(`import "@/lib/plugins/builtin/${plugin}";`);

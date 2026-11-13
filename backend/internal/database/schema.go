@@ -16,6 +16,9 @@ import (
 // Models 是应用持久化表的唯一清单，服务启动和跨数据库迁移必须共用它。
 func Models() []any {
 	return []any{
+		&model.ChannelWebsite{},
+		&model.ChannelCatalogSnapshot{},
+		&model.ChannelProtocolSelection{},
 		&model.CloudAgentExecution{},
 		&model.UploadReservation{},
 		&model.CloudAgentPiSession{},
@@ -31,6 +34,9 @@ func Models() []any {
 		&model.AgentMemoryRevision{},
 		&model.AgentMemoryDocument{},
 		&model.AgentMemoryDocumentRevision{},
+		&model.MCPServerTemplate{},
+		&model.MCPConnection{},
+		&model.MCPToolExecution{},
 		&model.User{},
 		&model.UserGroup{},
 		&model.UserGroupChannel{},
@@ -55,6 +61,7 @@ func Models() []any {
 		&model.LogicalModelRoute{},
 		&model.RouteAttempt{},
 		&model.ApiCallLog{},
+		&model.SiteTrafficEvent{},
 		&model.ModelPricing{},
 		&model.CreditAccount{},
 		&model.CreditLedgerEntry{},
@@ -146,6 +153,9 @@ func Models() []any {
 		&model.Task{},
 		&model.CreationRun{},
 		&model.CreationSubmission{},
+		&model.CreationConversation{},
+		&model.CreationConversationMessage{},
+		&model.CreationConversationResource{},
 		&model.TaskTextDelta{},
 		&model.TaskLog{},
 		&model.Result{},
@@ -159,6 +169,7 @@ func Models() []any {
 		&model.DramaJob{},
 		&model.PromptGallerySource{},
 		&model.PromptGalleryPrompt{},
+		&model.EcommerceRound{},
 	}
 }
 

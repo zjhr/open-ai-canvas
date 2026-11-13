@@ -23,7 +23,7 @@ import { registerPlugin } from "../plugin-registry";
 import { registerPromptEditorSlot } from "../prompt-editor-slot-registry";
 import { PromptGalleryAction } from "./prompt-gallery-action";
 import type {
-    PluginManifestV2,
+    PluginManifest,
     PluginTextMessage,
     PluginTextTool,
     PromptGalleryFacet,
@@ -41,11 +41,11 @@ export const PROMPT_GALLERY_SOURCE_ID = "inspiration-catalog";
 /** 后端远端索引的来源标识。 */
 export const PROMPT_GALLERY_REMOTE_SOURCE_ID = "remote-index";
 
-const manifest: PluginManifestV2 = {
+const manifest: PluginManifest = {
     id: PROMPT_GALLERY_PLUGIN_ID,
     name: "提示词画廊",
     version: "0.1.0",
-    apiVersion: "yingce.plugin/v2",
+    apiVersion: "yingce.plugin/v1",
     description: "在图片和视频的提示词输入框旁打开画廊，按关键词或自然语言检索提示词目录，选中即回填当前输入框。",
     author: "内置工具",
     permissions: ["ai.text"],

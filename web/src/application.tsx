@@ -5,11 +5,13 @@ import "./styles/globals.css";
 import "./styles/shared/model-picker.css";
 import "./styles/shared/overlays.css";
 import "./styles/shared/scrollbars.css";
+import "@/themes/load";
 import { RouterProvider } from "react-router";
 
 import { AuthDialogHost } from "@/components/auth/auth-dialog-host";
 import { AppProviders } from "@/components/layout/app-providers";
 import { router } from "@/router";
+import { installSiteTrafficCollector } from "@/services/site-traffic";
 
 // 内置插件的插槽注册是模块副作用：只有模块被加载，注册表里才会有条目。
 // 此前 builtin/index 只被「插件中心 / 后台插件页」引入，直接进画布或创作页时
@@ -30,3 +32,7 @@ createRoot(document.getElementById("root")!).render(
         </AppProviders>
     </React.StrictMode>,
 );
+
+// 在 React 生命周期外安装，游客与 StrictMode 都共用一次路由订阅。
+const disposeTraffic = installSiteTrafficCollector(router);
+if (import.meta.hot) import.meta.hot.dispose(disposeTraffic);

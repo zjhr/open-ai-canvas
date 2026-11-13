@@ -1,7 +1,7 @@
 /**
  * 内置插件的唯一加载入口。
  *
- * 这些插件的注册是【模块副作用】（文件末尾调用 registerPlugin / registerEditorSlot /
+ * 这些插件的注册是【模块副作用】（文件末尾调用 registerPlugin /
  * registerPromptEditorSlot），所以模块必须先被加载，注册表里才会有条目。
  *
  * 教训：`builtin/index` 曾只被插件管理页引入，导致直接进画布/创作页时
@@ -20,7 +20,6 @@ import "./prompt-gallery";
 import "./workflows";
 import "./ai-art-critique";
 import "./media-conversion";
-import "./editor/editor-shell";
 import "./user-feedback";
 
 export * from "./user-feedback";
@@ -33,6 +32,5 @@ export const BUILTIN_PLUGIN_BOOTSTRAP_ENTRIES = [
     "workflows",
     "ai-art-critique",
     "media-conversion",
-    "editor/editor-shell",
     "user-feedback",
 ] as const;

@@ -181,11 +181,11 @@ describe("prompt gallery plugin manifest", () => {
         const manifest = promptGalleryPlugin.manifest;
         expect(manifest.id).toBe(PROMPT_GALLERY_PLUGIN_ID);
         expect(manifest.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
-        expect(manifest.apiVersion).toBe("yingce.plugin/v2");
+        expect(manifest.apiVersion).toBe("yingce.plugin/v1");
         expect(manifest.permissions).toEqual(["ai.text"]);
         expect(manifest.surfaces).toContain("prompt-gallery");
         expect(manifest.contributes.promptSources).toEqual([PROMPT_GALLERY_SOURCE_ID, PROMPT_GALLERY_REMOTE_SOURCE_ID]);
-        // 输入框按钮走插槽声明；v2 清单里 editorSlots 与 promptEditorSlots 是并列贡献。
+        // 输入框按钮走插槽声明：宿主按 promptEditorSlots 渲染，不必改输入框组件。
         expect(manifest.contributes.promptEditorSlots).toEqual([{ slot: "prompt-composer-actions", priority: 10 }]);
         expect(typeof promptGalleryPlugin.createPromptGallery).toBe("function");
     });

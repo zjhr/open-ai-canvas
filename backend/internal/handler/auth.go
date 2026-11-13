@@ -23,6 +23,7 @@ func RegisterAuthRoutes(r *gin.RouterGroup, svc *service.Service) {
 	registerChannelOrderRoutes(r, svc)
 	registerNotificationRoutes(r, svc)
 	registerAuthProfileRoutes(r, svc)
+	registerWechatRoutes(r, svc)
 	r.GET("/auth/settings", func(c *gin.Context) {
 		settings, err := svc.PublicAuthSettings()
 		if err != nil {
@@ -157,6 +158,7 @@ func RegisterAuthRoutes(r *gin.RouterGroup, svc *service.Service) {
 		c.Redirect(http.StatusFound, target)
 	})
 	r.GET("/auth/linuxdo/callback", rejectedLoginAudit(svc, "linuxdo"), linuxDOCallbackHandler(svc))
+	registerOIDCRoutes(r, svc)
 	r.POST("/auth/logout", func(c *gin.Context) {
 		if err := svc.Logout(sessionCookie(c), loginRequestContext(c)); err != nil {
 			failService(c, err)
@@ -642,7 +644,14 @@ func readPayloadModel(body []byte) string {
 }
 
 func currentUser(c *gin.Context, svc *service.Service) (*model.User, error) {
-	return svc.CurrentUser(sessionCookie(c))
+	user, err := svc.CurrentUser(sessionCookie(c))
+	if err != nil {
+		return nil, err
+	}
+	if expected := c.GetHeader("X-Canvas-Expected-User"); expected != "" && expected != user.ID {
+		return nil, service.Forbidden("账号已切换，请重新加载后重试")
+	}
+	return user, nil
 }
 
 func sessionCookie(c *gin.Context) string {
