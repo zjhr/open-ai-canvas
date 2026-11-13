@@ -190,6 +190,7 @@ type (
 	DiagnosticPreview                      = app.DiagnosticPreview
 	DiagnosticRuntime                      = app.DiagnosticRuntime
 	DrawingEngineSetting                   = app.DrawingEngineSetting
+	JevReviewSettingRequest                = app.JevReviewSettingRequest
 	EagleAddItemRequest                    = app.EagleAddItemRequest
 	EagleCreatedItem                       = app.EagleCreatedItem
 	EagleFile                              = app.EagleFile
@@ -284,6 +285,7 @@ type (
 	PublicDrawingEngineSetting             = app.PublicDrawingEngineSetting
 	PublicEmailSetting                     = app.PublicEmailSetting
 	PublicFeatureAvailability              = app.PublicFeatureAvailability
+	PublicJevReviewSetting                 = app.PublicJevReviewSetting
 	PublicLibTVSetting                     = app.PublicLibTVSetting
 	PublicLinuxDOSetting                   = app.PublicLinuxDOSetting
 	PublicLogicalModel                     = app.PublicLogicalModel

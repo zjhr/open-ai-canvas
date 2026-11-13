@@ -44,6 +44,7 @@ const DrawingEngineSettingsPage = lazyAdminPage(() => import("@/pages/admin/sett
 const StorageSettingsPage = lazyAdminPage(() => import("@/pages/admin/settings/storage-settings-page"));
 const ArkPrivateAssetsSettingsPage = lazyAdminPage(() => import("@/pages/admin/settings/ark-private-assets-settings-page"));
 const ResponseInterceptionSettingsPage = lazyAdminPage(() => import("@/pages/admin/settings/response-interception-settings-page"));
+const JevReviewSettingsPage = lazyAdminPage(() => import("@/pages/admin/settings/jev-review-settings-page"));
 const ThirdPartySettingsPage = lazyAdminPage(() => import("@/pages/admin/settings/libtv-settings-page"));
 const WorkbenchToolsPage = lazyAdminPage(() => import("@/pages/admin/workbench-tools/workbench-tools-page"));
 const PoseLibraryAdminPage = lazyAdminPage(() => import("@/pages/admin/pose-library/pose-library-page"));
@@ -288,6 +289,7 @@ export const router = createBrowserRouter([
                     { path: "settings/storage", element: <StorageSettingsPage /> },
                     { path: "settings/ark-private-assets", element: <ArkPrivateAssetsSettingsPage /> },
                     { path: "settings/response-interception", element: <ResponseInterceptionSettingsPage /> },
+                    { path: "settings/jev-review", element: <JevReviewSettingsPage /> },
                     { path: "settings/third-party", element: <ThirdPartySettingsPage /> },
                     { path: "settings/system-update", element: <SystemUpdatePage /> },
                     { path: "settings/system-performance", element: <SystemPerformancePage /> },

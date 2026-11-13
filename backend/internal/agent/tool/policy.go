@@ -58,6 +58,8 @@ type Policy struct {
 	RequiresMemory bool
 	// RequiresDrama 只在画布关联了当前用户的短剧作品时暴露。
 	RequiresDrama bool
+	// RequiresReview 只在内容审核服务已启用时暴露。
+	RequiresReview bool
 	// AlwaysApprove 让写入在 auto 模式下也先审批：写入会改变画布以外的业务对象（如短剧版本）。
 	AlwaysApprove bool
 	// OutsideTransaction performs storage IO before the checkpoint transaction.
@@ -75,6 +77,8 @@ type Scope struct {
 	Drama bool
 	// Memory 表示本轮长期记忆处于开启状态（自动生效或需确认），由服务端建 run 时冻结。
 	Memory bool
+	// Review 表示本轮内容审核服务已配置，由服务端建 run 时冻结。
+	Review bool
 }
 
 func (p Policy) Allowed(scope Scope) bool {
@@ -83,6 +87,7 @@ func (p Policy) Allowed(scope Scope) bool {
 		(!p.RequiresSkills || scope.Skills) &&
 		(!p.RequiresMemory || scope.Memory) &&
 		(!p.RequiresDrama || scope.Drama) &&
+		(!p.RequiresReview || scope.Review) &&
 		(!p.Vision || scope.Vision) &&
 		(!p.Write() && !p.RequiresWriteMode || !scope.ReadOnly) &&
 		(p.Name != AgentProfileRead || scope.IncludeProfile)
@@ -140,6 +145,7 @@ const (
 	MediaBatchControl      = "media_batch_control"
 	CanvasBuildBoard       = "canvas_build_board"
 	CanvasPreflight        = "canvas_preflight"
+	ContentReview          = "content_review"
 	DramaGetContext        = "drama_get_context"
 	DramaAdoptCanvasMedia  = "drama_adopt_canvas_media"
 )
@@ -202,6 +208,8 @@ func policies() []Policy {
 		{Name: MediaBatchControl, Kind: KindControl, RequiresCanvas: true, RequiresWriteMode: true},
 		{Name: CanvasBuildBoard, Kind: KindWrite, RequiresCanvas: true},
 		{Name: CanvasPreflight, Kind: KindRead, RequiresCanvas: true, RequiresWriteMode: true, OutsideTransaction: true},
+		// 内容审核只调用外部判断服务，不读写画布；结果随内容变化，不能复用只读缓存。
+		{Name: ContentReview, Kind: KindControl, RequiresReview: true, OutsideTransaction: true},
 		{Name: DramaGetContext, Kind: KindRead, RequiresCanvas: true, RequiresDrama: true, OutsideTransaction: true},
 		{Name: DramaAdoptCanvasMedia, Kind: KindWrite, RequiresCanvas: true, RequiresDrama: true, AlwaysApprove: true},
 	}

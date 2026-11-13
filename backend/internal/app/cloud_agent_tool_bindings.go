@@ -48,6 +48,7 @@ func cloudAgentToolHandlers() map[string]cloudAgentToolHandler {
 		agenttool.MediaBatchControl:      {Read: cloudAgentHandleMediaBatchControlFallback},
 		agenttool.CanvasBuildBoard:       {Write: applyCloudAgentBuildBoard, Preview: cloudAgentPreviewBuildBoard},
 		agenttool.CanvasPreflight:        {Read: cloudAgentHandleCanvasPreflight},
+		agenttool.ContentReview:          {Read: cloudAgentHandleContentReview},
 		agenttool.DramaGetContext:        {Read: cloudAgentHandleDramaGetContext},
 		agenttool.DramaAdoptCanvasMedia:  {Write: applyCloudAgentDramaAdopt, Preview: cloudAgentPreviewDramaAdopt},
 	}

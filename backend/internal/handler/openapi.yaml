@@ -3985,6 +3985,37 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
+  /admin/settings/jev-review:
+    get:
+      tags: [admin]
+      summary: 读取 Agent 内容审核（Jev）配置
+      description: 仅管理员。data.setting 包含 enabled、protocol、baseUrl、model、hasApiKey、updatedAt；不返回密钥。protocol 为 typesafe 时调用 /v1/systemone，为 openrouter 时调用 Chat Completions。
+      responses:
+        "200": { $ref: "#/components/responses/Envelope" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [admin]
+      summary: 更新 Agent 内容审核（Jev）配置
+      description: API Key 加密保存，留空保留。启用时必须有已保存或本次提交的 Key。Base URL 经出站 SSRF 校验。配置启用后 Agent 暴露 content_review 工具。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled, protocol, baseUrl, model]
+              properties:
+                enabled: { type: boolean }
+                protocol: { type: string, enum: [typesafe, openrouter] }
+                baseUrl: { type: string, format: uri }
+                model: { type: string }
+                apiKey: { type: string, writeOnly: true }
+      responses:
+        "200": { $ref: "#/components/responses/Envelope" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /auth/wechat/start:
     get:
       tags: [auth]

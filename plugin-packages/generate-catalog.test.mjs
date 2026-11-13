@@ -25,7 +25,7 @@ async function fixture(t) {
     ids.push(id);
     await cp(join(root, id), join(temp, id), { recursive: true });
   }
-  assert.equal(ids.length, 34);
+  assert.equal(ids.length, 35);
   return { temp, ids };
 }
 
@@ -98,7 +98,7 @@ test("all 34 text packages including mixed-provider manifests regenerate without
   const { temp, ids } = await fixture(t);
   const before = {};
   for (const id of ids) before[id] = await snapshot(join(temp, id));
-  assert.match(generate(temp, ids), /generated 34 protocol packages/);
+  assert.match(generate(temp, ids), /generated 35 protocol packages/);
   for (const id of ids) {
     const after = await json(join(temp, id, "manifest.json"));
     assert.deepEqual(runtime(after), runtime(JSON.parse(before[id]["manifest.json"].content)), id);

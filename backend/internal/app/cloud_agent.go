@@ -59,6 +59,9 @@ type CloudAgentRequest struct {
 	// 后者是冻结的长期记忆模式（auto/review/off），决定是否暴露技能读取与记忆写入工具。
 	SkillsEnabled bool   `json:"skillsEnabled,omitempty"`
 	MemoryMode    string `json:"memoryMode,omitempty"`
+	// ReviewEnabled 决定是否暴露 content_review。与 VisionEnabled 一样由服务端
+	// 在建 run 时按 Jev 配置推导并持久化，客户端传入值被覆盖。
+	ReviewEnabled bool `json:"reviewEnabled,omitempty"`
 }
 
 const cloudAgentMaxStepsLimit = 9999
@@ -523,6 +526,7 @@ func (s *Service) CreateCloudAgentRun(userID string, req CloudAgentRequest, pare
 	req.VisionEnabled = s.cloudAgentVisionEnabled(req)
 	req.DramaLinked = len(req.ContextScope) != 0 && dramaLinkedCanvas(s.repo, canvas)
 	req.SkillsEnabled = len(skillPool.Versions) > 0
+	req.ReviewEnabled = s.jevReviewEnabled()
 	req.MemoryMode = memory.Mode
 	canvasSummary := ""
 	if len(req.ContextScope) != 0 {

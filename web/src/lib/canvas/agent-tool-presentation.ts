@@ -24,6 +24,7 @@ export const AGENT_TOOL_NAMES = [
     "canvas_preflight",
     "canvas_read_batch_table",
     "canvas_read_storyboard",
+    "content_review",
     "drama_adopt_canvas_media",
     "drama_get_context",
     "finish_run",
@@ -47,6 +48,17 @@ export const AGENT_TOOL_NAMES = [
 ] as const;
 
 export type AgentToolSummaryContext = { pending: boolean; detail?: unknown; text: string };
+
+/** 与后端 contentReviewQuestions 的 risk 选项一致。 */
+const CONTENT_RISK_LABELS: Record<string, string> = {
+    none: "无",
+    politics: "政治敏感",
+    violence: "暴力血腥",
+    sexual: "色情低俗",
+    minor: "未成年人",
+    ip: "侵权",
+    other: "其他",
+};
 
 export type AgentToolMetadataEntry = {
     summary: string | ((context: AgentToolSummaryContext) => string);
@@ -143,12 +155,24 @@ export const AGENT_TOOL_METADATA: Record<string, AgentToolMetadataEntry> = {
         failureMessage: "技能市场查找失败",
     },
     skill_recommend: { summary: ({ pending }) => (pending ? "准备推荐安装技能" : "已推荐安装技能，由你决定是否安装"), failureMessage: "技能推荐未显示" },
+    content_review: {
+        summary: ({ pending, detail }) => {
+            if (pending) return "准备审核内容";
+            const answers = record(field(field(detail, "result"), "answers"));
+            const risk = record(answers.risk).choice;
+            if (typeof risk === "string" && risk && risk !== "none") return `审核完成，风险：${CONTENT_RISK_LABELS[risk] || risk}`;
+            const compliant = record(answers.compliant).noul;
+            if (typeof compliant === "number") return `审核完成，合规概率 ${Math.round(compliant * 100)}%`;
+            return "内容审核已完成";
+        },
+        failureMessage: "内容审核未完成",
+    },
 };
 
 /** 画布上"读到清单"的只读工具：无像素，chip 必须是存在式。 */
 const AGENT_CANVAS_READ_TOOLS = new Set(["canvas_get_state", "canvas_list_node_types", "canvas_read_storyboard", "canvas_read_batch_table"]);
 /** 非画布信息的只读工具（模型、任务、技能、偏好）。`skills_load` 是历史事件名，保留兼容。 */
-const AGENT_INFO_READ_TOOLS = new Set(["model_list", "task_get", "skill_search", "skill_market_search", "skill_read_file", "skills_load", "agent_profile_read", "drama_get_context", "canvas_preflight", "memory_search", "mcp_list_tools"]);
+const AGENT_INFO_READ_TOOLS = new Set(["model_list", "task_get", "skill_search", "skill_market_search", "skill_read_file", "skills_load", "agent_profile_read", "drama_get_context", "canvas_preflight", "memory_search", "mcp_list_tools", "content_review"]);
 const AGENT_VISION_TOOLS = new Set(["canvas_inspect_image"]);
 const AGENT_CREATE_TOOLS = new Set(["generate_media", "generate_media_batch", "canvas_build_board", "canvas_create_storyboard", "canvas_create_character", "image_annotation_render"]);
 const AGENT_OPERATE_TOOLS = new Set(["canvas_apply_ops", "canvas_arrange_nodes", "canvas_edit_storyboard", "canvas_edit_batch_table", "image_layer_split", "image_text_detect", "media_batch_control"]);

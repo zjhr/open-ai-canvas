@@ -79,5 +79,6 @@ func cloudAgentToolScope(req CloudAgentRequest, profile bool) agenttool.Scope {
 		Vision: req.VisionEnabled, ReadOnly: req.PermissionMode == "read_only", IncludeProfile: profile,
 		Drama:  req.DramaLinked && len(req.ContextScope) > 0,
 		Memory: req.MemoryMode == model.AgentMemoryDocumentModeAuto || req.MemoryMode == model.AgentMemoryDocumentModeReview,
+		Review: req.ReviewEnabled,
 	}
 }

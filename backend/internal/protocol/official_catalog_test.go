@@ -1058,6 +1058,72 @@ func TestOfficialOpenAIAudioSpeedDefaultsInvalidAndZeroValues(t *testing.T) {
 	}
 }
 
+func TestOfficialStepFunAudioMapsInstructionAndVoice(t *testing.T) {
+	adapter := officialPackageAdapter(t, "stepfun-audio.yingce-plugin", "stepfun-audio")
+	spec, err := adapter.BuildCreate(context.Background(), RequestContext{Request: GenerationRequest{
+		Model:  "stepaudio-3-tts",
+		Prompt: "你好",
+		Extra:  map[string]any{"audioInstructions": "克制的悲伤，不哭腔"},
+		ProviderOptions: map[string]map[string]any{
+			"stepfun-audio": {"voice_label": map[string]any{"emotion": "高兴"}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := manifestTestBody(t, spec)
+	// StepFun 用单数 instruction；OpenAI 风格的 instructions 不应出现。
+	if got := body["instruction"]; got != "克制的悲伤，不哭腔" {
+		t.Fatalf("instruction = %#v", got)
+	}
+	if _, ok := body["instructions"]; ok {
+		t.Fatalf("unexpected instructions field: %#v", body)
+	}
+	if got := body["voice"]; got != "cixingnansheng" {
+		t.Fatalf("voice = %#v, want default cixingnansheng", got)
+	}
+	label, _ := body["voice_label"].(map[string]any)
+	if label["emotion"] != "高兴" {
+		t.Fatalf("voice_label = %#v", body["voice_label"])
+	}
+}
+
+func TestOfficialStepFunGenUsesTaskAndScripts(t *testing.T) {
+	adapter := officialPackageAdapter(t, "stepfun-audio-gen.yingce-plugin", "stepfun-audio-gen")
+	spec, err := adapter.BuildCreate(context.Background(), RequestContext{Request: GenerationRequest{
+		Model:  "stepaudio-3-gen-preview",
+		Prompt: "夜间机场停机坪，客机做起飞前检查",
+		ProviderOptions: map[string]map[string]any{
+			"stepfun-audio-gen": {
+				"roles":   []any{map[string]any{"name": "机长", "description": "中年男性"}},
+				"scripts": []any{map[string]any{"speaker": "机长", "text": "收到，请求后推许可"}},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := manifestTestBody(t, spec)
+	if body["task"] != "text_to_audio" {
+		t.Fatalf("task = %#v", body["task"])
+	}
+	if body["instruction"] != "夜间机场停机坪，客机做起飞前检查" {
+		t.Fatalf("instruction = %#v", body["instruction"])
+	}
+	// Gen 不支持 voice；带上会被上游判 400。
+	if _, ok := body["voice"]; ok {
+		t.Fatalf("unexpected voice field: %#v", body)
+	}
+	scripts, _ := body["scripts"].([]any)
+	if len(scripts) != 1 {
+		t.Fatalf("scripts = %#v", body["scripts"])
+	}
+	roles, _ := body["roles"].([]any)
+	if len(roles) != 1 {
+		t.Fatalf("roles = %#v", body["roles"])
+	}
+}
+
 func TestOfficialArkSeedreamParsesB64JSONAsDataURL(t *testing.T) {
 	for _, tc := range []struct {
 		packageName, providerID string

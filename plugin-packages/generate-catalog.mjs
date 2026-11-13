@@ -479,6 +479,44 @@ add({
 });
 
 add({
+  id: "stepfun-audio", providerId: "stepfun-audio", name: "StepFun 语音合成", vendor: "StepFun", capability: "audio",
+  baseUrl: "https://api.stepfun.com", auth: bearer, params: audioParams,
+  notes: "同步 /v1/audio/speech 返回原始音频流。StepAudio 2.5/3 用 instruction 控制全局语境；旧模型改用 voice_label 控制语言、情绪与风格。",
+  create: jsonCreate("/v1/audio/speech", {
+    model: ref("request.model"),
+    input: ref("request.prompt"),
+    voice: coalesce(ref("request.extra.audioVoice"), ref("request.providerOptions.stepfun-audio.voice"), "cixingnansheng"),
+    response_format: coalesce(ref("request.extra.audioFormat"), ref("request.providerOptions.stepfun-audio.response_format"), "mp3"),
+    speed: coalesce(nonZeroFloat(ref("request.extra.audioSpeed")), ref("request.providerOptions.stepfun-audio.speed"), 1),
+    instruction: omit(coalesce(ref("request.extra.audioInstructions"), ref("request.providerOptions.stepfun-audio.instruction"))),
+    volume: omit(ref("request.providerOptions.stepfun-audio.volume")),
+    sample_rate: omit(ref("request.providerOptions.stepfun-audio.sample_rate")),
+    text_normalization: omit(ref("request.providerOptions.stepfun-audio.text_normalization")),
+    voice_label: omit(ref("request.providerOptions.stepfun-audio.voice_label"))
+  }),
+  response: { binaryPayload: true, resultKind: "audio", status: "succeeded", errorPaths: ["error.code"], messagePaths: ["error.message"] }
+});
+
+add({
+  id: "stepfun-audio-gen", providerId: "stepfun-audio-gen", name: "StepFun 音频生成", vendor: "StepFun", capability: "audio",
+  baseUrl: "https://api.stepfun.com", auth: bearer, params: audioParams,
+  notes: "同步 /v1/audio/generate 返回原始音频流。必填 task=text_to_audio；不支持 voice，多角色台词与音效通过 providerOptions 的 roles/scripts 传入。",
+  create: jsonCreate("/v1/audio/generate", {
+    model: ref("request.model"),
+    task: "text_to_audio",
+    instruction: omit(coalesce(ref("request.extra.audioInstructions"), ref("request.prompt"))),
+    scripts: omit(ref("request.providerOptions.stepfun-audio-gen.scripts")),
+    roles: omit(ref("request.providerOptions.stepfun-audio-gen.roles")),
+    response_format: coalesce(ref("request.extra.audioFormat"), ref("request.providerOptions.stepfun-audio-gen.response_format"), "mp3"),
+    speed: coalesce(nonZeroFloat(ref("request.extra.audioSpeed")), ref("request.providerOptions.stepfun-audio-gen.speed"), 1),
+    volume: omit(ref("request.providerOptions.stepfun-audio-gen.volume")),
+    sample_rate: omit(ref("request.providerOptions.stepfun-audio-gen.sample_rate")),
+    text_normalization: omit(ref("request.providerOptions.stepfun-audio-gen.text_normalization"))
+  }),
+  response: { binaryPayload: true, resultKind: "audio", status: "succeeded", errorPaths: ["error.code"], messagePaths: ["error.message"] }
+});
+
+add({
   id: "async-audio", providerId: "async-audio", name: "Async Audio Tasks", vendor: "OpenAI compatible", capability: "audio",
   baseUrl: "https://api.openai.com", auth: bearer, params: audioParams,
   notes: "异步音频任务：创建 /v1/audio/tasks，轮询同一路径，结果优先 URL，否则下载 /content。",

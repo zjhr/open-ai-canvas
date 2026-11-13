@@ -10,7 +10,7 @@ import (
 // 平台工具全集按 auto + canvas + 技能 + 视觉工具构造，覆盖最大条件工具集。
 func platformToolSchema(t *testing.T) ([]map[string]any, []byte) {
 	t.Helper()
-	req := CloudAgentRequest{PermissionMode: "auto", ContextScope: []string{"canvas"}, SkillsEnabled: true, MemoryMode: "auto", VisionEnabled: true}
+	req := CloudAgentRequest{PermissionMode: "auto", ContextScope: []string{"canvas"}, SkillsEnabled: true, MemoryMode: "auto", VisionEnabled: true, ReviewEnabled: true}
 	req.Budget.MaxGenerationTasks = 1
 	tools := cloudAgentTools(req)
 	raw, err := json.Marshal(tools)
@@ -74,7 +74,9 @@ func TestCloudAgentToolSchemaStaysCompact(t *testing.T) {
 	// canvas_preflight（描述已压缩，批量参数复用同一份结构）并把 ask_user 放宽到 16 个字段后为
 	// 34 个工具、44,091 字节，预算显式上调到 45,000，保留约2%的余量。新增工具或字段时请重新测量并有意识地
 	// 调整这个数字，而不是让 schema 悄悄膨胀（它每一步都要发、还在前缀最前面）。
-	if len(raw) > 45000 {
-		t.Fatalf("平台工具 schema 体积 %d 字节超出预算 45000：请压缩描述或显式调整预算", len(raw))
+	// 新增 content_review（剧本/提示词/镜头/图片审核）后为 38 个工具、45,669 字节，
+	// 预算显式上调到 46,000，保留约0.7%的余量；再加工具前先压缩已有描述。
+	if len(raw) > 46000 {
+		t.Fatalf("平台工具 schema 体积 %d 字节超出预算 46000：请压缩描述或显式调整预算", len(raw))
 	}
 }

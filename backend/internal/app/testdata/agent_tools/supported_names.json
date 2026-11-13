@@ -36,6 +36,7 @@
   "media_batch_control",
   "canvas_build_board",
   "canvas_preflight",
+  "content_review",
   "drama_get_context",
   "drama_adopt_canvas_media"
 ]

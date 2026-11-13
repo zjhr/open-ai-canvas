@@ -155,6 +155,7 @@ const adminNavigation: AdminNavigationGroup[] = [
             { path: "/admin/settings/ark-private-assets", keywords: "方舟 素材库 火山", label: "方舟素材库", shortLabel: "方舟", icon: <CloudUpload className="size-4" /> },
             { path: "/admin/settings/third-party", keywords: "第三方 参数 配置 密钥 LibTV", label: "第三方参数配置", shortLabel: "三方", icon: <KeyRound className="size-4" /> },
             { path: "/admin/settings/response-interception", keywords: "模型 响应 拦截 敏感词 过滤", label: "模型响应拦截", shortLabel: "拦截", icon: <ShieldAlert className="size-4" /> },
+            { path: "/admin/settings/jev-review", keywords: "Jev 内容审核 剧本 提示词 镜头 图片 typesafe openrouter", label: "内容审核（Jev）", shortLabel: "审核", icon: <ShieldCheck className="size-4" /> },
             { path: "/admin/settings/system-update", keywords: "系统 更新 升级 版本 部署", label: "系统更新", shortLabel: "更新", icon: <RefreshCw className="size-4" /> },
         ],
     },

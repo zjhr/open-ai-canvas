@@ -1,0 +1,176 @@
+{
+  "apiVersion": "yingce.plugin/v2",
+  "id": "stepfun-audio",
+  "name": "StepFun 语音合成",
+  "version": "2.0.0",
+  "author": "StepFun / 影策",
+  "description": "StepFun 语音合成 独立请求协议插件。",
+  "documentation": "# StepFun 语音合成\n\n该目录是独立官方协议插件源码。后端从生成的 `stepfun-audio.yingce-plugin` 包加载，不依赖系统内置 `host:` 适配器。\n\n完整字段清单见 [docs/interface.md](docs/interface.md)。\n\n## 快速开始\n\n1. 在 [StepFun 开放平台](https://platform.stepfun.com) 创建 API Key。\n2. 在模型渠道中新增自定义渠道，协议选择「StepFun 语音合成」，填写 API Key。\n3. 模型填 `stepaudio-3-tts`；也可用 `stepaudio-2.5-tts`、`step-tts-2`、`step-tts-mini`。\n4. 音色填官方 Voice-id（如 `cixingnansheng`、`livelybreezy-female`），默认 `cixingnansheng`。\n5. 在画布音频节点或创作页输入文本后提交，插件请求 `POST https://api.stepfun.com/v1/audio/speech` 并返回音频。\n\n## 上游兼容性\n\n- 请求地址与 OpenAI Audio Speech 同构：`POST /v1/audio/speech`，返回二进制音频流。\n- `response_format` 支持 `wav`、`mp3`、`flac`、`opus`、`pcm`，默认 `mp3`。\n- `speed` 取值 0.5～2，`instruction` 仅 `stepaudio-2.5-tts`、`stepaudio-3-tts` 生效。\n- 旧模型可用 `voice_label`（`language` / `emotion` / `style`）控制音色标签；2.5/3 模型不支持该字段。\n- 文本上限 1000 字符。需要长文本时由宿主分段提交，插件不自动切分。\n- 流式 `stream_format: \"sse\"` 与非流式 URL 返回（`return_url`）暂未接入，当前只使用二进制文件响应。\n\n## 不包含的能力\n\nStepFun 的 ASR（`/v1/audio/transcriptions`）、Realtime WebSocket 对话、Music / Gen 生成不在本插件内。宿主当前没有语音识别和实时音频会话的协议位，接入它们需要先扩展宿主能力。\n\n---\n\n# StepFun 语音合成 接口字段\n\n## 协议身份\n\n- 插件 ID：`stepfun-audio`。\n- Provider ID：`stepfun-audio`。\n- 能力：`audio`。\n- 默认 Base URL：`https://api.stepfun.com`。\n- 鉴权驱动：`bearer`。\n- 创建：`POST /v1/audio/speech`。\n- 生命周期：同步响应。\n\n## 配置字段\n\n| 字段 | 类型 | 必填 | 含义 |\n| --- | --- | --- | --- |\n| `apiKey` | secret | 是 | API Key |\n\n## 统一字段映射\n\n| 统一字段 | 类型 | 必填 | 上游映射 | 说明 |\n| --- | --- | --- | --- | --- |\n| `model` | string | 是 | `model` | 音频模型 ID。 |\n| `prompt` | string | 是 | `input` | 待合成文本。 |\n| `providerOptions` | object | 否 | `provider-specific fields` | 插件命名空间内的厂商扩展字段。 |\n\n## 上游请求模板逐字段清单\n\n下表由插件请求模板生成，覆盖 body、query、headers 和 multipart 文件声明中的每个字段。\n\n| 上游位置 | 值或转换表达式 |\n| --- | --- |\n| `create.method` | `\"POST\"` |\n| `create.path` | `\"/v1/audio/speech\"` |\n| `create.contentType` | `\"application/json\"` |\n| `create.body.model` | `{\"$ref\":\"request.model\"}` |\n| `create.body.input` | `{\"$ref\":\"request.prompt\"}` |\n| `create.body.voice` | `{\"$coalesce\":[{\"$ref\":\"request.extra.audioVoice\"},{\"$ref\":\"request.providerOptions.stepfun-audio.voice\"},\"cixingnansheng\"]}` |\n| `create.body.response_format` | `{\"$coalesce\":[{\"$ref\":\"request.extra.audioFormat\"},{\"$ref\":\"request.providerOptions.stepfun-audio.response_format\"},\"mp3\"]}` |\n| `create.body.speed` | `{\"$coalesce\":[{\"$if\":{\"condition\":{\"$ne\":[{\"$toFloat\":{\"$ref\":\"request.extra.audioSpeed\"}},0]},\"then\":{\"$toFloat\":{\"$ref\":\"request.extra.audioSpeed\"}},\"else\":null}},{\"$ref\":\"request.providerOptions.stepfun-audio.speed\"},1]}` |\n| `create.body.instruction` | `{\"$omitEmpty\":{\"$coalesce\":[{\"$ref\":\"request.extra.audioInstructions\"},{\"$ref\":\"request.providerOptions.stepfun-audio.instruction\"}]}}` |\n| `create.body.volume` | `{\"$omitEmpty\":{\"$ref\":\"request.providerOptions.stepfun-audio.volume\"}}` |\n| `create.body.sample_rate` | `{\"$omitEmpty\":{\"$ref\":\"request.providerOptions.stepfun-audio.sample_rate\"}}` |\n| `create.body.text_normalization` | `{\"$omitEmpty\":{\"$ref\":\"request.providerOptions.stepfun-audio.text_normalization\"}}` |\n| `create.body.voice_label` | `{\"$omitEmpty\":{\"$ref\":\"request.providerOptions.stepfun-audio.voice_label\"}}` |\n\n## Provider 扩展键\n\n- `providerOptions.stepfun-audio.instruction`\n- `providerOptions.stepfun-audio.response_format`\n- `providerOptions.stepfun-audio.sample_rate`\n- `providerOptions.stepfun-audio.speed`\n- `providerOptions.stepfun-audio.text_normalization`\n- `providerOptions.stepfun-audio.voice`\n- `providerOptions.stepfun-audio.voice_label`\n- `providerOptions.stepfun-audio.volume`\n\n动态模型或工作流允许使用文档声明的完整 `parameters/input/extra_body` 对象；该对象是协议本身的开放 schema，不会被宿主裁剪。\n\n## 响应映射逐字段清单\n\n| 映射位置 | 上游路径或转换表达式 |\n| --- | --- |\n| `response.binaryPayload` | `true` |\n| `response.resultKind` | `\"audio\"` |\n| `response.status` | `\"succeeded\"` |\n| `response.errorPaths[0]` | `\"error.code\"` |\n| `response.messagePaths[0]` | `\"error.message\"` |\n\n## 响应与错误\n\n插件把上游 task/status/text/media/usage 映射为统一结果。临时媒体 URL 标记为 ephemeral，由宿主立即下载持久化。HTTP 错误、业务 code 和 error object 保持失败语义，不包装成成功。\n\n## 兼容边界\n\n同步 /v1/audio/speech 返回原始音频流。StepAudio 2.5/3 用 instruction 控制全局语境；旧模型改用 voice_label 控制语言、情绪与风格。\n\n<!-- YINGCE_MANIFEST_CONTRACT_START -->\n## Manifest 完整接口定义\n\n以下 JSON 与插件包内实际 `manifest.json` 逐字段一致，覆盖插件身份、权限、配置、鉴权、参数、校验、创建、Agent、查询、取消、结果下载、响应和 Agent 响应映射。`documentation` 字段的值就是当前完整文档；为避免文档在自身内部无限递归，JSON 中仅用等义占位文本表示正文。\n\n```json\n{\n  \"apiVersion\": \"yingce.plugin/v2\",\n  \"id\": \"stepfun-audio\",\n  \"name\": \"StepFun 语音合成\",\n  \"version\": \"2.0.0\",\n  \"author\": \"StepFun / 影策\",\n  \"description\": \"StepFun 语音合成 独立请求协议插件。\",\n  \"documentation\": \"<当前插件的完整 documentation，由 README.md 与 docs/interface.md 拼接而成；为避免 JSON 递归，此处不重复展开正文。>\",\n  \"permissions\": [\n    \"generation.run\",\n    \"media.read\"\n  ],\n  \"configuration\": {\n    \"fields\": [\n      {\n        \"name\": \"apiKey\",\n        \"type\": \"secret\",\n        \"label\": \"API Key\",\n        \"required\": true\n      }\n    ]\n  },\n  \"contributes\": {\n    \"providers\": [\n      {\n        \"id\": \"stepfun-audio\",\n        \"label\": \"StepFun 语音合成\",\n        \"capabilities\": [\n          \"audio\"\n        ],\n        \"scopes\": [\n          \"admin.system-channel\",\n          \"user.custom-channel\",\n          \"canvas\",\n          \"creation\",\n          \"agent\"\n        ],\n        \"baseUrl\": \"https://api.stepfun.com\",\n        \"requiresPublicMediaUrls\": false,\n        \"auth\": {\n          \"type\": \"bearer\",\n          \"field\": \"apiKey\"\n        },\n        \"parameters\": [\n          {\n            \"name\": \"model\",\n            \"type\": \"string\",\n            \"required\": true,\n            \"mapping\": \"model\",\n            \"description\": \"音频模型 ID。\"\n          },\n          {\n            \"name\": \"prompt\",\n            \"type\": \"string\",\n            \"required\": true,\n            \"mapping\": \"input\",\n            \"description\": \"待合成文本。\"\n          },\n          {\n            \"name\": \"providerOptions\",\n            \"type\": \"object\",\n            \"required\": false,\n            \"mapping\": \"provider-specific fields\",\n            \"description\": \"插件命名空间内的厂商扩展字段。\"\n          }\n        ],\n        \"create\": {\n          \"method\": \"POST\",\n          \"path\": \"/v1/audio/speech\",\n          \"contentType\": \"application/json\",\n          \"body\": {\n            \"model\": {\n              \"$ref\": \"request.model\"\n            },\n            \"input\": {\n              \"$ref\": \"request.prompt\"\n            },\n            \"voice\": {\n              \"$coalesce\": [\n                {\n                  \"$ref\": \"request.extra.audioVoice\"\n                },\n                {\n                  \"$ref\": \"request.providerOptions.stepfun-audio.voice\"\n                },\n                \"cixingnansheng\"\n              ]\n            },\n            \"response_format\": {\n              \"$coalesce\": [\n                {\n                  \"$ref\": \"request.extra.audioFormat\"\n                },\n                {\n                  \"$ref\": \"request.providerOptions.stepfun-audio.response_format\"\n                },\n                \"mp3\"\n              ]\n            },\n            \"speed\": {\n              \"$coalesce\": [\n                {\n                  \"$if\": {\n                    \"condition\": {\n                      \"$ne\": [\n                        {\n                          \"$toFloat\": {\n                            \"$ref\": \"request.extra.audioSpeed\"\n                          }\n                        },\n                        0\n                      ]\n                    },\n                    \"then\": {\n                      \"$toFloat\": {\n                        \"$ref\": \"request.extra.audioSpeed\"\n                      }\n                    },\n                    \"else\": null\n                  }\n                },\n                {\n                  \"$ref\": \"request.providerOptions.stepfun-audio.speed\"\n                },\n                1\n              ]\n            },\n            \"instruction\": {\n              \"$omitEmpty\": {\n                \"$coalesce\": [\n                  {\n                    \"$ref\": \"request.extra.audioInstructions\"\n                  },\n                  {\n                    \"$ref\": \"request.providerOptions.stepfun-audio.instruction\"\n                  }\n                ]\n              }\n            },\n            \"volume\": {\n              \"$omitEmpty\": {\n                \"$ref\": \"request.providerOptions.stepfun-audio.volume\"\n              }\n            },\n            \"sample_rate\": {\n              \"$omitEmpty\": {\n                \"$ref\": \"request.providerOptions.stepfun-audio.sample_rate\"\n              }\n            },\n            \"text_normalization\": {\n              \"$omitEmpty\": {\n                \"$ref\": \"request.providerOptions.stepfun-audio.text_normalization\"\n              }\n            },\n            \"voice_label\": {\n              \"$omitEmpty\": {\n                \"$ref\": \"request.providerOptions.stepfun-audio.voice_label\"\n              }\n            }\n          }\n        },\n        \"response\": {\n          \"binaryPayload\": true,\n          \"resultKind\": \"audio\",\n          \"status\": \"succeeded\",\n          \"errorPaths\": [\n            \"error.code\"\n          ],\n          \"messagePaths\": [\n            \"error.message\"\n          ]\n        }\n      }\n    ]\n  }\n}\n```\n<!-- YINGCE_MANIFEST_CONTRACT_END -->\n",
+  "permissions": [
+    "generation.run",
+    "media.read"
+  ],
+  "configuration": {
+    "fields": [
+      {
+        "name": "apiKey",
+        "type": "secret",
+        "label": "API Key",
+        "required": true
+      }
+    ]
+  },
+  "contributes": {
+    "providers": [
+      {
+        "id": "stepfun-audio",
+        "label": "StepFun 语音合成",
+        "capabilities": [
+          "audio"
+        ],
+        "scopes": [
+          "admin.system-channel",
+          "user.custom-channel",
+          "canvas",
+          "creation",
+          "agent"
+        ],
+        "baseUrl": "https://api.stepfun.com",
+        "requiresPublicMediaUrls": false,
+        "auth": {
+          "type": "bearer",
+          "field": "apiKey"
+        },
+        "parameters": [
+          {
+            "name": "model",
+            "type": "string",
+            "required": true,
+            "mapping": "model",
+            "description": "音频模型 ID。"
+          },
+          {
+            "name": "prompt",
+            "type": "string",
+            "required": true,
+            "mapping": "input",
+            "description": "待合成文本。"
+          },
+          {
+            "name": "providerOptions",
+            "type": "object",
+            "required": false,
+            "mapping": "provider-specific fields",
+            "description": "插件命名空间内的厂商扩展字段。"
+          }
+        ],
+        "create": {
+          "method": "POST",
+          "path": "/v1/audio/speech",
+          "contentType": "application/json",
+          "body": {
+            "model": {
+              "$ref": "request.model"
+            },
+            "input": {
+              "$ref": "request.prompt"
+            },
+            "voice": {
+              "$coalesce": [
+                {
+                  "$ref": "request.extra.audioVoice"
+                },
+                {
+                  "$ref": "request.providerOptions.stepfun-audio.voice"
+                },
+                "cixingnansheng"
+              ]
+            },
+            "response_format": {
+              "$coalesce": [
+                {
+                  "$ref": "request.extra.audioFormat"
+                },
+                {
+                  "$ref": "request.providerOptions.stepfun-audio.response_format"
+                },
+                "mp3"
+              ]
+            },
+            "speed": {
+              "$coalesce": [
+                {
+                  "$if": {
+                    "condition": {
+                      "$ne": [
+                        {
+                          "$toFloat": {
+                            "$ref": "request.extra.audioSpeed"
+                          }
+                        },
+                        0
+                      ]
+                    },
+                    "then": {
+                      "$toFloat": {
+                        "$ref": "request.extra.audioSpeed"
+                      }
+                    },
+                    "else": null
+                  }
+                },
+                {
+                  "$ref": "request.providerOptions.stepfun-audio.speed"
+                },
+                1
+              ]
+            },
+            "instruction": {
+              "$omitEmpty": {
+                "$coalesce": [
+                  {
+                    "$ref": "request.extra.audioInstructions"
+                  },
+                  {
+                    "$ref": "request.providerOptions.stepfun-audio.instruction"
+                  }
+                ]
+              }
+            },
+            "volume": {
+              "$omitEmpty": {
+                "$ref": "request.providerOptions.stepfun-audio.volume"
+              }
+            },
+            "sample_rate": {
+              "$omitEmpty": {
+                "$ref": "request.providerOptions.stepfun-audio.sample_rate"
+              }
+            },
+            "text_normalization": {
+              "$omitEmpty": {
+                "$ref": "request.providerOptions.stepfun-audio.text_normalization"
+              }
+            },
+            "voice_label": {
+              "$omitEmpty": {
+                "$ref": "request.providerOptions.stepfun-audio.voice_label"
+              }
+            }
+          }
+        },
+        "response": {
+          "binaryPayload": true,
+          "resultKind": "audio",
+          "status": "succeeded",
+          "errorPaths": [
+            "error.code"
+          ],
+          "messagePaths": [
+            "error.message"
+          ]
+        }
+      }
+    ]
+  }
+}

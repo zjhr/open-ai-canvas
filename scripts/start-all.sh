@@ -234,6 +234,8 @@ start_backend() {
         export CANVAS_BACKEND_ADDR="$BACKEND_HOST:$BACKEND_PORT"
         export CANVAS_BACKEND_DATA_DIR="$DATA_DIR"
         export CANVAS_CORS_ORIGINS="http://localhost:$FRONTEND_PORT,http://127.0.0.1:$FRONTEND_PORT"
+        export CANVAS_ALLOW_PRIVATE_UPSTREAMS="true"
+        export CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS="100.71.9.87"
         # 本地开发不设置 YINGCE_AGENT_URL：后端在进程内启动 Node，无需单独跑 yingce-agent
         export GOCACHE="$GO_BUILD_CACHE"
         export GOMODCACHE="$GO_MOD_CACHE"

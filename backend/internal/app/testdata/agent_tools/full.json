@@ -2671,5 +2671,46 @@
       }
     },
     "type": "function"
+  },
+  {
+    "function": {
+      "description": "用独立判断模型审核剧本、提示词、镜头或画布图片：prompt/script/storyboard 传 text，image 传 nodeIds；focus 可选。返回合规概率、风险类别与可制作评分。只给判断，不改画布、不提交任务。",
+      "name": "content_review",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "focus": {
+            "description": "可选：本次审核重点",
+            "type": "string"
+          },
+          "nodeIds": {
+            "items": {
+              "description": "真实图片节点ID",
+              "type": "string"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "target": {
+            "enum": [
+              "prompt",
+              "script",
+              "storyboard",
+              "image"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "待审核文本；image 时不传",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
   }
 ]
