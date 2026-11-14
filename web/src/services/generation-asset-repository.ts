@@ -1,10 +1,8 @@
+import { namedLockManager } from "@/lib/secure-context";
+
 export type GenerationAssetRecord = {
     id: string;
     metadata?: Record<string, unknown>;
-};
-
-type AsyncStorageLock = {
-    request<T>(name: string, callback: () => Promise<T>): Promise<T>;
 };
 
 type GenerationStorageLockOptions = {
@@ -46,22 +44,13 @@ function preserveHydratedPreview<TAsset extends GenerationAssetRecord>(persisted
     } as TAsset;
 }
 
-let warnedMissingGenerationAssetStorageLock = false;
-
-function warnMissingCrossRealmGenerationStorageLock(kind: "asset" | "artifact") {
-    if (warnedMissingGenerationAssetStorageLock) return;
-    if (typeof window === "undefined" || typeof document === "undefined") return;
-    warnedMissingGenerationAssetStorageLock = true;
-    const label = kind === "artifact" ? "生成文件提交" : "生成素材持久化";
-    console.warn(`当前页面非安全上下文，${label}已降级为单标签互斥；多标签同时写入可能冲突。建议改用 HTTPS 或 localhost。`);
-}
-
-function runWithBrowserStorageLock<T>(scope: string, operation: () => Promise<T>, options: GenerationStorageLockOptions) {
-    const locks = typeof window !== "undefined" && typeof navigator !== "undefined" ? (navigator.locks as AsyncStorageLock | undefined) : undefined;
-    if (locks) return locks.request(`${ASSET_STORAGE_LOCK_PREFIX}${scope}`, operation);
-    // 外层 withGenerationAssetStorageLock 已有进程内串行；无 Web Locks 时允许单标签继续。
+function runWithBrowserStorageLock<T>(lockName: string, operation: () => Promise<T>, options: GenerationStorageLockOptions) {
+    const locks = namedLockManager();
+    if (locks.crossRealm) return locks.request(lockName, operation);
     if (options.requireCrossRealmLock && typeof window !== "undefined" && typeof document !== "undefined") {
-        warnMissingCrossRealmGenerationStorageLock("asset");
+        // 走到这里说明 navigator.locks 与 localStorage 都不可用（极端隐私模式）。
+        // 此时确实没有任何跨标签互斥手段，保持失败关闭是既有安全约定。
+        throw new Error("当前浏览器不支持跨标签存储锁，已停止生成素材持久化");
     }
     return operation();
 }
@@ -74,7 +63,7 @@ function runWithBrowserStorageLock<T>(scope: string, operation: () => Promise<T>
  */
 export function withGenerationAssetStorageLock<T>(scope: string, operation: () => Promise<T>, options: GenerationStorageLockOptions = {}): Promise<T> {
     const previous = assetStorageTails.get(scope) ?? Promise.resolve();
-    const pending = previous.then(() => undefined, () => undefined).then(() => runWithBrowserStorageLock(scope, operation, options));
+    const pending = previous.then(() => undefined, () => undefined).then(() => runWithBrowserStorageLock(`${ASSET_STORAGE_LOCK_PREFIX}${scope}`, operation, options));
     const tail = pending.then(
         () => undefined,
         () => undefined,
@@ -90,14 +79,7 @@ export function withGenerationArtifactCommitLock<T>(scope: string, operation: ()
     const previous = artifactCommitTails.get(scope) ?? Promise.resolve();
     const pending = previous
         .then(() => undefined, () => undefined)
-        .then(() => {
-            const locks = typeof window !== "undefined" && typeof navigator !== "undefined" ? (navigator.locks as AsyncStorageLock | undefined) : undefined;
-            if (locks) return locks.request(`${ARTIFACT_COMMIT_LOCK_PREFIX}${scope}`, operation);
-            if (options.requireCrossRealmLock && typeof window !== "undefined" && typeof document !== "undefined") {
-                warnMissingCrossRealmGenerationStorageLock("artifact");
-            }
-            return operation();
-        });
+        .then(() => runWithBrowserStorageLock(`${ARTIFACT_COMMIT_LOCK_PREFIX}${scope}`, operation, options));
     const tail = pending.then(
         () => undefined,
         () => undefined,

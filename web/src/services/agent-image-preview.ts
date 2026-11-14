@@ -1,6 +1,7 @@
 import { imageToDataUrl } from "@/services/image-storage";
 import { resourceIdFromStorageKey, resourceStorageKey, uploadResourceFile } from "@/services/api/resources";
 import { getActiveUserScope } from "@/lib/user-scope";
+import { sha256HexOfBytes } from "@/lib/secure-context";
 
 // 预算只作用于视觉分析副本，不修改原素材。
 export async function agentImagePreviews(images: Parameters<typeof imageToDataUrl>[0][]): Promise<string[]> {
@@ -55,8 +56,8 @@ export async function inspectAgentImage(source: Parameters<typeof imageToDataUrl
     const response = await fetch(dataUrl);
     if (!response.ok) throw new Error("读取看图素材失败");
     const blob = await response.blob();
-    const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
-    const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    // 局域网 HTTP 没有 crypto.subtle；共用带降级的摘要，保证幂等键一致。
+    const hash = await sha256HexOfBytes(new Uint8Array(await blob.arrayBuffer()));
     if (scope !== getActiveUserScope()) throw new DOMException("账号已切换", "AbortError");
     const resource = await uploadResourceFile(blob, "image", { fileName: `agent-inspect-${hash.slice(0, 12)}.${blob.type === "image/png" ? "png" : "jpg"}`, idempotencyKey: `agent-inspect:${hash}` });
     if (scope !== getActiveUserScope()) throw new DOMException("账号已切换", "AbortError");

@@ -6,6 +6,7 @@ import { getResourceBlob, isResourceUrl, resourceFileUrl, resourceIdFromStorageK
 import { getImageBlob } from "@/services/image-storage";
 import { getMediaBlob } from "@/services/file-storage";
 import { rebaseCanvasBatchInputSignatures } from "@/lib/canvas/canvas-batch-input-signature";
+import { sha256Hex } from "@/lib/secure-context";
 
 export function numberValue(value: unknown) {
     const number = Number(value);
@@ -147,8 +148,8 @@ export async function uploadInlineDataUrl(dataUrl: string, identity: string) {
 }
 
 export async function inlineMediaUploadIdentity(dataUrl: string) {
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(dataUrl));
-    return `inline:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+    // 局域网 HTTP 没有 crypto.subtle；共用带降级的摘要，保证幂等键在两种环境下一致。
+    return `inline:${await sha256Hex(dataUrl)}`;
 }
 
 export async function uploadLocalStorageKey(storageKey: string, payload: Record<string, unknown>) {

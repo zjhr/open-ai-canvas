@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type 
 import type { CanvasNodeGenerationMode } from "@/components/canvas/canvas-node-prompt-panel";
 import { applyCanvasOperations, summarizeCanvasOperations, type CanvasOperation, type CanvasSnapshot } from "@/lib/canvas/canvas-operation-contract";
 import { createGenerationRetryContext } from "@/lib/canvas/canvas-project-generation";
+import { sha256Hex } from "@/lib/secure-context";
 import { subscribeGenerationTasks, type GenerationTask } from "@/services/api/task-center";
 import { persistCanvasOperationContinuationEffect } from "@/services/canvas-generation-consumer";
 import { consumeGenerationTaskAgent } from "@/services/project-asset-sync";
@@ -204,9 +205,9 @@ export async function consumeCanvasGenerationContinuation(
 }
 
 async function canvasGenerationContinuationId(nodeId: string, context?: CanvasGenerationContext) {
-    const seed = new TextEncoder().encode(`canvas-operation-generation\0${context?.source || ""}\0${context?.conversationId || ""}\0${context?.messageId || ""}\0${nodeId}`);
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", seed));
-    return `agent:${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+    // 局域网 HTTP 没有 crypto.subtle；共用同一份带降级的摘要实现。
+    const hex = await sha256Hex(`canvas-operation-generation\0${context?.source || ""}\0${context?.conversationId || ""}\0${context?.messageId || ""}\0${nodeId}`);
+    return `agent:${hex}`;
 }
 
 export function useCanvasOperationHistory({
