@@ -7,7 +7,10 @@ param(
     # 先停止已在运行的服务再启动。
     [switch]$Restart,
     # 不自动打开浏览器（自动化/无桌面环境用）。
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    # 透传给 start-local.ps1 的可信私网上游主机（逗号分隔）。
+    # 不传则沿用上次保存的值，首次运行回落到 start-local.ps1 的默认值。
+    [string]$AllowedPrivateUpstreamHosts
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +19,9 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $localStarter = Join-Path $PSScriptRoot "start-local.ps1"
 $healthUrl = "http://127.0.0.1:3000/api/health"
 $canvasUrl = "http://localhost:3000/canvas"
+# 白名单在启动时注入后端进程的环境变量，进程一起来就固定了；
+# 保存到 .local 下，重启时自动沿用，避免"上次能用、重启就坏"。
+$allowlistStateFile = Join-Path $repoRoot ".local\allowed-private-upstream-hosts.txt"
 
 function Test-CanvasHttp([string]$Url) {
     try {
@@ -71,7 +77,22 @@ if (-not (Test-Path -LiteralPath $localStarter)) {
 }
 
 Write-Host "正在启动影策前端和后端，请稍候..." -ForegroundColor Cyan
-& $localStarter
+
+# 白名单解析顺序：显式参数 → 上次保存的值 → start-local.ps1 的默认值。
+$allowlist = $AllowedPrivateUpstreamHosts
+if ([string]::IsNullOrWhiteSpace($allowlist) -and (Test-Path -LiteralPath $allowlistStateFile)) {
+    $saved = (Get-Content -LiteralPath $allowlistStateFile -Raw -ErrorAction SilentlyContinue)
+    if ($saved) { $allowlist = $saved.Trim() }
+}
+if (-not [string]::IsNullOrWhiteSpace($allowlist)) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $allowlistStateFile) | Out-Null
+    Set-Content -LiteralPath $allowlistStateFile -Value $allowlist -NoNewline -Encoding ascii
+    Write-Host ("私网上游白名单：{0}" -f $allowlist) -ForegroundColor DarkGray
+}
+
+$startArgs = @{}
+if (-not [string]::IsNullOrWhiteSpace($allowlist)) { $startArgs["AllowedPrivateUpstreamHosts"] = $allowlist }
+& $localStarter @startArgs
 
 $deadline = (Get-Date).AddMinutes(5)
 do {
