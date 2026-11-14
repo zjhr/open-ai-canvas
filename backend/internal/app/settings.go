@@ -34,9 +34,10 @@ const (
 	qiniuKodoProvider     = "qiniu"
 	volcengineTOSProvider = "volcengine"
 	s3Provider            = "s3"
+	gdriveProvider        = "gdrive"
 )
 
-const unsupportedOSSProviderMessage = "仅支持阿里云 OSS、腾讯云 COS、七牛云 Kodo、火山引擎 TOS 和通用 S3"
+const unsupportedOSSProviderMessage = "仅支持阿里云 OSS、腾讯云 COS、七牛云 Kodo、火山引擎 TOS、通用 S3 和 Google Drive"
 
 func supportedOSSProvider(provider string) bool {
 	return oneOf(provider, aliyunOSSProvider, tencentCOSProvider, qiniuKodoProvider, volcengineTOSProvider, s3Provider)
@@ -60,6 +61,11 @@ type OSSSettingRequest struct {
 	CDNAuthMode       string `json:"cdnAuthMode"`
 	RequireCDN        bool   `json:"requireCDN"`
 	AllowPrivateProxy bool   `json:"allowPrivateProxy"`
+	// Google Drive 的凭据不是一对密钥，而是 OAuth 客户端加一枚长期刷新令牌。
+	GDriveClientID     string `json:"gdriveClientId"`
+	GDriveClientSecret string `json:"gdriveClientSecret"`
+	GDriveRefreshToken string `json:"gdriveRefreshToken"`
+	GDriveRootFolderID string `json:"gdriveRootFolderId"`
 }
 
 type PublicOSSSetting struct {
@@ -85,9 +91,16 @@ type PublicOSSSetting struct {
 	CDNAuthMode             string     `json:"cdnAuthMode"`
 	RequireCDN              bool       `json:"requireCDN"`
 	AllowPrivateProxy       bool       `json:"allowPrivateProxy"`
-	UpdatedBy               string     `json:"updatedBy"`
-	CreatedAt               time.Time  `json:"createdAt"`
-	UpdatedAt               time.Time  `json:"updatedAt"`
+	// Drive 只回传非敏感标识；密钥与刷新令牌仅以「是否已配置」的布尔值出现。
+	GDriveClientID        string    `json:"gdriveClientId"`
+	GDriveRootFolderID    string    `json:"gdriveRootFolderId"`
+	GDriveRootFolderName  string    `json:"gdriveRootFolderName"`
+	GDriveAccountEmail    string    `json:"gdriveAccountEmail"`
+	HasGDriveClientSecret bool      `json:"hasGDriveClientSecret"`
+	HasGDriveRefreshToken bool      `json:"hasGDriveRefreshToken"`
+	UpdatedBy             string    `json:"updatedBy"`
+	CreatedAt             time.Time `json:"createdAt"`
+	UpdatedAt             time.Time `json:"updatedAt"`
 }
 
 func (s *Service) AdminOSSSetting(actor *model.User) (*PublicOSSSetting, error) {
@@ -154,6 +167,9 @@ func (s *Service) UpdateOSSSetting(actor *model.User, req OSSSettingRequest) (*P
 	if err := s.repo.SaveSystemSetting(&setting); err != nil {
 		return nil, err
 	}
+	// 配置一旦落库就丢弃缓存的 Drive access token：管理员重新保存是
+	// 「令牌在有效期内被提前吊销」时唯一的自恢复手段，不该等进程重启。
+	resetGDriveTokenCache()
 	if next.Provider == s3Provider && next.StorageLocationID != "" {
 		if err := s.repo.ActivateStorageLocation("platform", "", next.StorageLocationID, next.Enabled); err != nil {
 			return nil, err
@@ -193,6 +209,11 @@ func (s *Service) UpdateUserOSSSetting(actor *model.User, req OSSSettingRequest)
 	if actor == nil {
 		return nil, Unauthorized("请先登录")
 	}
+	// 先把「个人不能配 Drive」挡在配置校验之前，否则用户会先收到
+	// 「请填写 Google Drive 客户端 ID」这种误导性的字段提示。
+	if req.Enabled && strings.EqualFold(strings.TrimSpace(req.Provider), gdriveProvider) {
+		return nil, Forbidden("Google Drive 只能由管理员配置为平台存储，暂不支持按用户绑定")
+	}
 	_, currentValue, err := s.readUserOSSSetting(actor.ID)
 	if err != nil {
 		return nil, err
@@ -207,6 +228,11 @@ func (s *Service) UpdateUserOSSSetting(actor *model.User, req OSSSettingRequest)
 	}
 	if next.Enabled && next.Provider == s3Provider && !platform.AllowUserS3 {
 		return nil, Forbidden("平台管理员尚未允许个人 S3 兼容存储")
+	}
+	if next.Enabled && next.Provider == gdriveProvider {
+		// Drive 的凭据绑在一个 Google 账号上，做成按用户配置意味着每个用户
+		// 都要跑一遍 OAuth 授权并单独托管刷新令牌。当前只支持平台级存储。
+		return nil, Forbidden("Google Drive 只能由管理员配置为平台存储，暂不支持按用户绑定")
 	}
 	if next.Provider == s3Provider && next.Enabled {
 		location, err := s.requireTestedS3Location("user", actor.ID, next)
@@ -326,9 +352,26 @@ func (s *Service) encryptOSSSettingSecrets(value ossSettingValue) (ossSettingVal
 	if err != nil {
 		return ossSettingValue{}, err
 	}
+	// Drive 的刷新令牌等价于长期凭据，必须与 SecretKey 同等对待。
+	value.GDrive.ClientSecret, err = s.encryptSettingSecret(value.GDrive.ClientSecret)
+	if err != nil {
+		return ossSettingValue{}, err
+	}
+	value.GDrive.RefreshToken, err = s.encryptSettingSecret(value.GDrive.RefreshToken)
+	if err != nil {
+		return ossSettingValue{}, err
+	}
 	value.ArchivedCredentials = cloneOSSProviderCredentials(value.ArchivedCredentials)
 	for provider, credentials := range value.ArchivedCredentials {
 		credentials.AccessKeySecret, err = s.encryptSettingSecret(credentials.AccessKeySecret)
+		if err != nil {
+			return ossSettingValue{}, err
+		}
+		credentials.ClientSecret, err = s.encryptSettingSecret(credentials.ClientSecret)
+		if err != nil {
+			return ossSettingValue{}, err
+		}
+		credentials.RefreshToken, err = s.encryptSettingSecret(credentials.RefreshToken)
 		if err != nil {
 			return ossSettingValue{}, err
 		}
@@ -351,12 +394,40 @@ func (s *Service) decryptOSSSettingSecrets(value *ossSettingValue) (bool, error)
 	if err != nil {
 		return false, err
 	}
+	if value.GDrive.ClientSecret != "" && !strings.HasPrefix(value.GDrive.ClientSecret, encryptedSettingPrefix) {
+		needsMigration = true
+	}
+	value.GDrive.ClientSecret, err = s.decryptSettingSecret(value.GDrive.ClientSecret)
+	if err != nil {
+		return false, err
+	}
+	if value.GDrive.RefreshToken != "" && !strings.HasPrefix(value.GDrive.RefreshToken, encryptedSettingPrefix) {
+		needsMigration = true
+	}
+	value.GDrive.RefreshToken, err = s.decryptSettingSecret(value.GDrive.RefreshToken)
+	if err != nil {
+		return false, err
+	}
 	value.ArchivedCredentials = cloneOSSProviderCredentials(value.ArchivedCredentials)
 	for provider, credentials := range value.ArchivedCredentials {
 		if credentials.AccessKeySecret != "" && !strings.HasPrefix(credentials.AccessKeySecret, encryptedSettingPrefix) {
 			needsMigration = true
 		}
 		credentials.AccessKeySecret, err = s.decryptSettingSecret(credentials.AccessKeySecret)
+		if err != nil {
+			return false, err
+		}
+		if credentials.ClientSecret != "" && !strings.HasPrefix(credentials.ClientSecret, encryptedSettingPrefix) {
+			needsMigration = true
+		}
+		credentials.ClientSecret, err = s.decryptSettingSecret(credentials.ClientSecret)
+		if err != nil {
+			return false, err
+		}
+		if credentials.RefreshToken != "" && !strings.HasPrefix(credentials.RefreshToken, encryptedSettingPrefix) {
+			needsMigration = true
+		}
+		credentials.RefreshToken, err = s.decryptSettingSecret(credentials.RefreshToken)
 		if err != nil {
 			return false, err
 		}
@@ -601,12 +672,26 @@ func ossSettingFromRequest(req OSSSettingRequest, current ossSettingValue) (ossS
 		PathStyle:       req.PathStyle,
 		SessionToken:    strings.TrimSpace(req.SessionToken),
 		AllowUserS3:     req.AllowUserS3,
-		Delivery:        storage.DeliverySettings{CDNAuthMode: strings.ToLower(strings.TrimSpace(req.CDNAuthMode)), RequireCDN: req.RequireCDN, AllowPrivateProxy: req.AllowPrivateProxy},
+		GDrive: storage.GDriveSettings{
+			ClientID:     strings.TrimSpace(req.GDriveClientID),
+			ClientSecret: strings.TrimSpace(req.GDriveClientSecret),
+			RefreshToken: strings.TrimSpace(req.GDriveRefreshToken),
+			RootFolderID: strings.TrimSpace(req.GDriveRootFolderID),
+			// 以下字段由服务端维护，不接受请求体传入：端点是出站目标，
+			// 邮箱/文件夹名是连接流程写下的回显值，普通保存不应把它们清掉。
+			AccountEmail:   current.GDrive.AccountEmail,
+			RootFolderName: strings.TrimSpace(current.GDrive.RootFolderName),
+			APIBaseURL:     current.GDrive.APIBaseURL,
+			TokenURL:       current.GDrive.TokenURL,
+			AuthorizeURL:   current.GDrive.AuthorizeURL,
+			UserInfoURL:    current.GDrive.UserInfoURL,
+		},
+		Delivery: storage.DeliverySettings{CDNAuthMode: strings.ToLower(strings.TrimSpace(req.CDNAuthMode)), RequireCDN: req.RequireCDN, AllowPrivateProxy: req.AllowPrivateProxy},
 	})
 	if next.Delivery.CDNAuthMode != "" && next.Delivery.CDNAuthMode != "public" && next.Delivery.CDNAuthMode != "qiniu" {
 		return next, BadAuthRequest("CDN 鉴权方式无效，仅支持 public 或 qiniu")
 	}
-	if !supportedOSSProvider(next.Provider) {
+	if !supportedOSSProvider(next.Provider) && next.Provider != gdriveProvider {
 		return next, BadAuthRequest(unsupportedOSSProviderMessage)
 	}
 	if next.Provider == s3Provider {
@@ -629,7 +714,44 @@ func ossSettingFromRequest(req OSSSettingRequest, current ossSettingValue) (ossS
 		next.SessionToken = ""
 		next.PathStyle = false
 	}
+	// Drive 的两枚**秘密**同样遵循「留空表示不修改」，但**不要求 provider 未变**：
+	// 首次从其它 provider 切到 Drive 时，凭据是管理员在「连接 Google 账号」那一步
+	// 提前写进同一条设置的，前端根本拿不到刷新令牌，套用「切换厂商不复用」会把
+	// 已经成功的连接判成配置不完整。凭据与 provider 是否变化无关，只认留空。
+	if next.Provider == gdriveProvider {
+		if next.GDrive.ClientSecret == "" {
+			next.GDrive.ClientSecret = current.GDrive.ClientSecret
+		}
+		if next.GDrive.RefreshToken == "" {
+			next.GDrive.RefreshToken = current.GDrive.RefreshToken
+		}
+		// 根文件夹 ID 也不是用户可清空的字段：它由连接流程在「建好文件夹」之后写下，
+		// 清空会让上传不再设置 parents，生成的文件静默落到「我的云端硬盘」根目录。
+		// 前端没有理由主动清空它（换文件夹只能靠重新连接），因此这里一律兜底。
+		if next.GDrive.RootFolderID == "" {
+			next.GDrive.RootFolderID = current.GDrive.RootFolderID
+		}
+		if next.GDrive.RootFolderID == "" {
+			// 两个都是空：说明还没连过 Drive，或历史配置被抹过。
+			// 让校验把它报成「配置不完整」，而不是带着空文件夹把文件撒到根目录。
+			return next, BadAuthRequest("Google Drive 目标文件夹缺失，请重新连接 Google 账号")
+		}
+	}
 	if next.Enabled {
+		// Drive 不是对象存储：没有 Bucket、Endpoint、Region 和一对访问密钥，
+		// 判定条件是「OAuth 客户端 + 刷新令牌」是否齐全。其它 provider 的校验原样保留。
+		if next.Provider == gdriveProvider {
+			if !storage.GDriveConfigured(next.GDrive) {
+				return next, BadAuthRequest("请填写 Google Drive 客户端 ID、客户端密钥与刷新令牌")
+			}
+			if next.CDNBaseURL != "" {
+				return next, BadAuthRequest("Google Drive 不支持 CDN 分发，请留空 CDN 地址")
+			}
+			if next.Delivery.RequireCDN {
+				return next, BadAuthRequest("Google Drive 不支持 CDN 分发，无法要求 CDN 访问")
+			}
+			return next, nil
+		}
 		if next.Bucket == "" {
 			return next, BadAuthRequest("请填写对象存储 Bucket")
 		}
@@ -685,14 +807,31 @@ func ossSettingFromRequest(req OSSSettingRequest, current ossSettingValue) (ossS
 
 func archiveOSSProviderCredentials(next ossSettingValue, current ossSettingValue) ossSettingValue {
 	next.ArchivedCredentials = cloneOSSProviderCredentials(current.ArchivedCredentials)
-	if current.Provider != next.Provider && (current.AccessKeyID != "" || current.AccessKeySecret != "") {
+	if current.Provider != next.Provider && hasOSSProviderCredentials(current) {
 		if next.ArchivedCredentials == nil {
 			next.ArchivedCredentials = make(map[string]ossProviderCredentials)
 		}
-		next.ArchivedCredentials[current.Provider] = ossProviderCredentials{AccessKeyID: current.AccessKeyID, AccessKeySecret: current.AccessKeySecret}
+		next.ArchivedCredentials[current.Provider] = ossProviderCredentials{
+			AccessKeyID:     current.AccessKeyID,
+			AccessKeySecret: current.AccessKeySecret,
+			ClientID:        current.GDrive.ClientID,
+			ClientSecret:    current.GDrive.ClientSecret,
+			RefreshToken:    current.GDrive.RefreshToken,
+		}
 	}
 	delete(next.ArchivedCredentials, next.Provider)
 	return next
+}
+
+// hasOSSProviderCredentials 判断当前配置是否带有值得归档的凭据。
+// Drive 的凭据不是一对访问密钥，必须单独判断：否则从 Drive 切走之后，
+// 历史对象的存储位置就再也解析不出可用的读取凭据。
+func hasOSSProviderCredentials(value ossSettingValue) bool {
+	if value.AccessKeyID != "" || value.AccessKeySecret != "" {
+		return true
+	}
+	return value.Provider == gdriveProvider &&
+		(value.GDrive.ClientID != "" || value.GDrive.ClientSecret != "" || value.GDrive.RefreshToken != "")
 }
 
 func defaultOSSSetting() ossSettingValue {
@@ -725,6 +864,7 @@ func (s *Service) publicOSSSetting(setting *model.SystemSetting, value ossSettin
 		result.CreatedAt = setting.CreatedAt
 		result.UpdatedAt = setting.UpdatedAt
 	}
+	applyGDrivePublicFields(&result, value)
 	if err := s.populateStorageLocationPublic(&result, scope, ownerID, value.StorageLocationID); err != nil {
 		return PublicOSSSetting{}, err
 	}
@@ -760,6 +900,7 @@ func (s *Service) publicUserOSSSetting(setting *model.UserOSSSetting, value ossS
 		result.CreatedAt = setting.CreatedAt
 		result.UpdatedAt = setting.UpdatedAt
 	}
+	applyGDrivePublicFields(&result, value)
 	if err := s.populateStorageLocationPublic(&result, "user", ownerID, value.StorageLocationID); err != nil {
 		return PublicOSSSetting{}, err
 	}
@@ -768,13 +909,36 @@ func (s *Service) publicUserOSSSetting(setting *model.UserOSSSetting, value ossS
 
 func storageLocationDigest(value ossSettingValue) string {
 	value = normalizeOSSSetting(value)
-	payload := strings.Join([]string{value.Provider, value.Endpoint, value.Bucket, value.Region, strconv.FormatBool(value.PathStyle), value.PathPrefix}, "\x00")
-	sum := sha256.Sum256([]byte(payload))
+	parts := []string{value.Provider, value.Endpoint, value.Bucket, value.Region, strconv.FormatBool(value.PathStyle), value.PathPrefix}
+	// Drive 没有 Endpoint/Bucket，存储位置就是目标文件夹；不带上它，
+	// 切换根目录会算出同一个摘要，历史资源的存储位置就会被错误复用。
+	// 只在 Drive 下追加，保证其它厂商的摘要逐字节不变。
+	if value.Provider == gdriveProvider {
+		parts = append(parts, strings.TrimSpace(value.GDrive.RootFolderID))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
 
 func storageTestDigest(value ossSettingValue) string {
-	payload := strings.Join([]string{storageLocationDigest(value), value.AccessKeyID, value.AccessKeySecret, value.SessionToken}, "\x00")
-	sum := sha256.Sum256([]byte(payload))
+	value = normalizeOSSSetting(value)
+	parts := []string{storageLocationDigest(value), value.AccessKeyID, value.AccessKeySecret, value.SessionToken}
+	// 连接测试证明的是「这份凭据可用」。换掉 Drive 的客户端密钥或刷新令牌
+	// 必须让上一次测试结果失效，否则会拿旧凭据的结论放行新配置。
+	if value.Provider == gdriveProvider {
+		parts = append(parts, value.GDrive.ClientID, value.GDrive.ClientSecret, value.GDrive.RefreshToken)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:])
+}
+
+// applyGDrivePublicFields 把 Drive 的非敏感配置投影到公开结构。
+// 密钥和刷新令牌永远只以「是否已配置」的形式出现，避免回传给前端。
+func applyGDrivePublicFields(result *PublicOSSSetting, value ossSettingValue) {
+	result.GDriveClientID = value.GDrive.ClientID
+	result.GDriveRootFolderID = value.GDrive.RootFolderID
+	result.GDriveRootFolderName = value.GDrive.RootFolderName
+	result.GDriveAccountEmail = value.GDrive.AccountEmail
+	result.HasGDriveClientSecret = strings.TrimSpace(value.GDrive.ClientSecret) != ""
+	result.HasGDriveRefreshToken = strings.TrimSpace(value.GDrive.RefreshToken) != ""
 }

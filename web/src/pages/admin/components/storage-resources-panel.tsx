@@ -21,7 +21,7 @@ export default function StorageResourcesPanel() {
     const keyword = searchParams.get("filter") || "";
     const kind = normalizeOption(searchParams.get("kind"), ["image", "video", "audio", "file", "live2d"]);
     const status = normalizeOption(searchParams.get("status"), ["pending", "ready", "failed", "deleted"]);
-    const provider = normalizeOption(searchParams.get("provider"), ["local", "aliyun", "tencent", "qiniu", "volcengine", "s3"]);
+    const provider = normalizeOption(searchParams.get("provider"), ["local", "aliyun", "tencent", "qiniu", "volcengine", "s3", "gdrive"]);
     const userQuery = searchParams.get("user") || searchParams.get("userId") || "";
     const page = positiveInt(searchParams.get("page"), 1);
     const pageSize = normalizePageSize(searchParams.get("pageSize"));
@@ -339,6 +339,7 @@ const providerOptions = [
     { label: "七牛云 Kodo", value: "qiniu" },
     { label: "火山引擎 TOS", value: "volcengine" },
     { label: "S3", value: "s3" },
+    { label: "Google Drive", value: "gdrive" },
 ];
 
 function normalizeOption(value: string | null, values: string[]) {
@@ -365,7 +366,7 @@ function statusTone(status: string): "neutral" | "success" | "warning" | "error"
     return status === "ready" ? "success" : status === "pending" ? "warning" : status === "failed" ? "error" : "neutral";
 }
 function providerLabel(provider: string) {
-    return ({ local: "本地", aliyun: "阿里云 OSS", tencent: "腾讯云 COS", qiniu: "七牛云 Kodo", volcengine: "火山引擎 TOS", s3: "S3" } as Record<string, string>)[provider] || provider || "本地";
+    return ({ local: "本地", aliyun: "阿里云 OSS", tencent: "腾讯云 COS", qiniu: "七牛云 Kodo", volcengine: "火山引擎 TOS", s3: "S3", gdrive: "Google Drive" } as Record<string, string>)[provider] || provider || "本地";
 }
 function formatBytes(bytes: number) {
     if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";

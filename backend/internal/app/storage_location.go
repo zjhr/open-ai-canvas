@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"yingce/backend/internal/model"
+	"yingce/backend/internal/storage"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/tencentyun/cos-go-sdk-v5"
@@ -50,6 +51,9 @@ func (s *Service) TestUserOSSSetting(actor *model.User, req OSSSettingRequest) (
 	}
 	if strings.EqualFold(strings.TrimSpace(req.Provider), s3Provider) && !platform.AllowUserS3 {
 		return nil, Forbidden("平台管理员尚未允许个人 S3 兼容存储")
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Provider), gdriveProvider) {
+		return nil, Forbidden("Google Drive 只能由管理员配置为平台存储，暂不支持按用户绑定")
 	}
 	_, current, err := s.readUserOSSSetting(actor.ID)
 	if err != nil {
@@ -100,6 +104,11 @@ func (s *Service) testOSSSetting(scope string, ownerID string, actorID string, r
 }
 
 func verifyOSSConnection(value ossSettingValue, testKey string) error {
+	// Drive 的对象句柄（fileId）要等写入之后才存在，无法像 S3 那样用同一个 key
+	// 走完「写 → 读 → 删」三步，因此单独走一条连接测试。
+	if value.Provider == gdriveProvider {
+		return verifyGDriveConnection(value, testKey)
+	}
 	payload := []byte("yingce-storage-test")
 	// 连接测试验证服务端到对象存储的真实读写权限。CDN 是浏览器读取出口，
 	// 可能存在回源鉴权或边缘同步延迟，不能参与刚写入对象的最小读写测试。
@@ -155,6 +164,10 @@ func verifyOSSConnectionRead(stream *ossObjectStream, payload []byte) error {
 func storageConnectionTestError(provider string, operation string, cause error) error {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	providerName := "对象存储"
+	// 每个 provider 需要用户检查的东西不一样，提示必须跟着换：
+	// Drive 没有 Bucket/Endpoint/访问密钥，照搬对象存储的指引只会把人带偏。
+	networkHint := "请检查 Endpoint 和服务端网络"
+	credentialHint := "请检查 Endpoint、Bucket、访问密钥和存储桶权限"
 	switch provider {
 	case aliyunOSSProvider:
 		providerName = "阿里云 OSS"
@@ -166,16 +179,21 @@ func storageConnectionTestError(provider string, operation string, cause error) 
 		providerName = "火山引擎 TOS"
 	case s3Provider:
 		providerName = "S3 兼容存储"
+	case gdriveProvider:
+		providerName = "Google Drive"
+		networkHint = "请检查服务器的出网网络能否访问 Google"
+		credentialHint = "请检查 OAuth 客户端 ID、客户端密钥、刷新令牌，以及目标文件夹的写入权限"
 	}
 
 	if errors.Is(cause, context.DeadlineExceeded) {
-		return WrapAppError(http.StatusGatewayTimeout, fmt.Sprintf("%s %s测试超时，请检查 Endpoint 和服务端网络", providerName, operation), cause)
+		return WrapAppError(http.StatusGatewayTimeout, fmt.Sprintf("%s %s测试超时，%s", providerName, operation, networkHint), cause)
 	}
 	var networkErr net.Error
 	if errors.As(cause, &networkErr) && networkErr.Timeout() {
-		return WrapAppError(http.StatusGatewayTimeout, fmt.Sprintf("%s %s测试超时，请检查 Endpoint 和服务端网络", providerName, operation), cause)
+		return WrapAppError(http.StatusGatewayTimeout, fmt.Sprintf("%s %s测试超时，%s", providerName, operation, networkHint), cause)
 	}
-	if operation == "Range 读取" && errors.Is(cause, errOSSConnectionReadMismatch) {
+	// Drive 的回读不一致由 storage 层用独立哨兵报出，与对象存储共用同一句解释。
+	if operation == "Range 读取" && (errors.Is(cause, errOSSConnectionReadMismatch) || errors.Is(cause, storage.ErrGDriveReadMismatch)) {
 		return WrapAppError(http.StatusBadGateway, fmt.Sprintf("%s Range 读取返回的数据与刚写入对象不一致，请检查 Endpoint 或出网代理是否忽略、改写了 Range 请求", providerName), cause)
 	}
 
@@ -212,7 +230,7 @@ func storageConnectionTestError(provider string, operation string, cause error) 
 		}
 	}
 
-	return WrapAppError(http.StatusBadGateway, fmt.Sprintf("%s %s测试失败，请检查 Endpoint、Bucket、访问密钥和存储桶权限", providerName, operation), cause)
+	return WrapAppError(http.StatusBadGateway, fmt.Sprintf("%s %s测试失败，%s", providerName, operation, credentialHint), cause)
 }
 
 func (s *Service) upsertStorageLocation(scope string, ownerID string, value ossSettingValue) (*model.StorageLocation, error) {
@@ -293,6 +311,8 @@ func (s *Service) populateStorageLocationPublic(result *PublicOSSSetting, scope 
 
 func deleteOSSObject(setting ossSettingValue, objectKey string) error {
 	switch normalizeOSSSetting(setting).Provider {
+	case gdriveProvider:
+		return deleteGDriveObject(setting, objectKey)
 	case s3Provider, volcengineTOSProvider:
 		return deleteS3Object(setting, objectKey)
 	case tencentCOSProvider:
@@ -302,4 +322,17 @@ func deleteOSSObject(setting ossSettingValue, objectKey string) error {
 	default:
 		return deleteAliyunOSSObject(setting, objectKey)
 	}
+}
+
+// verifyGDriveConnection 把 Drive 的连接测试收敛到一处：失败步骤由 storage 层给出，
+// 这里只负责把它翻译成带「Google Drive」和正确排查方向的可读提示。
+func verifyGDriveConnection(value ossSettingValue, testKey string) error {
+	operation, err := verifyGDriveObject(value, testKey)
+	if err == nil {
+		return nil
+	}
+	if operation == "" {
+		operation = "写入"
+	}
+	return storageConnectionTestError(gdriveProvider, operation, err)
 }

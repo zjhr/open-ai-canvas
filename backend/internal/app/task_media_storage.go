@@ -381,7 +381,7 @@ func (s *Service) storeTaskMediaObjectContext(ctx context.Context, resource *mod
 	if err != nil {
 		return "", err
 	}
-	return putOSSObjectContext(ctx, s.storageSettingWithRuntimePolicy(setting), resource.ObjectKey, resource.MimeType, resource.Size, body)
+	return s.writeResourceObjectContext(ctx, setting, resource, resource.MimeType, resource.Size, body)
 }
 
 // Cleanup is best effort only after durable completion. Expired leftovers are

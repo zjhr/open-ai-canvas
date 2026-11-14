@@ -1,16 +1,16 @@
 import { AdminPageFrame } from "../components/admin-shell";
-import { AlertTriangle, RefreshCw, Database, RotateCcw, HardDrive, Cloud, Check, ShieldCheck, Server, BadgeCheck, Save, Globe2, LocateFixed, KeyRound, Wifi } from "lucide-react";
+import { AlertTriangle, RefreshCw, Database, RotateCcw, HardDrive, Cloud, Check, ShieldCheck, Server, BadgeCheck, Save, Globe2, LocateFixed, KeyRound, Wifi, Copy, ExternalLink, Link2, PlugZap, Unplug } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Select, Switch } from "@/pages/admin/ui/controls";
 import { App, Form, Skeleton, Button, Input } from "antd";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useBlocker } from "react-router";
 
-import { type OSSConnectionTestResult, changesRequireOSSRetest, getS3PresetHints, S3_PRESET_OPTIONS, type S3Preset, VOLCENGINE_TOS_REGION_HINT } from "@/lib/oss-settings";
-import { getAdminOSSSetting, updateAdminOSSSetting, type AdminOSSSetting, testAdminOSSConnection } from "@/services/api/auth";
+import { type OSSConnectionTestResult, changesRequireOSSRetest, getS3PresetHints, GDRIVE_FIELD_HINTS, S3_PRESET_OPTIONS, type S3Preset, VOLCENGINE_TOS_REGION_HINT } from "@/lib/oss-settings";
+import { getAdminOSSSetting, updateAdminOSSSetting, type AdminOSSSetting, testAdminOSSConnection, getAdminGDriveSetup, authorizeAdminGDrive, disconnectAdminGDrive, type GDriveConnectStatus } from "@/services/api/auth";
 import { useAppearanceStore } from "@/stores/use-appearance-store";
 import { AdminStatusBadge, configuredSecretText, SettingsSectionCard } from "../components/admin-ui";
-import { accessKeySecretLabel, formValues, formatSettingTime, hasStorageChanges, isAdminOSSSetting, normalizeStoragePayload, providerDraftValues, storageProviderLabel, storageResponseMatches, type StoragePayload, validateStorageDraft, connectionInput, storageConfigurationReady, providerGuidance, accessKeyIdLabel } from "./storage-settings-model";
+import { accessKeySecretLabel, formValues, formatSettingTime, gdriveAuthorizeDraft, hasStorageChanges, isAdminOSSSetting, normalizeStoragePayload, providerDraftValues, storageProviderLabel, storageResponseMatches, type StoragePayload, validateStorageDraft, connectionInput, storageConfigurationReady, providerGuidance, accessKeyIdLabel } from "./storage-settings-model";
 import { type OSSFormValues, type StorageMode } from "./storage-settings-model";
 
 export { type OSSFormValues, type StorageMode, type StoragePayload } from "./storage-settings-model";
@@ -22,6 +22,7 @@ const STORAGE_MODES: Array<{ mode: StorageMode; label: string; short: string; de
     { mode: "qiniu", label: "七牛云 Kodo", short: "对象存储", description: "新增资源上传到 Kodo；无绑定域名时由后端代理读取。" },
     { mode: "volcengine", label: "火山引擎 TOS", short: "对象存储", description: "新增资源写入火山引擎 Bucket，可由 Region 生成 S3 兼容 Endpoint。" },
     { mode: "s3", label: "S3 兼容存储", short: "对象存储", description: "支持 AWS S3、Cloudflare R2、Backblaze B2、RustFS 与自定义 S3 Endpoint。" },
+    { mode: "gdrive", label: "Google Drive", short: "云盘", description: "填 OAuth 客户端后一键连接 Google 账号，写入 Drive 文件夹；浏览器读取由平台代理。" },
 ];
 
 export default function StorageSettingsPage() {
@@ -38,10 +39,20 @@ export default function StorageSettingsPage() {
     const [draftMode, setDraftMode] = useState<StorageMode>("local");
     const [loadError, setLoadError] = useState("");
     const [saveError, setSaveError] = useState("");
+    const [gdriveStatus, setGdriveStatus] = useState<GDriveConnectStatus | null>(null);
+    const [gdriveStatusLoading, setGdriveStatusLoading] = useState(false);
+    const [gdriveStatusError, setGdriveStatusError] = useState("");
+    const [connectingGDrive, setConnectingGDrive] = useState(false);
     const [form] = Form.useForm<OSSFormValues>();
     const requestVersionRef = useRef(0);
     const navigationConfirmOpenRef = useRef(false);
     const navigationTriggerRef = useRef<HTMLElement | null>(null);
+    // 连接 Google 账号必须整页跳转，此时不能弹出「未保存」拦截。
+    const gdriveRedirectRef = useRef(false);
+    // 授权回调是整页跳转，页面会重新挂载，表单里选中的存储方式也会丢。
+    // 回调成功后必须强制停在 Drive 面板，否则「已连接」状态根本不渲染，
+    // 用户会以为授权失败、存储被改回了本地。
+    const forceGDriveModeRef = useRef(false);
 
     const load = useCallback(
         async (initial = false, announce = false) => {
@@ -74,25 +85,70 @@ export default function StorageSettingsPage() {
         [message],
     );
 
+    const loadGDriveSetup = useCallback(async () => {
+        setGdriveStatusLoading(true);
+        try {
+            const result = await getAdminGDriveSetup();
+            setGdriveStatus(result.status);
+            setGdriveStatusError("");
+        } catch (error) {
+            setGdriveStatusError(error instanceof Error ? error.message : "读取 Google Drive 连接状态失败");
+        } finally {
+            setGdriveStatusLoading(false);
+        }
+    }, []);
+
     useEffect(() => {
+        // 授权回调只带回 query：先清掉再重新读取，刷新页面时不会重复弹同一条提示。
+        const params = new URLSearchParams(window.location.search);
+        const callbackResult = params.get("gdrive");
+        const callbackMessage = params.get("gdriveMessage") || "";
+        if (callbackResult) {
+            params.delete("gdrive");
+            params.delete("gdriveMessage");
+            const search = params.toString();
+            window.history.replaceState(window.history.state, "", `${window.location.pathname}${search ? `?${search}` : ""}${window.location.hash}`);
+            if (callbackResult === "connected") {
+                // 授权成功说明用户就是要用 Drive：即使平台此刻还跑在本地存储上，
+                // 也必须把面板切到 Drive，让「已连接」状态和保存按钮可见。
+                forceGDriveModeRef.current = true;
+                message.success("Google Drive 授权成功，请点「保存修改」把平台存储切换过来");
+            } else if (callbackResult === "cancelled") message.info("已取消 Google Drive 授权");
+            // 失败原因是服务端返回的中文可读文案，直接展示，不替换成本地措辞。
+            else if (callbackResult === "error") message.error(callbackMessage || "Google Drive 授权失败，请重新发起连接");
+        }
         void load(true);
         return () => {
             requestVersionRef.current += 1;
         };
-    }, [load]);
+    }, [load, message]);
+
+    // Drive 模式需要回调地址与连接状态：切到这个模式或配置变化后都重新读取。
+    useEffect(() => {
+        if (loading || !setting || draftMode !== "gdrive") return;
+        void loadGDriveSetup();
+    }, [draftMode, loadGDriveSetup, loading, setting]);
 
     useEffect(() => {
         if (loading || !setting) return;
         const values = formValues(setting);
-        form.setFieldsValue(values);
-        setDraftMode(values.mode);
+        // 刚完成授权时必须停在 Drive：formValues 只看服务端 enabled，
+        // 而平台此刻往往还在本地存储上，照抄会立刻把 Drive 面板藏起来。
+        const forced = forceGDriveModeRef.current ? { ...values, mode: "gdrive" as StorageMode } : values;
+        form.setFieldsValue(forced);
+        setDraftMode(forced.mode);
+        // 切到 Drive 相当于用户已做出的选择：标记为有未保存改动，
+        // 「保存修改」按钮才会亮，否则用户没有任何入口把平台切换过去。
+        if (forceGDriveModeRef.current) setDirty(true);
+        forceGDriveModeRef.current = false;
     }, [form, loading, setting]);
 
     const blocker = useBlocker(dirty && !saving);
 
     useEffect(() => {
         const beforeUnload = (event: BeforeUnloadEvent) => {
-            if (!dirty || saving) return;
+            // 连接 Google 账号是刻意的整页跳转，不能让「未保存」提示把它拦下来。
+            if (!dirty || saving || gdriveRedirectRef.current) return;
             event.preventDefault();
         };
         window.addEventListener("beforeunload", beforeUnload);
@@ -261,6 +317,57 @@ export default function StorageSettingsPage() {
         }
     };
 
+    const copyGDriveRedirectUri = async () => {
+        const redirectUri = gdriveStatus?.redirectUri || "";
+        if (!redirectUri) return;
+        try {
+            await navigator.clipboard.writeText(redirectUri);
+            message.success("已复制回调地址，请登记到 Google Cloud Console 的「已获授权的重定向 URI」");
+        } catch {
+            message.error("复制失败，请手动选中回调地址后复制");
+        }
+    };
+
+    const connectGDriveAccount = async () => {
+        if (!setting) return;
+        // 用表单当前草稿发起授权：两个都填就顺带保存，都空则沿用服务端已保存的客户端凭据。
+        const draft = gdriveAuthorizeDraft(form.getFieldsValue(true), setting);
+        if (draft.error) {
+            message.error(draft.error);
+            return;
+        }
+        setConnectingGDrive(true);
+        try {
+            const result = await authorizeAdminGDrive(draft.input || {});
+            // Google 同意页不能用 XHR 打开，必须由浏览器整页跳转。
+            gdriveRedirectRef.current = true;
+            window.location.href = result.authorizeUrl;
+        } catch (error) {
+            setConnectingGDrive(false);
+            message.error(error instanceof Error ? error.message : "发起 Google Drive 授权失败");
+        }
+    };
+
+    const disconnectGDriveAccount = () => {
+        modal.confirm({
+            title: "断开 Google Drive 连接？",
+            content: "断开后服务端会清除刷新令牌与目标文件夹信息，已写入 Drive 的文件不会被删除；客户端 ID 与密钥保留，可换账号重连。",
+            okText: "断开连接",
+            cancelText: "取消",
+            okButtonProps: { danger: true },
+            onOk: async () => {
+                try {
+                    await disconnectAdminGDrive();
+                    // 断开是服务端状态变更：重新读取配置与连接状态，避免把旧草稿当成本次操作结果。
+                    await load(false);
+                    message.success("已断开 Google Drive 连接");
+                } catch (error) {
+                    message.error(error instanceof Error ? error.message : "断开 Google Drive 连接失败");
+                }
+            },
+        });
+    };
+
     if (loading && !setting) {
         return (
             <AdminPageFrame title="存储服务" description="配置新增资源的默认存储位置" scroll>
@@ -297,6 +404,15 @@ export default function StorageSettingsPage() {
     const currentValues = form.getFieldsValue(true);
     const normalizedDraft = normalizeStoragePayload(currentValues, setting);
     const hasCurrentProviderSecret = draftMode !== "local" && setting.provider === draftMode && setting.hasAccessKeySecret;
+    const isGDrive = draftMode === "gdrive";
+    const sameGDriveSetting = isGDrive && setting.provider === "gdrive";
+    const hasCurrentGDriveSecret = sameGDriveSetting && setting.hasGDriveClientSecret;
+    // 连接状态以服务端 setup 为准，未取到时回退到已保存的配置。
+    const gdriveConnected = gdriveStatus?.connected ?? setting.hasGDriveRefreshToken === true;
+    const gdriveAccountEmail = gdriveStatus?.accountEmail || "";
+    const gdriveRootFolderName = gdriveStatus?.rootFolderName || "";
+    const gdriveRootFolderId = gdriveStatus?.rootFolderId || setting.gdriveRootFolderId || "";
+    const gdriveRedirectUri = gdriveStatus?.redirectUri || "";
 
     return (
         <AdminPageFrame title="存储服务" description="配置新增资源的默认存储位置" scroll>
@@ -378,7 +494,13 @@ export default function StorageSettingsPage() {
                         className="admin-storage-section admin-storage-configuration-section"
                         icon={draftMode === "local" ? <Server className="size-4" aria-hidden="true" /> : <Cloud className="size-4" aria-hidden="true" />}
                         title={draftMode === "local" ? "2. 配置服务器本地访问" : `2. 配置 ${storageProviderLabel(draftMode)} 接入`}
-                        description={draftMode === "local" ? "填写浏览器访问本地资源时使用的服务器根地址，然后保存。" : "按顺序填写存储位置、读取出口和服务端访问密钥，然后测试并保存。"}
+                        description={
+                            draftMode === "local"
+                                ? "填写浏览器访问本地资源时使用的服务器根地址，然后保存。"
+                                : isGDrive
+                                  ? "填 OAuth 客户端后连接 Google 账号，再测试并保存。刷新令牌与目标文件夹由服务端自动管理，Drive 没有 Bucket、Endpoint 与访问密钥。"
+                                  : "按顺序填写存储位置、读取出口和服务端访问密钥，然后测试并保存。"
+                        }
                         status={
                             <AdminStatusBadge
                                 label={dirty ? "有调整" : storageConfigurationReady(draftMode, normalizedDraft, setting) ? "已配置" : "待配置"}
@@ -454,148 +576,244 @@ export default function StorageSettingsPage() {
                                         <span>{providerGuidance(draftMode)}</span>
                                     </div>
 
-                                    <div className="admin-storage-form-section">
-                                        <FormSectionTitle icon={<Database className="size-4" />} title="存储位置" description="Bucket 决定容器，路径前缀用于隔离当前应用写入的对象目录。" />
-                                        {draftMode === "s3" ? (
-                                            <Form.Item name="s3Preset" label="S3 预设" extra={getS3PresetHints(form.getFieldValue("s3Preset") || "custom").help}>
-                                                <Select
-                                                    options={S3_PRESET_OPTIONS}
-                                                    onChange={(preset: S3Preset) => {
-                                                        const hints = getS3PresetHints(preset);
-                                                        form.setFieldsValue({ region: hints.region, endpoint: hints.endpoint });
-                                                        setDirty(hasStorageChanges({ ...form.getFieldsValue(true), region: hints.region, endpoint: hints.endpoint, s3Preset: preset }, setting));
-                                                        setTestStale(true);
-                                                    }}
-                                                />
-                                            </Form.Item>
-                                        ) : null}
-                                        <div className="admin-storage-form-grid is-location">
-                                            <Form.Item
-                                                name="region"
-                                                label="Region"
-                                                extra={
-                                                    draftMode === "tencent"
-                                                        ? "Endpoint 留空时由 Region 自动生成。"
-                                                        : draftMode === "qiniu"
-                                                          ? "无绑定域名时用于兼容 S3 的私有读取。"
-                                                          : draftMode === "volcengine"
-                                                            ? `Endpoint 留空时由 Region 自动生成。可选：${VOLCENGINE_TOS_REGION_HINT}。`
-                                                            : "按云厂商控制台显示值填写。"
-                                                }
-                                            >
-                                                <Input
-                                                    autoComplete="off"
-                                                    placeholder={
-                                                        draftMode === "s3"
-                                                            ? getS3PresetHints(form.getFieldValue("s3Preset") || "custom").region
-                                                            : draftMode === "tencent"
-                                                              ? "ap-guangzhou"
-                                                              : draftMode === "qiniu"
-                                                                ? "z0 / cn-east-1"
-                                                                : draftMode === "volcengine"
-                                                                  ? "cn-beijing"
-                                                                  : "oss-cn-hangzhou"
-                                                    }
-                                                />
-                                            </Form.Item>
-                                            <Form.Item name="bucket" label="Bucket">
-                                                <Input autoComplete="off" placeholder={draftMode === "qiniu" ? "七牛云存储空间名称" : draftMode === "volcengine" ? "火山引擎存储桶名称" : "对象存储 Bucket"} />
-                                            </Form.Item>
-                                            <Form.Item label="路径前缀" extra={`可自行填写；也可采用外观管理中的英文品牌标识 ${brandSlug}。保存时自动去除首尾斜杠。`}>
-                                                <div className="admin-storage-address-control">
-                                                    <Form.Item name="pathPrefix" noStyle>
-                                                        <Input autoComplete="off" placeholder={`例如：${brandSlug}`} />
-                                                    </Form.Item>
-                                                    <Button disabled={saving || refreshing || form.getFieldValue("pathPrefix") === brandSlug} onClick={useBrandPathPrefix}>
-                                                        使用品牌标识
-                                                    </Button>
+                                    {isGDrive ? (
+                                        <>
+                                            {gdriveStatusError ? (
+                                                <div className="admin-storage-inline-alert" role="alert">
+                                                    <AlertTriangle className="size-4 shrink-0" aria-hidden="true" />
+                                                    <span>{gdriveStatusError}。回调地址与连接状态暂时无法读取，请稍后刷新重试。</span>
                                                 </div>
-                                            </Form.Item>
-                                        </div>
-                                    </div>
-
-                                    <div className="admin-storage-form-section">
-                                        <FormSectionTitle icon={<Globe2 className="size-4" />} title="连接与读取出口" description="Endpoint 用于服务端写入；CDN 或绑定域名只决定浏览器读取出口。" />
-                                        <div className="admin-storage-form-grid">
-                                            <Form.Item
-                                                name="endpoint"
-                                                label={draftMode === "qiniu" ? "上传 Endpoint" : "Endpoint"}
-                                                extra={
-                                                    draftMode === "s3"
-                                                        ? getS3PresetHints(form.getFieldValue("s3Preset") || "custom").help
-                                                        : draftMode === "tencent"
-                                                          ? "可留空并由 Region 生成，也可填写完整 COS Endpoint。"
-                                                          : draftMode === "volcengine"
-                                                            ? "可留空并由 Region 生成；控制台的原生 Endpoint 或 Bucket 域名会换算为同地域 tos-s3 地址。"
-                                                            : "必须填写完整的 http/https 地址，服务端会继续执行出站安全校验。"
-                                                }
-                                            >
-                                                <Input
-                                                    autoComplete="off"
-                                                    inputMode="url"
-                                                    placeholder={
-                                                        draftMode === "s3"
-                                                            ? getS3PresetHints(form.getFieldValue("s3Preset") || "custom").endpoint
-                                                            : draftMode === "tencent"
-                                                              ? "https://cos.ap-guangzhou.myqcloud.com"
-                                                              : draftMode === "qiniu"
-                                                                ? "https://up-z0.qiniup.com"
-                                                                : draftMode === "volcengine"
-                                                                  ? "https://tos-s3-cn-beijing.volces.com"
-                                                                  : "https://oss-cn-hangzhou.aliyuncs.com"
-                                                    }
-                                                />
-                                            </Form.Item>
-                                            <Form.Item
-                                                name="cdnBaseUrl"
-                                                label={draftMode === "qiniu" ? "绑定域名（可选）" : "CDN 加速域名（可选）"}
-                                                extra={draftMode === "qiniu" ? "留空时按下方分发策略处理；不会由浏览器自行决定是否代理。" : "只填写域名根地址，不包含路径、查询参数或认证信息。"}
-                                            >
-                                                <Input autoComplete="off" inputMode="url" placeholder="https://media.example.com" />
-                                            </Form.Item>
-                                            <Form.Item name="cdnAuthMode" label="CDN 访问鉴权" extra="public 适用于 CDN 已公开或由 CDN 自行鉴权；qiniu 仅支持七牛私有下载签名。阿里云/腾讯云/火山引擎私有 CDN 暂不自动签名。">
-                                                <Select
-                                                    options={[
-                                                        { label: "未配置（回源或按兜底策略）", value: "" },
-                                                        { label: "公开 CDN", value: "public" },
-                                                        { label: "七牛私有下载签名", value: "qiniu" },
-                                                    ]}
-                                                />
-                                            </Form.Item>
-                                            <Form.Item name="requireCDN" label="必须走 CDN" valuePropName="checked" extra="开启后 CDN 鉴权配置不完整时直接失败，不会静默回源。">
-                                                <Switch checkedChildren="严格" unCheckedChildren="允许回源" />
-                                            </Form.Item>
-                                            <Form.Item name="allowPrivateProxy" label="允许模型输入代理" valuePropName="checked" extra="仅允许服务端向第三方模型提交参考素材时读取私有源站。浏览器展示、复制、下载和本地处理始终直连 OSS/CDN，不会经平台中转媒体正文。">
-                                                <Switch checkedChildren="允许" unCheckedChildren="禁止" />
-                                            </Form.Item>
-                                        </div>
-                                    </div>
-
-                                    <div className="admin-storage-form-section">
-                                        <FormSectionTitle icon={<KeyRound className="size-4" />} title="服务端访问凭据" description="密钥仅用于当前后端读写对象；切换厂商时不能复用另一厂商的 Secret。" />
-                                        <div className="admin-storage-form-grid">
-                                            <Form.Item name="accessKeyId" label={accessKeyIdLabel(draftMode)}>
-                                                <Input autoComplete="off" placeholder={accessKeyIdLabel(draftMode)} />
-                                            </Form.Item>
-                                            <Form.Item name="accessKeySecret" label={hasCurrentProviderSecret ? `${accessKeySecretLabel(draftMode)}（${configuredSecretText}）` : accessKeySecretLabel(draftMode)} extra="只在新增或替换当前厂商密钥时填写。">
-                                                <Input.Password autoComplete="new-password" placeholder={hasCurrentProviderSecret ? "留空保留原密钥" : accessKeySecretLabel(draftMode)} />
-                                            </Form.Item>
-                                            {draftMode === "s3" ? (
-                                                <Form.Item
-                                                    name="sessionToken"
-                                                    label={setting.provider === "s3" && setting.hasSessionToken ? `Session Token（${configuredSecretText}）` : "Session Token（可选）"}
-                                                    extra="使用临时凭证时填写；留空会保留当前 S3 提供方已有 Token。"
-                                                >
-                                                    <Input.Password autoComplete="new-password" placeholder={setting.provider === "s3" && setting.hasSessionToken ? "留空保留原 Token" : "临时凭证 Session Token"} />
-                                                </Form.Item>
                                             ) : null}
-                                        </div>
-                                        {draftMode === "s3" ? (
-                                            <Form.Item name="pathStyle" label="Path Style" valuePropName="checked" extra="开启后强制使用 path-style；关闭时由后端按 Endpoint 自动选择。">
-                                                <Switch checkedChildren="强制" unCheckedChildren="自动" />
-                                            </Form.Item>
-                                        ) : null}
-                                    </div>
+
+                                            <div className="admin-storage-form-section">
+                                                <FormSectionTitle
+                                                    icon={<KeyRound className="size-4" />}
+                                                    title="OAuth 客户端"
+                                                    description="在 Google Cloud Console 创建 OAuth 客户端，类型选「Web 应用」（桌面应用只接受 localhost 回调，填不了本站域名）；把客户端 ID 与密钥填在这里，凭据只用于当前后端读写 Drive。"
+                                                />
+                                                <div className="admin-storage-form-grid">
+                                                    <Form.Item name="gdriveClientId" label="客户端 ID" extra={GDRIVE_FIELD_HINTS.clientId}>
+                                                        <Input autoComplete="off" spellCheck={false} placeholder="xxxxxxxx.apps.googleusercontent.com" />
+                                                    </Form.Item>
+                                                    <Form.Item name="gdriveClientSecret" label={hasCurrentGDriveSecret ? `客户端密钥（${configuredSecretText}）` : "客户端密钥"} extra={GDRIVE_FIELD_HINTS.clientSecret}>
+                                                        <Input.Password autoComplete="off" spellCheck={false} placeholder={hasCurrentGDriveSecret ? "留空保留原密钥" : "OAuth 客户端密钥"} />
+                                                    </Form.Item>
+                                                </div>
+                                            </div>
+
+                                            <div className="admin-storage-form-section">
+                                                <FormSectionTitle
+                                                    icon={<Link2 className="size-4" />}
+                                                    title="回调地址"
+                                                    description="需登记到 Google Cloud Console 的「已获授权的重定向 URI」；地址由服务端按当前访问域名推导，请勿修改。"
+                                                />
+                                                <Form.Item label="已获授权的重定向 URI" extra="授权完成后 Google 会把浏览器送回这个地址，服务端据此换取长期刷新令牌。">
+                                                    <div className="admin-storage-address-control">
+                                                        <Input readOnly aria-label="Google Drive 回调地址" value={gdriveRedirectUri} placeholder={gdriveStatusLoading ? "正在读取回调地址…" : "暂时无法读取回调地址"} />
+                                                        <Button icon={<Copy className="size-4" />} disabled={!gdriveRedirectUri} onClick={() => void copyGDriveRedirectUri()}>
+                                                            复制
+                                                        </Button>
+                                                    </div>
+                                                </Form.Item>
+                                                {/* Drive 不展示路径前缀与模型输入代理；根文件夹由连接流程创建，这里只保持字段挂载，保存时原样回传服务端当前值。 */}
+                                                <Form.Item name="gdriveRootFolderId" hidden>
+                                                    <Input />
+                                                </Form.Item>
+                                                <Form.Item name="pathPrefix" hidden>
+                                                    <Input />
+                                                </Form.Item>
+                                                <Form.Item name="allowPrivateProxy" valuePropName="checked" hidden>
+                                                    <Switch />
+                                                </Form.Item>
+                                            </div>
+
+                                            <div className="admin-storage-form-section">
+                                                <FormSectionTitle icon={<Cloud className="size-4" />} title="Google 账号连接" description="授权成功后刷新令牌与目标文件夹都由服务端保存和创建，不需要手动填写。" />
+                                                {gdriveConnected ? (
+                                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                                        <div className="flex flex-col gap-1">
+                                                            <span className="flex flex-wrap items-center gap-2">
+                                                                <AdminStatusBadge label="已连接" tone="success" />
+                                                                <strong>{gdriveAccountEmail || "已连接 Google 账号"}</strong>
+                                                            </span>
+                                                            <span className="text-sm text-foreground/60">{gdriveRootFolderId ? `目标文件夹：${gdriveRootFolderName || "未命名文件夹"}` : "目标文件夹：云端硬盘根目录"}</span>
+                                                        </div>
+                                                        <div className="flex flex-wrap items-center gap-2">
+                                                            {gdriveRootFolderId ? (
+                                                                <Button icon={<ExternalLink className="size-4" />} href={`https://drive.google.com/drive/folders/${gdriveRootFolderId}`} target="_blank" rel="noreferrer">
+                                                                    打开文件夹
+                                                                </Button>
+                                                            ) : null}
+                                                            <Button danger icon={<Unplug className="size-4" />} disabled={saving || refreshing} onClick={disconnectGDriveAccount}>
+                                                                断开连接
+                                                            </Button>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <div className="flex flex-col gap-3">
+                                                        <span className="text-sm text-foreground/60">点下面的按钮会跳到 Google 同意页；请先用同一个 Google 账号登录并确认授权，授权码只在本机浏览器里流转。</span>
+                                                        <div>
+                                                            <Button
+                                                                type="primary"
+                                                                icon={<PlugZap className="size-4" />}
+                                                                loading={connectingGDrive || gdriveStatusLoading}
+                                                                disabled={saving || refreshing}
+                                                                onClick={() => void connectGDriveAccount()}
+                                                            >
+                                                                连接 Google 账号
+                                                            </Button>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <div className="admin-storage-form-section">
+                                                <FormSectionTitle icon={<Database className="size-4" />} title="存储位置" description="Bucket 决定容器，路径前缀用于隔离当前应用写入的对象目录。" />
+                                                {draftMode === "s3" ? (
+                                                    <Form.Item name="s3Preset" label="S3 预设" extra={getS3PresetHints(form.getFieldValue("s3Preset") || "custom").help}>
+                                                        <Select
+                                                            options={S3_PRESET_OPTIONS}
+                                                            onChange={(preset: S3Preset) => {
+                                                                const hints = getS3PresetHints(preset);
+                                                                form.setFieldsValue({ region: hints.region, endpoint: hints.endpoint });
+                                                                setDirty(hasStorageChanges({ ...form.getFieldsValue(true), region: hints.region, endpoint: hints.endpoint, s3Preset: preset }, setting));
+                                                                setTestStale(true);
+                                                            }}
+                                                        />
+                                                    </Form.Item>
+                                                ) : null}
+                                                <div className="admin-storage-form-grid is-location">
+                                                    <Form.Item
+                                                        name="region"
+                                                        label="Region"
+                                                        extra={draftMode === "tencent" ? "Endpoint 留空时由 Region 自动生成。" : draftMode === "qiniu" ? "无绑定域名时用于兼容 S3 的私有读取。" : draftMode === "volcengine" ? `Endpoint 留空时由 Region 自动生成。可选：${VOLCENGINE_TOS_REGION_HINT}。` : "按云厂商控制台显示值填写。"}
+                                                    >
+                                                        <Input
+                                                            autoComplete="off"
+                                                            placeholder={
+                                                                draftMode === "s3"
+                                                                    ? getS3PresetHints(form.getFieldValue("s3Preset") || "custom").region
+                                                                    : draftMode === "tencent"
+                                                                      ? "ap-guangzhou"
+                                                                      : draftMode === "qiniu"
+                                                                        ? "z0 / cn-east-1"
+                                                                        : draftMode === "volcengine"
+                                                                          ? "cn-beijing"
+                                                                          : "oss-cn-hangzhou"
+                                                            }
+                                                        />
+                                                    </Form.Item>
+                                                    <Form.Item name="bucket" label="Bucket">
+                                                        <Input autoComplete="off" placeholder={draftMode === "qiniu" ? "七牛云存储空间名称" : draftMode === "volcengine" ? "火山引擎存储桶名称" : "对象存储 Bucket"} />
+                                                    </Form.Item>
+                                                    <Form.Item label="路径前缀" extra={`可自行填写；也可采用外观管理中的英文品牌标识 ${brandSlug}。保存时自动去除首尾斜杠。`}>
+                                                        <div className="admin-storage-address-control">
+                                                            <Form.Item name="pathPrefix" noStyle>
+                                                                <Input autoComplete="off" placeholder={`例如：${brandSlug}`} />
+                                                            </Form.Item>
+                                                            <Button disabled={saving || refreshing || form.getFieldValue("pathPrefix") === brandSlug} onClick={useBrandPathPrefix}>
+                                                                使用品牌标识
+                                                            </Button>
+                                                        </div>
+                                                    </Form.Item>
+                                                </div>
+                                            </div>
+
+                                            <div className="admin-storage-form-section">
+                                                <FormSectionTitle icon={<Globe2 className="size-4" />} title="连接与读取出口" description="Endpoint 用于服务端写入；CDN 或绑定域名只决定浏览器读取出口。" />
+                                                <div className="admin-storage-form-grid">
+                                                    <Form.Item
+                                                        name="endpoint"
+                                                        label={draftMode === "qiniu" ? "上传 Endpoint" : "Endpoint"}
+                                                        extra={
+                                                            draftMode === "s3"
+                                                                ? getS3PresetHints(form.getFieldValue("s3Preset") || "custom").help
+                                                                : draftMode === "tencent"
+                                                                  ? "可留空并由 Region 生成，也可填写完整 COS Endpoint。"
+                                                                  : draftMode === "volcengine"
+                                                                    ? "可留空并由 Region 生成；控制台的原生 Endpoint 或 Bucket 域名会换算为同地域 tos-s3 地址。"
+                                                                    : "必须填写完整的 http/https 地址，服务端会继续执行出站安全校验。"
+                                                        }
+                                                    >
+                                                        <Input
+                                                            autoComplete="off"
+                                                            inputMode="url"
+                                                            placeholder={
+                                                                draftMode === "s3"
+                                                                    ? getS3PresetHints(form.getFieldValue("s3Preset") || "custom").endpoint
+                                                                    : draftMode === "tencent"
+                                                                      ? "https://cos.ap-guangzhou.myqcloud.com"
+                                                                      : draftMode === "qiniu"
+                                                                        ? "https://up-z0.qiniup.com"
+                                                                        : draftMode === "volcengine"
+                                                                          ? "https://tos-s3-cn-beijing.volces.com"
+                                                                          : "https://oss-cn-hangzhou.aliyuncs.com"
+                                                            }
+                                                        />
+                                                    </Form.Item>
+                                                    <Form.Item
+                                                        name="cdnBaseUrl"
+                                                        label={draftMode === "qiniu" ? "绑定域名（可选）" : "CDN 加速域名（可选）"}
+                                                        extra={draftMode === "qiniu" ? "留空时按下方分发策略处理；不会由浏览器自行决定是否代理。" : "只填写域名根地址，不包含路径、查询参数或认证信息。"}
+                                                    >
+                                                        <Input autoComplete="off" inputMode="url" placeholder="https://media.example.com" />
+                                                    </Form.Item>
+                                                    <Form.Item name="cdnAuthMode" label="CDN 访问鉴权" extra="public 适用于 CDN 已公开或由 CDN 自行鉴权；qiniu 仅支持七牛私有下载签名。阿里云/腾讯云/火山引擎私有 CDN 暂不自动签名。">
+                                                        <Select
+                                                            options={[
+                                                                { label: "未配置（回源或按兜底策略）", value: "" },
+                                                                { label: "公开 CDN", value: "public" },
+                                                                { label: "七牛私有下载签名", value: "qiniu" },
+                                                            ]}
+                                                        />
+                                                    </Form.Item>
+                                                    <Form.Item name="requireCDN" label="必须走 CDN" valuePropName="checked" extra="开启后 CDN 鉴权配置不完整时直接失败，不会静默回源。">
+                                                        <Switch checkedChildren="严格" unCheckedChildren="允许回源" />
+                                                    </Form.Item>
+                                                    <Form.Item
+                                                        name="allowPrivateProxy"
+                                                        label="允许模型输入代理"
+                                                        valuePropName="checked"
+                                                        extra="仅允许服务端向第三方模型提交参考素材时读取私有源站。浏览器展示、复制、下载和本地处理始终直连 OSS/CDN，不会经平台中转媒体正文。"
+                                                    >
+                                                        <Switch checkedChildren="允许" unCheckedChildren="禁止" />
+                                                    </Form.Item>
+                                                </div>
+                                            </div>
+
+                                            <div className="admin-storage-form-section">
+                                                <FormSectionTitle icon={<KeyRound className="size-4" />} title="服务端访问凭据" description="密钥仅用于当前后端读写对象；切换厂商时不能复用另一厂商的 Secret。" />
+                                                <div className="admin-storage-form-grid">
+                                                    <Form.Item name="accessKeyId" label={accessKeyIdLabel(draftMode)}>
+                                                        <Input autoComplete="off" placeholder={accessKeyIdLabel(draftMode)} />
+                                                    </Form.Item>
+                                                    <Form.Item
+                                                        name="accessKeySecret"
+                                                        label={hasCurrentProviderSecret ? `${accessKeySecretLabel(draftMode)}（${configuredSecretText}）` : accessKeySecretLabel(draftMode)}
+                                                        extra="只在新增或替换当前厂商密钥时填写。"
+                                                    >
+                                                        <Input.Password autoComplete="new-password" placeholder={hasCurrentProviderSecret ? "留空保留原密钥" : accessKeySecretLabel(draftMode)} />
+                                                    </Form.Item>
+                                                    {draftMode === "s3" ? (
+                                                        <Form.Item
+                                                            name="sessionToken"
+                                                            label={setting.provider === "s3" && setting.hasSessionToken ? `Session Token（${configuredSecretText}）` : "Session Token（可选）"}
+                                                            extra="使用临时凭证时填写；留空会保留当前 S3 提供方已有 Token。"
+                                                        >
+                                                            <Input.Password autoComplete="new-password" placeholder={setting.provider === "s3" && setting.hasSessionToken ? "留空保留原 Token" : "临时凭证 Session Token"} />
+                                                        </Form.Item>
+                                                    ) : null}
+                                                </div>
+                                                {draftMode === "s3" ? (
+                                                    <Form.Item name="pathStyle" label="Path Style" valuePropName="checked" extra="开启后强制使用 path-style；关闭时由后端按 Endpoint 自动选择。">
+                                                        <Switch checkedChildren="强制" unCheckedChildren="自动" />
+                                                    </Form.Item>
+                                                ) : null}
+                                            </div>
+                                        </>
+                                    )}
                                     <div className="admin-storage-form-section">
                                         <FormSectionTitle icon={<Wifi className="size-4" />} title="连接验证" description="使用当前草稿执行最小读写测试；测试不会保存配置，也不会迁移已有资源。" />
                                         <div className="flex flex-wrap items-center gap-3">

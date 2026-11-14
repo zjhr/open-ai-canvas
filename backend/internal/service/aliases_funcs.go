@@ -27,6 +27,7 @@ var (
 	EnsureChatCompletionStreamUsageRequest     = app.EnsureChatCompletionStreamUsageRequest
 	Forbidden                                  = app.Forbidden
 	FormatModelError                           = app.FormatModelError
+	GDriveCallbackURL                          = app.GDriveCallbackURL
 	GetModelErrorCode                          = app.GetModelErrorCode
 	HasValidPrice                              = app.HasValidPrice
 	InvalidModelSelection                      = app.InvalidModelSelection

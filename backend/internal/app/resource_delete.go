@@ -339,6 +339,12 @@ func (s *Service) deleteStoredResourceObject(userID string, resource *model.Reso
 			return fmt.Errorf("无法读取火山引擎 TOS 配置：%w", err)
 		}
 		return deleteS3Object(setting, resource.ObjectKey)
+	case gdriveProvider:
+		setting, err := s.ossSettingForResource(userID, resource)
+		if err != nil {
+			return fmt.Errorf("无法读取 Google Drive 配置：%w", err)
+		}
+		return deleteGDriveObject(setting, resource.ObjectKey)
 	case s3Provider:
 		setting, err := s.ossSettingForResource(userID, resource)
 		if err != nil {

@@ -82,6 +82,48 @@ func TestResolveAccessPolicyMatrix(t *testing.T) {
 			options:  AccessOptions{Purpose: PurposeProvider},
 			wantMode: DeliveryProxy, wantReason: "private_origin",
 		},
+		{
+			// Drive 的读取必须带 Authorization 头，没有可交给浏览器的地址，
+			// 因此展示改由平台代理，而不是像 OSS 那样签发直连地址。
+			name:     "gdrive display goes through the platform proxy",
+			resource: testReadyResource("gdrive"),
+			setting:  storage.Settings{Provider: "gdrive", GDrive: storage.GDriveSettings{ClientID: "id", ClientSecret: "secret", RefreshToken: "token"}},
+			options:  AccessOptions{Purpose: PurposeDisplay},
+			wantMode: DeliveryProxy, wantReason: "provider_requires_proxy",
+			wantURL: "https://canvas.example/api/resources/resource-1/file",
+		},
+		{
+			name:     "gdrive download goes through the platform proxy",
+			resource: testReadyResource("gdrive"),
+			setting:  storage.Settings{Provider: "gdrive", GDrive: storage.GDriveSettings{ClientID: "id", ClientSecret: "secret", RefreshToken: "token"}},
+			options:  AccessOptions{Purpose: PurposeDownload},
+			wantMode: DeliveryProxy, wantReason: "provider_requires_proxy",
+		},
+		{
+			// 预签名能力是 provider 的固有属性：即使误配了 CDN，也不能签发一个拿不到的地址。
+			name:     "gdrive never hands off a CDN URL",
+			resource: testReadyResource("gdrive"),
+			setting:  storage.Settings{Provider: "gdrive", CDNBaseURL: "https://media.example.com", Delivery: storage.DeliverySettings{CDNAuthMode: "public"}},
+			options:  AccessOptions{Purpose: PurposeCopy},
+			wantMode: DeliveryProxy, wantReason: "provider_requires_proxy",
+			wantURL: "https://canvas.example/api/resources/resource-1/file",
+		},
+		{
+			// 非内联媒体仍然先命中「附件必须由平台强制响应头」，理由保持可区分。
+			name:     "gdrive attachment keeps the attachment reason",
+			resource: &model.Resource{ID: "resource-1", UserID: "user-1", Provider: "gdrive", ObjectKey: "file-1", Status: model.ResourceStatusReady, MimeType: "application/zip", ETag: "etag-1"},
+			setting:  storage.Settings{Provider: "gdrive", GDrive: storage.GDriveSettings{ClientID: "id", ClientSecret: "secret", RefreshToken: "token"}},
+			options:  AccessOptions{Purpose: PurposeDownload},
+			wantMode: DeliveryProxy, wantReason: "attachment_required",
+		},
+		{
+			// 模型输入读 Drive 也必须代理，且不依赖 AllowPrivateProxy 这个针对私网源站的开关。
+			name:     "gdrive provider input proxies without the private origin switch",
+			resource: testReadyResource("gdrive"),
+			setting:  storage.Settings{Provider: "gdrive", GDrive: storage.GDriveSettings{ClientID: "id", ClientSecret: "secret", RefreshToken: "token"}},
+			options:  AccessOptions{Purpose: PurposeProvider},
+			wantMode: DeliveryProxy, wantReason: "provider_requires_proxy",
+		},
 	}
 
 	for _, tt := range tests {

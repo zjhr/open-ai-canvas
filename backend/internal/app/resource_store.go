@@ -6,6 +6,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -270,7 +271,7 @@ func (s *Service) openResourceRange(userID string, resource *model.Resource, ran
 	if err != nil {
 		return nil, err
 	}
-	if setting.AccessKeyID == "" || setting.AccessKeySecret == "" {
+	if (setting.AccessKeyID == "" || setting.AccessKeySecret == "") && !(setting.Provider == gdriveProvider || strings.EqualFold(strings.TrimSpace(resource.Provider), gdriveProvider)) {
 		return nil, errors.New("对象存储访问密钥不可用")
 	}
 	setting.Provider = firstNonEmpty(resource.Provider, setting.Provider)
@@ -404,6 +405,29 @@ func writeLocalResourceObject(filePath string, body io.Reader) error {
 	return closeErr
 }
 
+// writeResourceObject 是资源写入对象存储的唯一分支点。
+//
+// Google Drive 的对象句柄（fileId）只有写入成功之后才存在，因此这里在写入后把
+// resource.ObjectKey 从「逻辑路径」换成 Drive 的 fileId：调用方紧接着保存资源，
+// 落库的就已经是后续读取和删除要用的句柄。其它 provider 的 key 语义原样不变。
+func (s *Service) writeResourceObject(setting ossSettingValue, resource *model.Resource, mimeType string, size int64, body io.Reader) (string, error) {
+	return s.writeResourceObjectContext(context.Background(), setting, resource, mimeType, size, body)
+}
+
+// writeResourceObjectContext 在调用方已有 ctx 时使用，让对象存储写入（含 SDK 重试）
+// 跟随任务取消；Drive 分支暂无 ctx 支持，保持原有行为。
+func (s *Service) writeResourceObjectContext(ctx context.Context, setting ossSettingValue, resource *model.Resource, mimeType string, size int64, body io.Reader) (string, error) {
+	if setting.Provider != gdriveProvider {
+		return putOSSObjectContext(ctx, s.storageSettingWithRuntimePolicy(setting), resource.ObjectKey, mimeType, size, body)
+	}
+	fileID, etag, err := putGDriveObject(s.storageSettingWithRuntimePolicy(setting), resource.ObjectKey, mimeType, size, body)
+	if err != nil {
+		return "", err
+	}
+	resource.ObjectKey = fileID
+	return etag, nil
+}
+
 // storeResourceObject writes to the configured origin. When object storage is
 // enabled, a failed origin write must fail the resource instead of silently
 // changing its storage location to local disk.
@@ -418,11 +442,7 @@ func (s *Service) storeResourceObject(resource *model.Resource, fileName string,
 	if settingErr != nil {
 		return "", settingErr
 	}
-	etag, err := putOSSObject(s.storageSettingWithRuntimePolicy(setting), resource.ObjectKey, resource.MimeType, resource.Size, body)
-	if err != nil {
-		return "", err
-	}
-	return etag, nil
+	return s.writeResourceObject(setting, resource, resource.MimeType, resource.Size, body)
 }
 
 func (s *Service) retryStoredResource(userID string, resource *model.Resource, kind string, mimeType string, size int64, body io.Reader) (*model.Resource, error) {

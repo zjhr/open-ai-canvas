@@ -202,6 +202,8 @@ type (
 	EmailSettingRequest                    = app.EmailSettingRequest
 	ErrorReason                            = app.ErrorReason
 	FeatureAvailability                    = app.FeatureAvailability
+	GDriveAuthorizeRequest                 = app.GDriveAuthorizeRequest
+	GDriveConnectStatus                    = app.GDriveConnectStatus
 	ImageCapabilityConfig                  = app.ImageCapabilityConfig
 	ImageQualityConfig                     = app.ImageQualityConfig
 	ImageReferenceConfig                   = app.ImageReferenceConfig

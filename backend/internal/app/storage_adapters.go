@@ -65,6 +65,15 @@ var (
 	getS3ObjectRange            = storage.GetS3ObjectRange
 	signedS3ObjectURL           = storage.SignedS3ObjectURL
 	deleteS3Object              = storage.DeleteS3Object
+	putGDriveObject             = storage.PutGDriveObject
+	deleteGDriveObject          = storage.DeleteGDriveObject
+	verifyGDriveObject          = storage.VerifyGDriveObject
+	gdriveAuthorizeURL          = storage.GDriveAuthorizeURL
+	exchangeGDriveCode          = storage.GDriveExchangeCode
+	readGDriveAccountEmail      = storage.GDriveAccountEmail
+	ensureGDriveRootFolder      = storage.EnsureGDriveRootFolder
+	pkceChallenge               = storage.PKCEChallenge
+	resetGDriveTokenCache       = storage.ResetGDriveTokenCache
 	cloneOSSProviderCredentials = storage.CloneCredentials
 	normalizeOSSSetting         = storage.NormalizeSettings
 )

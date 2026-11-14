@@ -139,11 +139,51 @@ test("storage settings keep generic S3 controls and connection validation", asyn
     const compacted = compactSource(source);
 
     expect(compacted).toContain('{ mode: "s3", label: "S3 兼容存储"');
+    expect(compacted).toContain('{ mode: "gdrive", label: "Google Drive"');
     expect(compacted).toContain("testAdminOSSConnection(connectionInput(values))");
-    for (const field of ["s3Preset", "sessionToken", "pathStyle", "allowUserS3"]) {
+    for (const field of ["s3Preset", "sessionToken", "pathStyle", "allowUserS3", "gdriveClientId", "gdriveClientSecret"]) {
         expect(compacted).toContain(`name="${field}"`);
     }
-    expect(compacted).toContain('["aliyun", "tencent", "qiniu", "volcengine", "s3"].includes(setting.provider || "")');
+    // 刷新令牌改由服务端授权流程取得，前端不再有手填入口。
+    expect(compacted).not.toContain('name="gdriveRefreshToken"');
+    expect(compacted).not.toContain("gdriveRefreshToken");
+    expect(compacted).toContain('["aliyun", "tencent", "qiniu", "volcengine", "s3", "gdrive"].includes(setting.provider || "")');
+});
+
+test("Google Drive storage connects through a Google authorization redirect", async () => {
+    const source = await Promise.resolve(moduleGroupSource("pages/admin/settings/storage-settings-page.tsx"));
+    const compacted = compactSource(source);
+
+    expect(compacted).toContain("getAdminGDriveSetup()");
+    expect(compacted).toContain("authorizeAdminGDrive(");
+    expect(compacted).toContain("disconnectAdminGDrive()");
+    expect(compacted).toContain("gdriveAuthorizeDraft(form.getFieldsValue(true), setting)");
+    // 同意页必须整页跳转，fetch/XHR 打不开。
+    expect(compacted).toContain("window.location.href = result.authorizeUrl");
+    expect(compacted).toContain("连接 Google 账号");
+    expect(compacted).toContain("断开连接");
+    // 回调地址只读展示，供管理员登记到 Google Cloud Console。
+    expect(compacted).toContain("已获授权的重定向 URI");
+    expect(compacted).toContain("gdriveStatus?.redirectUri");
+    expect(compacted).toContain("https://drive.google.com/drive/folders/");
+    expect(compacted).toContain('rel="noreferrer"');
+    expect(compacted).not.toContain("Modal.confirm");
+});
+
+test("Google Drive callback query drives the notice and is cleared from the address bar", async () => {
+    const source = await Promise.resolve(moduleGroupSource("pages/admin/settings/storage-settings-page.tsx"));
+    const compacted = compactSource(source);
+
+    expect(compacted).toContain('params.get("gdrive")');
+    expect(compacted).toContain('params.get("gdriveMessage")');
+    expect(compacted).toContain('params.delete("gdrive")');
+    expect(compacted).toContain('params.delete("gdriveMessage")');
+    expect(compacted).toContain("window.history.replaceState");
+    expect(compacted).toContain('callbackResult === "connected"');
+    expect(compacted).toContain('callbackResult === "cancelled"');
+    expect(compacted).toContain('callbackResult === "error"');
+    // 失败原因是服务端返回的中文可读文案：直接展示，不替换成本地措辞。
+    expect(compacted).toContain("message.error(callbackMessage ||");
 });
 
 test("admin navigation keeps the storage resource page reachable", async () => {

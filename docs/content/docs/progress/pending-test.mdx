@@ -22,6 +22,31 @@ description: 当前项目已实现功能的手工验证清单与未确认边界
 - [ ] 请求体不含 `voice` / `voice_label` / `timestamp`（上游对这三个字段返回 400）。
 - [ ] `instruction` 超过 500 字符或 `scripts` 超过 1000 字符时，失败信息按上游错误返回。
 
+## Google Drive 作为资源存储（provider `gdrive`）
+
+- 已实现：存储设置新增第五个 provider `gdrive`，让生成的图片/视频落到谷歌云盘而不占服务器磁盘。凭据是「OAuth 客户端 ID + 客户端密钥 + 长期刷新令牌」，目标文件夹由服务端创建并记下；没有 Bucket/Endpoint/Region/访问密钥——Drive 不是对象存储，这些字段对它没有意义。管理员在界面上只需要填客户端 ID 与客户端密钥两项。
+- 已实现：写入走 resumable 会话（先 `files.create` 拿 `Location`，再 PUT 内容），读取走 `files.get?alt=media` 并透传 `Range`，删除走 `files.delete`。连接测试要求**写入 → 按 fileId Range 回读 → 删除**三步都通过；回读失败也先把测试对象删掉，不在用户云盘里留垃圾。
+- 已实现「一键连接」授权：管理员只需填**客户端 ID + 客户端密钥**两个字段，点「连接 Google 账号」后整页跳到 Google 同意页；回调由服务端换码、读账号邮箱、准备好目标文件夹并一次性落库。**刷新令牌与根文件夹都由服务端自动获得，不需要人工填写**。接口是 `GET /gdrive/setup`、`POST /gdrive/authorize`、`GET /gdrive/callback`、`POST /gdrive/disconnect`（都在 `/api/admin/settings/oss/` 之下）。
+- 权限设计：只申请 `openid`、`email`、`drive.file` 三个**非敏感**权限，因此自建 OAuth 客户端**不需要**跑 Google 的验证与 CASA 安全评估。代价是只能访问本应用创建或被显式选中的文件——所以目标文件夹是**应用自己在「我的云端硬盘」根目录建的**（默认名 `yingce-storage`），而不是让管理员填一个已有目录的 ID：按名字搜索已存在的同名目录会拿到一个没有权限的 ID，要等到写入时才失败。因此设置页不再有「根文件夹 ID」输入框。
+- 已经上传的文件之后被管理员在 Drive 里移到别处也不影响读写：读取和删除都按 `fileId` 定位，不依赖父目录。重新连接时若登记的文件夹已被删除或进了回收站，会新建一个；若是 500 之类的非「不存在」错误则原样上报，不退化成新建。
+- 授权安全：授权链接带 `access_type=offline` 与 `prompt=consent`（否则重复授权时 Google 会省略刷新令牌），并用 PKCE(S256) 保护换码——verifier 只存服务端。状态记录复用 `oauth_states` 表但与 Linux.do 登录用独立 `provider` 值隔离，绑定发起授权的管理员，**回调必须由同一个管理员完成**；一次性消费、10 分钟过期，绑定校验失败时状态同样作废（失败关闭）。回调路径放在 `/api/` 下，沿用现有反代规则，**不需要改 nginx.conf 或 vite.config.ts**。
+- 关键差异：`resources.object_key` 对 Drive 是上传后生成的 `fileId`，不是路径。Drive 的文件名与文件句柄不是同一个东西，因此写入成功后由 `writeResourceObject` 把 `object_key` 回填为 `fileId`，逻辑路径另存为 Drive 文件的 description（展示名取末段）。这意味着 Drive 资源不能按路径推导对象键。
+- 投递策略：Drive 没有预签名地址，读取必须带 `Authorization` 头，把地址交给浏览器只会 401。因此 Drive 资源的全部媒体用途（展示/复制/下载/模型输入）都由平台代理，`fallbackReason` 为 `provider_requires_proxy`。代价是媒体流量经过应用服务器——这是「用个人网盘当存储」的固有成本。该规则由 `storage.RequiresPlatformProxy` 按 provider 能力判断，**只在 Drive 生效**，其它 provider 的私有源站仍按原规则返回 `resource_origin_private`。
+- 已实现：Drive 只允许平台级配置；用户级表单提交会被拒绝（403「Google Drive 只能由管理员配置为平台存储」）。按用户绑定意味着每个用户各跑一遍 OAuth 并单独托管刷新令牌，不在本次范围。
+- 已实现：客户端密钥与刷新令牌用后端设置密钥加密落库；切换 provider 时归档，保证历史 Drive 对象仍能解析出可用凭据。存储位置摘要把根文件夹算进去（换根目录 = 换位置），连接测试摘要把凭据算进去（换凭据 = 上一次测试结论失效）。
+- [x] 后端专项：`go test ./internal/storage/ -run 'GDrive|PKCE'` 42 项通过，用 httptest 假 Drive 覆盖 resumable 会话元数据（展示名压平、description 保留逻辑路径、parents 指向根目录）、`Range` 透传与 `Content-Range`、`files.delete` 幂等（404 视为成功）、access token 缓存与过期重取、`invalid_grant` 与配额错误的消息透传、未知长度缓冲与超限拒绝、fileId 校验、连接测试三步与回读不一致/删除失败的步骤归属；授权侧覆盖权限集合钉死（防止有人换成受限的 `drive` scope）、**PKCE 用 RFC 7636 附录 B 官方向量校验**、授权链接的 `offline`/`consent`/S256 参数、换码表单字段、Google 未下发刷新令牌时的可读报错、账号邮箱读取、目标文件夹的「复用 / 新建 / 被删 / 进回收站 / 非不存在错误原样上报」五种分支，以及读状态不产生副作用。
+- [x] 后端专项：`go test ./internal/app/ -run 'GDrive|Gdrive'` 35 项通过，覆盖 Drive 配置校验（不要求 Bucket/Endpoint/Region）、缺凭据拒绝、CDN 配置拒绝、留空保留旧凭据、请求体不能覆盖 Drive 端点、密钥加密与归档、存储位置/连接测试摘要、用户级拒绝、公开结构只回传布尔标记、`object_key` 回填 `fileId`、删除分派、连接测试错误步骤映射；授权侧覆盖非管理员拒绝、只填一个凭据字段拒绝、凭据在发起连接时就加密落库且 state 只存摘要、**换人完成授权被拒绝且状态作废**、state 只能消费一次、连接失败不留下「有令牌没文件夹」的半成品、连接 Drive 不改动现网 provider/enabled/归档凭据、回调地址的三级推导与非法地址拒绝、断开连接保留客户端凭据、普通保存不清掉账号邮箱与文件夹名、可见字段（客户端 ID / 根文件夹 ID）不被「留空继承」从而仍可清空。
+- [x] 投递策略矩阵：`go test ./internal/assets/` 通过，新增 5 个 Drive 用例（展示/下载/复制都走代理且理由为 `provider_requires_proxy`、误配 CDN 也不签发地址、非内联附件保留 `attachment_required`、模型输入代理不依赖 `allowPrivateProxy`）；原有两个「私有源站不得代理」的回归用例仍通过。
+- [x] 构建与静态检查：`go build ./...`、`go vet ./internal/...` 无输出。
+- [x] 无回归对照：在 HEAD `bd3c1bb7` 的干净 worktree 上跑同一批测试做基线对比。后端 `./internal/app/` + `./internal/handler/` 的失败集合是基线的**子集**（基线还多 5 个 flaky 的 `TestCloudAgentLive*`）；前端完整 `bun test` 两侧都是 2793 → 2798 通过（多出的 5 项就是本次新增的 Drive 用例）、失败测试名逐条一致。即本次改动**没有引入任何新失败**。注意：`internal/app` 与前端在本机各有一批既有失败（OSS/CDN 需要 DNS stub、settings-key 需要目录 fsync、media-recovery、渠道导入、canvas 交互），与本特性无关。
+- [x] 无数据库变更：复用 `system_settings.value_json`（JSON 字段）与 `resources.object_key`/`provider`，`oauth_states` 表沿用 Linux.do 登录已有的字段（未新增列），`CurrentSchemaVersion` 仍是 61，不需要迁移。
+- [ ] 未验收：**没有对真实 Google 端点跑过一次**。上面全部结论来自 httptest 假服务与替身，真实 Drive 的字段限制（文件名可用字符、`description` 长度、resumable 会话对分块 PUT 的要求、`supportsAllDrives` 对共享盘的行为）以及真实同意页→回调→302 的整条链路都未经验证。
+- [ ] 未验收：**浏览器里的完整授权往返**。需要真实 Google Cloud OAuth 客户端才能验：点「连接 Google 账号」跳到同意页、授权后回到 `/admin/settings/storage?gdrive=connected` 并弹出成功提示、账号邮箱与文件夹名正确回显、回调地址被正确登记（否则 `redirect_uri_mismatch`）。前端这部分只过了类型检查与单测。
+- [ ] 未验收：Google Cloud 项目的发布状态。停在 "Testing" 的项目 refresh token 只有 7 天寿命，用户会周期掉线；上线前必须发布到 Production。当前申请的是非敏感权限，因此不需要提交验证，但**发布到 Production 这一步仍然必须做**。
+- [ ] 未验收：浏览器里的实际观看体验与服务器带宽。Drive 资源全部经平台代理，画布上多个视频预览会集中占用服务器出网带宽，未做任何缓存或预热。
+- [ ] 未验收：配额与限流。Drive 是按用户计的速率与每日上传配额，且免费版 15 GB；打满时的错误表现（403 `storageQuotaExceeded` / 429）只按消息透传，没有退避重试。
+- 已知限制（不在本次范围）：Drive 没有对象覆盖语义，失败重试会**新建**一个文件并回填新的 `fileId`，旧文件由重试路径的清理负责；Drive 也不能配置 CDN 或 `requireCDN`，设置表单与后端都会拒绝；设置页不再提供手动粘贴刷新令牌的入口（后端仍接受 `gdriveRefreshToken` 字段），也不再让管理员指定目标文件夹。
+
 ## 提示词画廊筛选计数与结果对不上（分类 / 来源）
 
 - 症状：抽屉默认按当前输入框类型过滤（图片框只出图片、视频框只出视频），但来源/分类下拉里的计数此前是全库的，于是「标着 8000 条、选中只出来 2000 条」，还有些分类选中恒为 0。

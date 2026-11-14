@@ -152,6 +152,12 @@ func ResolveAccess(resource *model.Resource, setting storage.Settings, options A
 		// A redirect cannot enforce our attachment and sandbox response headers.
 		access.Delivery = DeliveryProxy
 		access.FallbackReason = "attachment_required"
+	} else if storage.RequiresPlatformProxy(setting) {
+		// Google Drive 这类存储没有预签名地址，读取必须携带 Authorization 头：
+		// 把地址交给浏览器只会得到 401，因此展示与下载都改由平台代理字节流。
+		// 代价是媒体流量经过应用服务器 —— 这是「用个人网盘当存储」的固有成本。
+		access.Delivery = DeliveryProxy
+		access.FallbackReason = "provider_requires_proxy"
 	} else if options.Purpose == PurposeDownload && setting.Delivery.CDNAuthMode == "public" && storage.CDNEnabled(setting) {
 		// Public COS/OSS CDN deployments can forward this response override to
 		// their origin. Keeping it on the download-only URL lets images and

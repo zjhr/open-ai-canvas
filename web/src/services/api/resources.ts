@@ -46,6 +46,11 @@ export type UserOSSSetting = {
     allowUserS3: boolean;
     publicBaseUrl: string;
     pathPrefix: string;
+    // Google Drive 只回传非敏感标识；密钥与刷新令牌以「是否已配置」的布尔值出现。
+    gdriveClientId: string;
+    gdriveRootFolderId: string;
+    hasGDriveClientSecret: boolean;
+    hasGDriveRefreshToken: boolean;
     testedAt?: string;
     testedDigest?: string;
     historyCount?: number;
@@ -59,6 +64,11 @@ export type UserOSSSettingInput = Pick<UserOSSSetting, "enabled" | "provider" | 
     cdnAuthMode?: "" | "public" | "qiniu" | string;
     requireCDN?: boolean;
     allowPrivateProxy?: boolean;
+    // 用户级不接受 Drive（后端会以 403 拒绝），这里只为对齐平台级请求体。
+    gdriveClientId?: string;
+    gdriveClientSecret?: string;
+    gdriveRefreshToken?: string;
+    gdriveRootFolderId?: string;
 };
 
 /** totalBytes = baseBytes（后台全局容量）+ purchasedBytes（当前生效的扩容）。 */

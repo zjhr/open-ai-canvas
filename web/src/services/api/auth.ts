@@ -340,6 +340,16 @@ export type AdminOSSSetting = {
     allowUserS3: boolean;
     publicBaseUrl: string;
     pathPrefix: string;
+    // Google Drive 的请求字段与公开字段：密钥和刷新令牌只以「是否已配置」返回。
+    gdriveClientId: string;
+    gdriveClientSecret?: string;
+    gdriveRefreshToken?: string;
+    gdriveRootFolderId: string;
+    // 连接流程由服务端维护：目标文件夹名与已连接账号邮箱，只用于回显。
+    gdriveRootFolderName: string;
+    gdriveAccountEmail: string;
+    hasGDriveClientSecret: boolean;
+    hasGDriveRefreshToken: boolean;
     testedAt?: string;
     testedDigest?: string;
     historyCount?: number;
@@ -347,6 +357,17 @@ export type AdminOSSSetting = {
     updatedBy?: string;
     createdAt?: string;
     updatedAt?: string;
+};
+
+// Google Drive 一键授权的连接状态。redirectUri 由服务端按当前访问域名推导，
+// 前端只读展示给管理员登记到 Google Cloud Console，不允许本地改写。
+export type GDriveConnectStatus = {
+    redirectUri: string;
+    connected: boolean;
+    accountEmail: string;
+    rootFolderId: string;
+    rootFolderName: string;
+    hasClientCredentials: boolean;
 };
 
 export type AdminArkPrivateAssetSetting = {
@@ -684,6 +705,20 @@ export function updateAdminOSSSetting(input: Partial<AdminOSSSetting>) {
 
 export function testAdminOSSConnection(input: OSSConnectionTestInput) {
     return http.post<OSSConnectionTestResult>("/admin/settings/oss/test", input);
+}
+
+export function getAdminGDriveSetup() {
+    return http.get<{ status: GDriveConnectStatus }>("/admin/settings/oss/gdrive/setup");
+}
+
+// 两个字段要么都传（顺带保存客户端凭据），要么都留空（沿用服务端已保存的）；
+// 只传一个后端会拒绝。返回的 authorizeUrl 必须由浏览器整页跳转打开，不能用 XHR。
+export function authorizeAdminGDrive(input: { clientId?: string; clientSecret?: string }) {
+    return http.post<{ authorizeUrl: string }>("/admin/settings/oss/gdrive/authorize", input);
+}
+
+export function disconnectAdminGDrive() {
+    return http.post<{ setting: AdminOSSSetting }>("/admin/settings/oss/gdrive/disconnect");
 }
 
 export function getAdminArkPrivateAssetSetting() {

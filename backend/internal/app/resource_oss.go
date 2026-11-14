@@ -8,6 +8,7 @@ import (
 
 	"gorm.io/gorm"
 	"yingce/backend/internal/model"
+	"yingce/backend/internal/storage"
 )
 
 func (s *Service) activeOSSSetting() (ossSettingValue, error) {
@@ -99,7 +100,10 @@ func (s *Service) ossSettingForResource(userID string, resource *model.Resource)
 		setting.CDNBaseURL = ""
 	}
 	if setting.AccessKeyID == "" || setting.AccessKeySecret == "" {
-		return ossSettingValue{}, errors.New("对象存储访问密钥不可用")
+		// Drive 没有访问密钥，它的可用性由客户端凭据与刷新令牌决定。
+		if !(setting.Provider == gdriveProvider && storage.GDriveConfigured(setting.GDrive)) {
+			return ossSettingValue{}, errors.New("对象存储访问密钥不可用")
+		}
 	}
 	return setting, nil
 }
@@ -138,10 +142,28 @@ func ossSettingForProvider(setting ossSettingValue, provider string) (ossSetting
 		return setting, nil
 	}
 	credentials, ok := setting.ArchivedCredentials[provider]
-	if !ok || credentials.AccessKeyID == "" || credentials.AccessKeySecret == "" {
+	if !ok {
 		return ossSettingValue{}, errors.New("历史对象存储访问密钥不可用")
 	}
 	setting.Provider = provider
+	if provider == gdriveProvider {
+		if credentials.ClientID == "" || credentials.ClientSecret == "" || credentials.RefreshToken == "" {
+			return ossSettingValue{}, errors.New("历史对象存储访问密钥不可用")
+		}
+		setting.GDrive = storage.GDriveSettings{
+			ClientID:     credentials.ClientID,
+			ClientSecret: credentials.ClientSecret,
+			RefreshToken: credentials.RefreshToken,
+			// 归档只保存凭据；根目录由一个存储位置一次，必要时由调用方覆盖。
+			RootFolderID: setting.GDrive.RootFolderID,
+			APIBaseURL:   setting.GDrive.APIBaseURL,
+			TokenURL:     setting.GDrive.TokenURL,
+		}
+		return setting, nil
+	}
+	if credentials.AccessKeyID == "" || credentials.AccessKeySecret == "" {
+		return ossSettingValue{}, errors.New("历史对象存储访问密钥不可用")
+	}
 	setting.AccessKeyID = credentials.AccessKeyID
 	setting.AccessKeySecret = credentials.AccessKeySecret
 	return setting, nil
@@ -152,8 +174,14 @@ func validateActiveOSSSetting(setting ossSettingValue, disabledMessage string, i
 	if !setting.Enabled {
 		return ossSettingValue{}, BadAuthRequest(disabledMessage)
 	}
-	if !supportedOSSProvider(setting.Provider) {
+	if !supportedOSSProvider(setting.Provider) && setting.Provider != gdriveProvider {
 		return ossSettingValue{}, BadAuthRequest(unsupportedOSSProviderMessage)
+	}
+	if setting.Provider == gdriveProvider {
+		if !storage.GDriveConfigured(setting.GDrive) {
+			return ossSettingValue{}, BadAuthRequest(incompleteMessage)
+		}
+		return setting, nil
 	}
 	if setting.Bucket == "" || setting.Endpoint == "" || setting.AccessKeyID == "" || setting.AccessKeySecret == "" {
 		return ossSettingValue{}, BadAuthRequest(incompleteMessage)

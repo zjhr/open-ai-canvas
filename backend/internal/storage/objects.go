@@ -57,6 +57,11 @@ func PutOSSObject(setting Settings, objectKey string, mimeType string, size int6
 // PutOSSObjectContext 与 PutOSSObject 相同，但整个写入（含 SDK 内部重试）受 ctx 约束。
 func PutOSSObjectContext(ctx context.Context, setting Settings, objectKey string, mimeType string, size int64, body io.Reader) (string, error) {
 	setting = NormalizeSettings(setting)
+	if setting.Provider == gdriveProvider {
+		// Drive 的对象句柄（fileId）只有写入之后才存在，而这里只回传 ETag。
+		// 调用方必须改用 PutGDriveObject 并把 fileId 回填到资源记录上。
+		return "", errors.New("Google Drive 写入必须经 PutGDriveObject 取得文件标识")
+	}
 	if setting.Provider == tencentCOSProvider {
 		return putCOSObject(ctx, setting, objectKey, mimeType, size, body)
 	}
@@ -120,6 +125,9 @@ func GetOSSObjectRange(setting Settings, objectKey string, rangeHeader string) (
 
 func GetOriginObjectRange(setting Settings, objectKey string, rangeHeader string) (*ObjectStream, error) {
 	setting = NormalizeSettings(setting)
+	if setting.Provider == gdriveProvider {
+		return GetGDriveObjectRange(setting, objectKey, rangeHeader)
+	}
 	if usesS3Protocol(setting.Provider) {
 		return GetS3ObjectRange(setting, objectKey, rangeHeader)
 	}
@@ -236,6 +244,10 @@ func signingTime(signedAt time.Time) time.Time {
 
 func signedOriginObjectURL(setting Settings, objectKey string, signing objectURLSigning) (string, error) {
 	setting = NormalizeSettings(setting)
+	if setting.Provider == gdriveProvider {
+		// Drive 没有预签名地址：读取要带 Authorization 头，签出来的 URL 到浏览器只会 401。
+		return "", errors.New("Google Drive 不支持预签名地址，请由平台代理读取对象")
+	}
 	if usesS3Protocol(setting.Provider) {
 		return signedS3ObjectURL(setting, objectKey, signing)
 	}

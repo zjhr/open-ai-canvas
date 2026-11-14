@@ -11,12 +11,14 @@ const (
 	qiniuKodoProvider     = "qiniu"
 	volcengineTOSProvider = "volcengine"
 	s3Provider            = "s3"
+	gdriveProvider        = "gdrive"
 	defaultOSSPathPrefix  = "open-ai-canvas"
 	resourceAccessURLTTL  = 4 * time.Hour
 )
 
 type Settings struct {
 	Delivery          DeliverySettings `json:"delivery"`
+	GDrive            GDriveSettings   `json:"gdrive"`
 	Enabled           bool             `json:"enabled"`
 	Provider          string           `json:"provider"`
 	Region            string           `json:"region"`
@@ -37,6 +39,27 @@ type Settings struct {
 	ArchivedCredentials map[string]Credentials `json:"archivedCredentials,omitempty"`
 }
 
+// GDriveSettings 是 Google Drive 的凭据与落点。
+// Drive 没有一对 AccessKey，而是「OAuth 客户端 + 长期 refresh token」，
+// 且对象标识是上传后才生成的 fileId，所以它不需要 Bucket / Endpoint / Region。
+type GDriveSettings struct {
+	ClientID     string `json:"clientId"`
+	ClientSecret string `json:"clientSecret"`
+	RefreshToken string `json:"refreshToken"`
+	// RootFolderID 是 Drive 文件夹 ID；留空表示「我的云端硬盘」根目录。
+	RootFolderID string `json:"rootFolderId"`
+	// AccountEmail / RootFolderName 只用于界面回显「连的是哪个账号、写进哪个文件夹」，
+	// 不参与读写判定，因此不是敏感字段。
+	AccountEmail   string `json:"accountEmail,omitempty"`
+	RootFolderName string `json:"rootFolderName,omitempty"`
+	// APIBaseURL / TokenURL / AuthorizeURL / UserInfoURL 覆盖 Drive 端点，
+	// 仅供测试与私有出网代理使用，不参与持久化，也不接受请求体传入。
+	APIBaseURL   string `json:"-"`
+	TokenURL     string `json:"-"`
+	AuthorizeURL string `json:"-"`
+	UserInfoURL  string `json:"-"`
+}
+
 type RuntimePolicy struct {
 	TransferTimeout       time.Duration
 	AccessURLTTL          time.Duration
@@ -48,6 +71,10 @@ type RuntimePolicy struct {
 type Credentials struct {
 	AccessKeyID     string `json:"accessKeyId"`
 	AccessKeySecret string `json:"accessKeySecret"`
+	// Drive 的凭据不是一对密钥；切换厂商后归档历史资源仍要能读回这几个字段。
+	ClientID     string `json:"clientId,omitempty"`
+	ClientSecret string `json:"clientSecret,omitempty"`
+	RefreshToken string `json:"refreshToken,omitempty"`
 }
 
 func CloneCredentials(source map[string]Credentials) map[string]Credentials {
@@ -59,9 +86,30 @@ func CloneCredentials(source map[string]Credentials) map[string]Credentials {
 		cloned[strings.ToLower(strings.TrimSpace(provider))] = Credentials{
 			AccessKeyID:     strings.TrimSpace(credentials.AccessKeyID),
 			AccessKeySecret: strings.TrimSpace(credentials.AccessKeySecret),
+			ClientID:        strings.TrimSpace(credentials.ClientID),
+			ClientSecret:    strings.TrimSpace(credentials.ClientSecret),
+			RefreshToken:    strings.TrimSpace(credentials.RefreshToken),
 		}
 	}
 	return cloned
+}
+
+// NormalizeGDriveSettings 统一去空白，避免把复制粘贴带入的换行当成凭据的一部分。
+func NormalizeGDriveSettings(value GDriveSettings) GDriveSettings {
+	value.ClientID = strings.TrimSpace(value.ClientID)
+	value.ClientSecret = strings.TrimSpace(value.ClientSecret)
+	value.RefreshToken = strings.TrimSpace(value.RefreshToken)
+	value.RootFolderID = strings.TrimSpace(value.RootFolderID)
+	value.AccountEmail = strings.TrimSpace(value.AccountEmail)
+	value.RootFolderName = strings.TrimSpace(value.RootFolderName)
+	return value
+}
+
+// GDriveConfigured 判断 Drive 凭据是否足以发起一次请求。
+// 注意：这里只做完整度判断，真实可用性必须由连接测试证明。
+func GDriveConfigured(value GDriveSettings) bool {
+	value = NormalizeGDriveSettings(value)
+	return value.ClientID != "" && value.ClientSecret != "" && value.RefreshToken != ""
 }
 
 func NormalizeSettings(value Settings) Settings {
@@ -93,6 +141,7 @@ func NormalizeSettings(value Settings) Settings {
 	}
 	value.SessionToken = strings.TrimSpace(value.SessionToken)
 	value.StorageLocationID = strings.TrimSpace(value.StorageLocationID)
+	value.GDrive = NormalizeGDriveSettings(value.GDrive)
 	if value.Runtime.TransferTimeout <= 0 {
 		value.Runtime.TransferTimeout = 2 * time.Minute
 	}

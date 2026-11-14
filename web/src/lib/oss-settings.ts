@@ -1,4 +1,4 @@
-export type OSSProvider = "aliyun" | "tencent" | "qiniu" | "volcengine" | "s3";
+export type OSSProvider = "aliyun" | "tencent" | "qiniu" | "volcengine" | "s3" | "gdrive";
 
 export type S3Preset = "aws" | "r2" | "b2" | "rustfs" | "custom";
 
@@ -16,6 +16,10 @@ export type OSSConnectionTestInput = {
     sessionToken?: string;
     pathPrefix: string;
     pathStyle?: boolean;
+    gdriveClientId?: string;
+    gdriveClientSecret?: string;
+    gdriveRefreshToken?: string;
+    gdriveRootFolderId?: string;
 };
 
 export type OSSConnectionTestDraft = Omit<Partial<OSSConnectionTestInput>, "provider"> & Pick<OSSConnectionTestInput, "provider">;
@@ -63,7 +67,33 @@ const S3_PRESET_HINTS: Record<S3Preset, { region: string; endpoint: string; help
     },
 };
 
-const CONNECTION_FIELDS = new Set(["provider", "s3Preset", "region", "endpoint", "cdnBaseUrl", "bucket", "accessKeyId", "accessKeySecret", "sessionToken", "pathPrefix", "pathStyle"]);
+const CONNECTION_FIELDS = new Set([
+    "provider",
+    "s3Preset",
+    "region",
+    "endpoint",
+    "cdnBaseUrl",
+    "bucket",
+    "accessKeyId",
+    "accessKeySecret",
+    "sessionToken",
+    "pathPrefix",
+    "pathStyle",
+    "gdriveClientId",
+    "gdriveClientSecret",
+    "gdriveRefreshToken",
+    "gdriveRootFolderId",
+]);
+
+// Google Drive 的四个字段提示：Drive 只有 OAuth 凭据与一个落点，没有 Bucket/Endpoint/Region。
+export const GDRIVE_ROOT_FOLDER_PLACEHOLDER = "留空 = 我的云端硬盘根目录";
+
+export const GDRIVE_FIELD_HINTS = {
+    clientId: "在 Google Cloud Console 创建 OAuth 客户端（类型选桌面应用）后取得；它与客户端密钥共同代表本次授权。",
+    clientSecret: "与客户端 ID 配套；后端只保存密文，留空表示不修改。",
+    refreshToken: "用同一客户端完成一次离线授权取得（access_type=offline 且 prompt=consent）；它等同于该账号 Drive 的长期读写权限，请在 Google 账号的第三方授权页面撤销泄露的令牌。",
+    rootFolderId: "可留空：留空表示写入「我的云端硬盘」根目录；填写时取文件夹链接 /folders/<ID> 的最后一段。",
+} as const;
 
 // 火山引擎 TOS 官方地域，见 https://docs.volcengine.com/docs/6349/107356 。
 export const VOLCENGINE_TOS_REGION_HINT = "cn-beijing、cn-shanghai、cn-guangzhou、cn-hongkong、ap-southeast-1、ap-southeast-3";
@@ -116,6 +146,13 @@ export function changesRequireOSSRetest(changedValues: Record<string, unknown>) 
 }
 
 export function validateOSSConnectionDraft(input: OSSConnectionTestDraft) {
+    // Drive 没有 Bucket：可连接的前提是 OAuth 客户端与刷新令牌齐全。
+    if (input.provider === "gdrive") {
+        if (!trimConnectionValue(input.gdriveClientId)) return "请填写 Google Drive 客户端 ID";
+        if (!trimConnectionValue(input.gdriveClientSecret)) return "请填写 Google Drive 客户端密钥";
+        if (!trimConnectionValue(input.gdriveRefreshToken)) return "请填写 Google Drive 刷新令牌";
+        return "";
+    }
     if (!trimConnectionValue(input.bucket)) return "请填写对象存储 Bucket";
     return "";
 }
@@ -133,6 +170,10 @@ export function normalizeOSSConnectionTestInput(input: OSSConnectionTestDraft): 
         sessionToken: trimConnectionValue(input.sessionToken),
         pathPrefix: (trimConnectionValue(input.pathPrefix) || DEFAULT_OSS_PATH_PREFIX).replace(/^\/+|\/+$/g, ""),
         pathStyle: input.pathStyle === true,
+        gdriveClientId: trimConnectionValue(input.gdriveClientId),
+        gdriveClientSecret: trimConnectionValue(input.gdriveClientSecret),
+        gdriveRefreshToken: trimConnectionValue(input.gdriveRefreshToken),
+        gdriveRootFolderId: trimConnectionValue(input.gdriveRootFolderId),
     };
 }
 
