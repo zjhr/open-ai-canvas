@@ -116,20 +116,30 @@ function remoteQueryOf(query: PromptGalleryQuery) {
     return {
         keyword: query.keyword?.trim() || undefined,
         mode: query.mode,
-        category: query.category && query.category !== "all" ? query.category : undefined,
+        // 分类要先还原成远端的原值：下拉里带前缀的远端分类不能直接发给接口。
+        category: remoteCategoryOf(query.category && query.category !== "all" ? query.category : undefined),
     };
 }
 
 /**
- * 远端分面请求：把当前筛选原样带上（含来源与分类），只取 1 条结果，计数由服务端给。
+ * 远端分面请求。
  *
  * 服务端算来源计数时忽略来源、算分类计数时忽略分类，所以两个维度都得发过去；
  * 漏掉来源会让「选定来源后的分类计数」仍按全库算，数字就又骗人了。
+ *
+ * 但**只有远端来源才能传给远端接口**：站内来源（seedance/lanshu/…）在后端索引里
+ * 根本不存在，直接传过去会让远端全部计数归零，表现为「一切换来源，来源下拉里
+ * 远端那一大项就消失了，合计对不上总数」。
+ *
+ * `ignoreSource` 为 true 时连远端来源也不带——用于「来源维度」的取样，
+ * 让下拉始终列出全部来源（与站内 facetSample 忽略自身维度保持一致）。
  */
-function remoteFacetQuery(query: PromptGalleryQuery | undefined) {
+function remoteFacetQuery(query: PromptGalleryQuery | undefined, options: { ignoreSource?: boolean } = {}) {
+    const selected = query?.sourceId && query.sourceId !== "all" ? query.sourceId : undefined;
+    const remoteSourceID = !options.ignoreSource && selected && isRemotePromptGallerySource(selected) ? selected : undefined;
     return {
         ...remoteQueryOf(query ?? {}),
-        sourceId: query?.sourceId && query.sourceId !== "all" ? query.sourceId : undefined,
+        sourceId: remoteSourceID,
         limit: 1,
     };
 }
@@ -148,6 +158,39 @@ function mergeFacets(primary: PromptGalleryFacet[], extra: PromptGalleryFacet[])
         else merged.set(facet.id, { ...facet });
     }
     return [...merged.values()];
+}
+
+/**
+ * 远端分类与站内分类是两套互不相通的命名空间：
+ * 远端是大写的英文短语（`Entertainment`、`Content Creation`），
+ * 站内是 kebab 码（`handheld-ugc-vlog`、`cinematic`）。
+ *
+ * 它们曾经被直接按 id 合并成一个下拉列表，于是选中任意一项都只能命中一侧：
+ * 选 `Entertainment` 时站内 0 条，选 `cinematic` 时远端 0 条 ——
+ * 用户看到的就是「来源/分类选了却没有结果」。
+ *
+ * 现在给远端分类加统一前缀，让两个命名空间在下拉里共存且各自可选；
+ * 选中后由 {@link remoteCategoryOf} 还原成远端要的原值。
+ */
+const REMOTE_CATEGORY_PREFIX = "hf:";
+
+function remoteCategoryFacetId(category: string): string {
+    return REMOTE_CATEGORY_PREFIX + category;
+}
+
+/** 把下拉里选中的分类还原成远端接口要的原始值；站内分类原样返回。 */
+export function remoteCategoryOf(category: string | undefined): string | undefined {
+    if (!category) return undefined;
+    return category.startsWith(REMOTE_CATEGORY_PREFIX) ? category.slice(REMOTE_CATEGORY_PREFIX.length) : undefined;
+}
+
+/**
+ * 站内检索用的分类：带 `hf:` 前缀说明选的是远端分类，站内不应再按它过滤（返回 undefined 表示不限分类）。
+ * 站内分类原样返回。
+ */
+export function localCategoryOf(category: string | undefined): string | undefined {
+    if (!category) return undefined;
+    return category.startsWith(REMOTE_CATEGORY_PREFIX) ? undefined : category;
 }
 
 const planTool: PluginTextTool = {
@@ -268,7 +311,10 @@ async function searchAllSources(query: PromptGalleryQuery): Promise<PromptGaller
     const limit = query.limit && query.limit > 0 ? query.limit : PROMPT_GALLERY_PAGE_SIZE;
     const offset = Math.max(0, Math.floor(query.offset ?? 0));
     const { items: localItems } = await loadLocalGalleryItems();
-    const localAll = searchPromptGalleryItems(localItems, { ...query, offset: 0, limit: Number.MAX_SAFE_INTEGER });
+    // 站内检索只认站内分类：下拉里带 hf: 前缀的远端分类不能拿去过滤站内条目，
+    // 否则选了远端分类后站内会被全部排除（这正是「选了没结果」的另一半成因）。
+    const localQuery: PromptGalleryQuery = { ...query, category: localCategoryOf(query.category) };
+    const localAll = searchPromptGalleryItems(localItems, { ...localQuery, offset: 0, limit: Number.MAX_SAFE_INTEGER });
     const page = planMergedPage(localAll.total, offset, limit);
     const localPage = localAll.items.slice(page.localOffset, page.localOffset + page.localLimit);
 
@@ -297,24 +343,39 @@ function createPromptGallery(context: Parameters<NonNullable<RegisteredPlugin["c
             if (sourceId && isRemotePromptGallerySource(sourceId)) return searchRemoteOnly(query, sourceId, limit, offset);
             if (sourceId) {
                 const { items } = await loadLocalGalleryItems();
-                return searchPromptGalleryItems(items, { ...query, limit, offset });
+                // 只查站内时同样剥掉远端分类前缀，否则选了远端分类会得到空列表。
+                return searchPromptGalleryItems(items, { ...query, category: localCategoryOf(query.category), limit, offset });
             }
             return searchAllSources(query);
         },
         facets: async (query) => {
             const { items } = await loadLocalGalleryItems();
-            const local = promptGalleryFacets(items, query);
+            // 站内分类计数只按站内分类过滤：选中远端分类时站内不应被排除，
+            // 否则站内分类的计数会全部掉到 0，下拉看起来像坏了。
+            const local = promptGalleryFacets(items, query ? { ...query, category: localCategoryOf(query.category) } : query);
             try {
-                const [sources, remote] = await Promise.all([loadRemoteSources(), searchRemotePromptGallery(remoteFacetQuery(query))]);
+                const [sources, remoteForSources, remoteForCategories] = await Promise.all([
+                    loadRemoteSources(),
+                    // 来源维度忽略已选来源，让下拉始终列出全部来源。
+                    searchRemotePromptGallery(remoteFacetQuery(query, { ignoreSource: true })),
+                    // 分类维度保留已选来源，使分类计数等于「再选它」能筛出的条数。
+                    searchRemotePromptGallery(remoteFacetQuery(query)),
+                ]);
                 const byId = new Map(sources.map((source) => [source.id, source]));
                 return {
                     sources: mergeFacets(
                         local.sources,
-                        remote.sources.map((facet) => ({ id: facet.id, label: remoteSourceLabel(byId.get(facet.id), facet.id), count: facet.count })),
+                        remoteForSources.sources.map((facet) => ({ id: facet.id, label: remoteSourceLabel(byId.get(facet.id), facet.id), count: facet.count })),
                     ),
                     categories: mergeFacets(
                         local.categories,
-                        remote.categories.map((facet) => ({ id: facet.id, label: facet.id, count: facet.count })),
+                        remoteForCategories.categories.map((facet) => ({
+                            // 远端分类加前缀只是为了隔离两套命名空间（站内是 kebab 码、
+                            // 远端是英文短语），这个前缀不进界面。
+                            id: remoteCategoryFacetId(facet.id),
+                            label: facet.id,
+                            count: facet.count,
+                        })),
                     ),
                 };
             } catch {
